@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.batch-flow/
+.agy-launch/
+*.log
+.venv/

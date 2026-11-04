@@ -1,0 +1,3 @@
+interface:
+  display_name: "任务分流与分批编排"
+  short_description: "技术负责人判断直派或分批，独立审阅，脚本守住计划同步与恢复门禁"
