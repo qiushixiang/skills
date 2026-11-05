@@ -11,12 +11,17 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 
 SCRIPTS=Path(__file__).resolve().parent
 SKILL=SCRIPTS.parent
 AGENT='batch_flow_orchestrator'
 ENV_KEY='BATCH_FLOW_AGY_LAUNCH'
+# Hook payloads, decision values and the native tool schema are undocumented runtime behaviour; a new
+# version is accepted only after a live run confirms the gate still binds (see hosts-agy-codex.md).
+VERIFIED_VERSIONS={'1.4.12','1.5.0','1.5.1'}
+BIND_SECONDS=120
 NATIVE=['define_subagent','invoke_subagent','send_message','manage_subagents',
         'manage_task','command_status','schedule','ask_question','finish','wait']
 TOOLS=NATIVE+['view_file','write_to_file','run_command']
@@ -313,7 +318,7 @@ def launch(args):
     binary=shutil.which(args.binary)
     if not binary:raise ValueError('AGY executable not found')
     result=subprocess.run([binary,'--version'],capture_output=True,text=True,check=True,timeout=15)
-    if result.stdout.strip() not in {'1.4.12','1.5.0'}:raise ValueError('launcher verified for AGY 1.4.12/1.5.0; review interfaces before upgrading')
+    if result.stdout.strip() not in VERIFIED_VERSIONS:raise ValueError('launcher verified for AGY '+'/'.join(sorted(VERIFIED_VERSIONS))+'; review interfaces before upgrading')
     if not args.model or not args.effort:raise ValueError('model and effort must not be empty')
     spec=dict(launch_id=uuid.uuid4().hex,python=sys.executable,workspace=str(workspace),task_base=str(task_base),store=str(store),records=str(store.parent/'records'),profiles=[],model=args.model,effort=args.effort,terminal_sandbox=False)
     runtime=store.parent/'.agy-launch'/spec['launch_id']
@@ -356,7 +361,19 @@ def launch(args):
         installed=install(workspace,runtime,spec)
         env=os.environ.copy();env[ENV_KEY]=spec['launch_id']
         try:
-            code=subprocess.call(argv,cwd=workspace,env=env)
+            child=subprocess.Popen(argv,cwd=workspace,env=env)
+            # 1.5.1 live run: when the workspace is trusted for the first time inside the session, hooks.json is
+            # loaded after SessionStart and the session runs with no gate at all. Never leave such a session running.
+            deadline=time.monotonic()+BIND_SECONDS
+            while child.poll() is None and not (runtime/'owner.json').exists() and time.monotonic()<deadline:
+                time.sleep(1)
+            if child.poll() is None and not (runtime/'owner.json').exists():
+                child.terminate()
+                try:child.wait(timeout=10)
+                except subprocess.TimeoutExpired:child.kill();child.wait()
+                print('AGY 在 %d 秒内未加载本次 hooks（首次信任工作区时常见），门禁未生效，已结束会话；直接重新启动即可。'%BIND_SECONDS,file=sys.stderr)
+                return 2
+            code=child.wait()
             if not (runtime/'owner.json').exists():
                 print('AGY 未回传 SessionStart 绑定；不能报告本次门禁已生效。',file=sys.stderr)
                 return code or 2

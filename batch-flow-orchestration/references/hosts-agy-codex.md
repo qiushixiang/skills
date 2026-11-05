@@ -95,6 +95,8 @@ EnableWriteTools=true 提供创建/编辑文件及运行命令的工具，不是
 
 同模型默认继承时，上述不传 Model 的形式已在 Gemini 3.8 Flash Medium 主/子会话中核对实际 modelName。若本次工具明确提供 Model，且用户已指定 flash 或批准相应映射，可在单个 spec 中增加 `"Model":"flash"`；这不是对其他版本或当前默认映射的承诺，仍须核对真实子会话元数据。
 
+2026-11-05 AGY 1.5.1 真实临时目录验收（next 驱动，执行者 tool=agy-native、model=inherit）：next 依次给出 define_subagent 与 invoke_subagent（Role=卡 ID），门禁逐条放行并记下标签，next 据 children.jsonl 找到实际子会话 ID 登记；首次运行中途重启后，新启动的 next 把未交付的 A0001 登记 INVALID，重派 A0002（retry_of A0001），子代理写出 NATIVE_OK，编排者用 write_to_file 写 result.md，next 回收为 VERIFIED；主子会话 modelName 均为 gemini-3.8-flash-medium。同次发现：**首次在会话内确认信任工作区时，hooks.json 在 SessionStart 之后才加载，该会话完全没有门禁**（无 owner/decisions，编排者还读了技能脚本）。启动器因此在 120 秒内未见 SessionStart 绑定即结束会话并提示重启；工作区已信任后再启动即正常绑定。版本白名单只在这类真实验收通过后扩展，因为门禁依赖的 hook 载荷、决策值和原生工具字段都是未文档化的运行时行为，变化时会静默失效或误拒子代理。
+
 2026-11-04 的真实临时目录验收确认：主会话文件写入及任意 Python 命令被 PreToolUse 拒绝且无标记落盘；define_subagent/invoke_subagent 成功；执行者写入 EXECUTOR_OK 标记并运行打印命令返回 CHILD_COMMAND_OK；主子宿主记录均为 gemini-3.8-flash-medium。此结果只覆盖该版本、该模型及本次接入配置，不扩大后续任务授权。
 
 取得实际子代理 ID 和原始回执，按协议登记会话/运行句柄、计时与 register_dispatch；原始工具记录和 children.jsonl 元数据用于核对实际配置，不自造回执。用 manage_subagents/manage_task 查询运行状态，合规续接用 send_message 指向原始 ID；不重新 invoke 相同写任务，不把状态查询算作新的技术轮次。结束后按原始交付代交 finish，技术载荷有误退原角色修正。主会话永不执行 payload 中的产品命令。

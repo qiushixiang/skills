@@ -177,6 +177,17 @@ class LauncherTests(unittest.TestCase):
         with patch('builtins.print'):self.assertEqual(launcher.launch(args),0)
         self.assertFalse((self.root/'.agents').exists())
 
+    def test_session_without_hooks_is_ended(self):
+        binary=self.root/'agy'
+        binary.write_text('#!'+sys.executable+'\nimport sys,time\nif "--version" in sys.argv:print("1.5.1");sys.exit(0)\n'
+                          'if "--help" in sys.argv:print("--mode --model --effort --output-format --conversation --settings");sys.exit(0)\ntime.sleep(30)\n')
+        binary.chmod(0o700)
+        args=argparse.Namespace(workspace=str(self.root),task_base=str(self.root),store=None,model='m',effort='medium',binary=str(binary),dry_run=False)
+        with patch.object(launcher,'BIND_SECONDS',2),patch('builtins.print') as out:
+            self.assertEqual(launcher.launch(args),2)
+        self.assertIn('门禁未生效',' '.join(str(c) for c in out.call_args_list))
+        self.assertFalse((self.root/'.agents/hooks.json').exists())
+
     def test_fake_host_full_launch_loads_hooks_and_restores_configuration(self):
         binary=self.root/'agy'
         binary.write_text('#!'+sys.executable+'\n'+'''
