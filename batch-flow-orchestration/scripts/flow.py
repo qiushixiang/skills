@@ -6,6 +6,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import json
+import re
 import os
 import sys
 import base64
@@ -665,7 +666,10 @@ def status(s, at=None):
             actions.append(action('REPORT_PROGRESS',recorded['task'],task['role'],'达到反馈阈值：补记进度/阻塞与下一步；不自动停止或增加预算',attempt=recorded['id']))
     for issue in issues(s):
         if not any(d.get('source_key') == issue['key'] and not decision_closed(s, d) for d in s['decisions'].values()):
-            actions.append(action('REGISTER_DECISION', issue['blocks'][0], 'orchestrator', issue['reason'], issue=issue))
+            actions.append(action('REGISTER_DECISION', issue['blocks'][0], 'orchestrator',
+                issue['reason'] + '。只做机械登记：signal --from-issue ' + issue['key'] + '（数据由脚本按本问题生成，不自拟）。'
+                '登记后 status 会出现 DECIDE，由技术负责人诊断，按其派发方式交出；编排者不自行诊断、修复或代做 DECIDE，'
+                '预算耗尽也不直接请用户批预算（追加与否由技术负责人裁决后才问用户）。', issue=issue))
     for d in s['decisions'].values():
         if decision_closed(s, d):
             continue
@@ -1525,9 +1529,23 @@ def save_record(root, value):
     return str(path)
 
 
-def shortcut(args, root):
+def issue_signal(s, key, root):
+    """Mechanical signal data for a status issue, so the orchestrator copies nothing technical."""
+    issue = next((i for i in issues(s) if i['key'] == key), None)
+    require(issue is not None, 'no current issue with key ' + key + '; reread status')
+    numbers = [int(m.group(1)) for d in s['decisions'] for m in [re.fullmatch(r'DEC-(\d+)', d)] if m]
+    latest_attempt = latest(s, issue['blocks'][0])
+    evidence = list((latest_attempt or {}).get('evidence', {})) or [save_record(root, {'issue': issue})]
+    return dict(id='DEC-%02d' % (max(numbers, default=0) + 1), signal=issue['signal'], source_key=key,
+                blocks=list(issue['blocks']), reason=issue['reason'], evidence=evidence)
+
+
+def shortcut(args, root, s=None):
     require(args.revision is not None, 'mutation requires --revision from the inspected status')
     data = {}
+    if getattr(args, 'from_issue', None):
+        require(args.command == 'signal' and not args.data and s is not None, '--from-issue is only for signal on an existing store')
+        data = issue_signal(s, args.from_issue, root)
     if args.data:
         data = json.loads(sys.stdin.read() if args.data == '-' else Path(args.data[1:]).read_text() if args.data.startswith('@') else args.data)
         require(isinstance(data, dict), '--data must contain an operation parameter object')
@@ -1619,6 +1637,9 @@ def attach_host_capabilities(result, store):
             # Claude Code orchestrators dispatch through a card instead of composing the role prompt.
             action['dispatch_card_command']=shlex.join([host['python'],str(Path(__file__).resolve().parent/'dispatch_card.py'),'make',
                                                         '--store',str(Path(store).resolve()),'--kind',action['kind'],'--target',action['target']])
+        if action.get('kind')=='REGISTER_DECISION' and action.get('issue'):
+            action['register_command']=shlex.join([host.get('python') or sys.executable,str(Path(__file__).resolve()),'--store',str(Path(store).resolve()),
+                'signal','--actor','orchestrator','--revision','<当前revision>','--from-issue',action['issue']['key']])
         adapter=action.get('cli_adapter')
         if adapter and host.get('host')=='claude' and adapter.get('tool')=='claude':
             # In a Claude Code host bare `claude` is a subagent (see dispatch_card.py); only claude-cli is a nested CLI.
@@ -1645,6 +1666,7 @@ def main():
     parser.add_argument('--result', choices=sorted(RESULTS))
     parser.add_argument('--evidence', action='append', default=[])
     parser.add_argument('--blocks', nargs='*')
+    parser.add_argument('--from-issue', help='signal: build the decision from this status issue key (REGISTER_DECISION)')
     parser.add_argument('--clarification', action='store_true')
     parser.add_argument('--context-mode', choices=['fresh','resume'], default='fresh')
     parser.add_argument('--repo', type=Path)
@@ -1716,7 +1738,7 @@ def main():
                 else:
                     # Check CAS before creating any automatic evidence files.
                     require(args.revision == (s['revision'] if s else 0), 'revision conflict: reread status and rebase request')
-                    request=shortcut(args,path.parent)
+                    request=shortcut(args,path.parent,s)
                 new,changed=apply_request(s,request,path.parent)
                 if changed:write_atomic(path,new)
             result={'ok':True,'changed':changed,'revision':new['revision'],'next':status(new)}

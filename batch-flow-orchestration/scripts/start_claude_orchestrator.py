@@ -75,7 +75,8 @@ def capabilities(spec):
         '工作循环：',
         '1. 运行 ' + status + '，看 actions。',
         '2. mode=request_user：把 orchestrator_todo 中的待决项原样问用户；拿到原话后按协议登记（set_models/authorize 等）。',
-        '   mode=register / collect_progress：按 orchestrator_todo 机械登记或收集进度，不作技术判断。',
+        '   mode=register / collect_progress：按 orchestrator_todo 机械登记或收集进度，不作技术判断；动作带 register_command 时逐字照抄'
+        '（只登记，随后的 DECIDE 等技术动作仍按其 dispatch_card_command 派给角色，不自己做、不直接请用户批预算）。',
         '3. mode=dispatch / delegate_to_lead：运行该动作的 dispatch_card_command，然后严格按输出 steps 逐步执行，命令和工具参数逐字照抄，'
         '<当前revision> 用刚读到的 revision，其余尖括号值用上一步工具返回的真实值。',
         '4. 后台子代理/进程完成会有通知，不轮询、不猜测结果；计时到期按卡第 6 步汇报并重启计时。'

@@ -1218,6 +1218,19 @@ class FlowTests(unittest.TestCase):
         self.assertEqual([flow.used(self.s,b) for b in ['E','backup','lead']],[2,1,0])
         self.assertEqual(flow.performer(self.s,'execute')[0],'lead')
 
+    def test_signal_from_issue_is_mechanical(self):
+        self.start('execute');self.finish('execute','ARCH_DECISION_REQUIRED')
+        action=next(a for a in flow.status(self.s)['actions'] if a['kind']=='REGISTER_DECISION')
+        self.assertIn('--from-issue', action['instruction']); self.assertIn('不直接请用户批预算', action['instruction'])
+        args=type('A',(),dict(revision=self.s['revision'],data=None,from_issue=action['issue']['key'],command='signal',actor='orchestrator',request_id=None,
+            attempt=None,task=None,result=None,id=None,signal=None,reason=None,summary=None,blocks=None,evidence=[],note=None,git_ref=None,repo=None,clarification=False,conversation=None))()
+        req=flow.shortcut(args,self.root,self.s)
+        data=req['operations'][0]['data']
+        self.assertEqual((data['source_key'],data['signal'],data['blocks']),(action['issue']['key'],'technical_decision',action['issue']['blocks']))
+        self.s,_=flow.apply_request(self.s,req,self.root)
+        kinds=[a['kind'] for a in flow.status(self.s)['actions']]
+        self.assertNotIn('REGISTER_DECISION',kinds); self.assertIn('DECIDE',kinds)
+
     def test_backup_wildcard_covers_unfinished_handoff_tasks(self):
         self.init_handoff_plan()
         handoff=[tid for tid,t in self.s['plan']['tasks'].items() if t.get('handoff')]
