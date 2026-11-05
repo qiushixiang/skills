@@ -52,11 +52,16 @@ Stop 同时连接 pre_yield 和[角色审计](role-audit.md)，明确用户停�
 
 新项目尚无正式台账时，Stop 只核查已采集的角色审计；审计正常即可报告缺少批准计划/角色配置并等待用户，不假报项目完成，也不因不存在 flow.json 无限续作。有正式台账后恢复完整 pre_yield 门禁。
 
-**编排方式与 Claude Code 相同**：编排者[只运行 next](roles/orchestrator.md#派发只用-next两宿主相同)。本宿主的调用形态是 `run_command`（CommandLine 为卡中的 `agent_cli.py run`），角色 tool 为 agy/codex/claude-cli（AGY 宿主内裸 claude 视为 claude-cli）；Claude 子代理类配置在 AGY 下报错，不静默替换。next 以 `run/exit.json` 回收，进程仍在则等待；台账锁与 Claude 启动器共用，中断后直接重新启动。
+**编排方式与 Claude Code 相同**：编排者[只运行 next](roles/orchestrator.md#派发只用-next两宿主相同)。本宿主两种调用形态，由角色 tool 决定：
+
+- `agy-native`：AGY 原生子代理。next 先给出固定的 define_subagent（本启动器每类角色一次），再给 invoke_subagent（Role 为卡 ID，Prompt 指向派发卡）。角色 model 写 `inherit` 或与编排者相同时不传 Model（继承主会话模型）；写其他值时原样作为 Model 传入，实际模型仍以 children.jsonl 的宿主元数据核对。原生接口没有 effort 参数，继承主会话。启动器在 decisions.jsonl 记下每次调用的 Role/Name，next 据此判断是否已派发；子代理交付到达后，编排者按 next 的 todo 用 write_to_file 把最终报告原文写到卡目录 result.md，下一次 next 回收登记。原生子代理不续接旧上下文。
+- agy/codex/claude-cli：`run_command` 运行卡中的 `agent_cli.py run`，next 以 `run/exit.json` 回收，进程仍在则等待（AGY 宿主内裸 claude 视为 claude-cli）。
+
+Claude 子代理类配置（claude-agent）在 AGY 下报错，不静默替换；反过来 Claude 宿主遇到 agy-native 时按 AGY CLI 派发。台账锁与 Claude 启动器共用，中断后直接重新启动。
 
 ## AGY 原生：定义执行者，再实际派发
 
-以下原生接口供维护核查和非启动器场景使用；受限启动器下的编排者经 next 派发，不手工 define_subagent/invoke_subagent。
+受限启动器下这两个调用由 next 生成（角色 tool 配 agy-native），编排者照抄即可；以下是接口核查记录与字段说明。
 
 
 本启动器的自定义主代理在真实 1.4.12 运行时要求 PascalCase 定义字段（Name/Description/SystemPrompt），小写形式会明确报缺少这些必填项。[官方 hooks 工具表](https://antigravity.google/docs/hooks/#agent-collaboration)描述的 snake_case 属于不同接口，不能替代当前运行时校验。此处固定使用已验证启动方式和下列定义，不每轮重新猜参数。

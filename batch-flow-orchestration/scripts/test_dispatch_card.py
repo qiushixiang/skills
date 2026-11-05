@@ -150,6 +150,42 @@ class CardTests(unittest.TestCase):
         self.assertEqual(out['interrupted'], [dict(card=cid, result='INVALID')])
         self.assertEqual(out['tool'], 'run_command')
 
+    def agy_runtime(self, tool, model):
+        self.build(lambda p: p['roles']['executor'].update(tool=tool, model=model, effort='default'))
+        agy = self.task / '.batch-flow' / '.agy-launch' / ('d' * 32); agy.mkdir(parents=True, exist_ok=True)
+        spec = json.loads((self.runtime / 'spec.json').read_text()); spec.pop('session_id')
+        spec.update(launch_id='N1', model='gemini-3.8-flash-medium'); (agy / 'spec.json').write_text(json.dumps(spec))
+        (agy / 'owner.json').write_text(json.dumps(dict(conversation_id='agy-main')))
+        self.runtime = agy
+        return agy
+
+    def log(self, agy, tool, label):
+        with (agy / 'decisions.jsonl').open('a') as f:
+            f.write(json.dumps(dict(tool=tool, label=label, decision='allow')) + '\n')
+
+    def test_agy_native_subagent_through_next(self):
+        agy = self.agy_runtime('agy-native', 'inherit')
+        out = self.next()
+        self.assertEqual((out['tool'], out['input']['Name'], out['input']['EnableWriteTools']), ('define_subagent', 'batch_flow_executor', True))
+        self.assertEqual(json.loads(self.store.read_text())['state']['attempts'], [])  # nothing started before the definition
+        self.log(agy, 'define_subagent', 'batch_flow_executor')
+        out = self.next(); cid = out['card']
+        self.assertEqual((out['tool'], out['input']['TypeName'], out['input']['Role']), ('invoke_subagent', 'batch_flow_executor', cid))
+        self.assertNotIn('Model', out['input'])  # inherit: same model as the orchestrator
+        self.assertEqual(self.next()['card'], cid)  # not sent yet: same call again
+        self.log(agy, 'invoke_subagent', cid)
+        out = self.next()
+        self.assertEqual(out['do'], 'wait'); self.assertIn('result.md', out['running'][0]['todo'])
+        self.assertEqual(self.attempt('execute')['dispatch']['owner_conversation_id'], 'agy-main')
+        (self.store.parent / 'records' / 'dispatch' / cid / 'result.md').write_text('结果：VERIFIED\n')
+        self.assertEqual(self.next()['collected'][0]['result'], 'VERIFIED')
+        self.assertEqual(self.attempt('execute')['result'], 'VERIFIED')
+
+    def test_agy_native_passes_a_configured_model(self):
+        agy = self.agy_runtime('agy-native', 'gemini-3.8-pro')
+        self.log(agy, 'define_subagent', 'batch_flow_executor')
+        self.assertEqual(self.next()['input']['Model'], 'gemini-3.8-pro')
+
     def rev(self):
         return str(json.loads(self.store.read_text())['revision'])
 

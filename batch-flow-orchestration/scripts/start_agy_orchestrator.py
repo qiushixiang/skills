@@ -228,7 +228,9 @@ def hook(event_name,runtime,event,environ=None):
         decision='auto_approve' if allowed and call.get('name')=='run_command' else 'allow' if allowed else 'deny'
         with (Path(runtime)/'decisions.jsonl').open('a') as stream:
             fcntl.flock(stream,fcntl.LOCK_EX)
-            stream.write(json.dumps(dict(conversation_id=actual,tool=call.get('name'),decision=decision,
+            # label: invoke_subagent Role / define_subagent Name, so dispatch_card.py next can see what was sent.
+            label=(inputs.get('Role') or inputs.get('Name') or inputs.get('name')) if isinstance(inputs,dict) else None
+            stream.write(json.dumps(dict(conversation_id=actual,tool=call.get('name'),decision=decision,label=label,
                 reason=reason,step=event.get('stepIdx'),args_sha256=hashlib.sha256(json.dumps(inputs,sort_keys=True).encode()).hexdigest()))+'\n')
         return {'decision':decision,'reason':reason}
     if event_name=='PostToolUse':

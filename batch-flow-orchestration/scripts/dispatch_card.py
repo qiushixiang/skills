@@ -67,6 +67,28 @@ LEAD_DELIVERY = """结果：<VERIFIED | WAIT_EVIDENCE | FAILED | ARCH_DECISION_R
 下一责任人：<角色>"""
 
 
+# AGY native subagents (role tool agy-native): fixed definitions, the same ones the AGY host guide verified.
+NATIVE_TOOLS = {'agy-native', 'agy-agent'}
+AGY_TYPES = {'executor': 'batch_flow_executor', 'reviewer': 'batch_flow_reviewer', 'third_party': 'batch_flow_third_party',
+             'architect': 'batch_flow_technical_lead'}
+AGY_DEFS = {
+    'batch_flow_executor': ('Dedicated implementation executor for batch-flow tasks', True,
+                            '你是 batch-flow 的执行者。严格在本次批次允许范围内修改代码并运行测试，交付结果与原始证据。只处理收到的任务，不派生代理，不修改正式台账、管理脚本或授权。'),
+    'batch_flow_reviewer': ('Read-only independent reviewer for batch-flow tasks', False,
+                            '你是 batch-flow 的独立审阅者。只读复核派发卡指定的固定版本，可运行验证命令，不修改任何文件，按卡中结构交付。'),
+    'batch_flow_third_party': ('Read-only third-party reviewer for batch-flow tasks', False,
+                               '你是 batch-flow 的第三方审阅者。只读复核派发卡指定的对象，不修改任何文件，按卡中结构交付。'),
+    'batch_flow_technical_lead': ('Technical lead for batch-flow decisions and checks', True,
+                                  '你是 batch-flow 的技术负责人。按派发卡处理裁决、方案或条件核对，不修改正式台账（只经 flow.py 登记），按卡中结构交付。'),
+}
+
+
+def agy_definition(type_name):
+    description, write, prompt = AGY_DEFS[type_name]
+    return dict(Name=type_name, Description=description, SystemPrompt=prompt, EnableWriteTools=write,
+                EnableSubagentTools=False, EnableMCPTools=False)
+
+
 class CardError(ValueError):
     pass
 
@@ -288,6 +310,11 @@ def make(args):
     hint = payload.get('context_hint') or {}
     resume = hint.get('conversation_id') if hint.get('mode') == 'resume' and mode == 'dispatch' else None
     replacement = None
+    host = (spec or {}).get('host', 'claude')
+    native = host == 'agy' and tool in NATIVE_TOOLS
+    if native and resume:
+        replacement = 'AGY 原生子代理按新上下文派发（原上下文 %s）；交接靠台账与交付文件' % resume
+        resume = None
     if resume and is_agent_tool(tool) and not agent_in_session(spec, resume):
         # Continuing is an optimisation; the ledger and delivery files carry the state. Fall back to a fresh
         # context instead of blocking, and record why (the ledger requires it for resume-policy tasks).
@@ -322,11 +349,20 @@ def make(args):
     card['prompt_file'] = str(prompt_path); card['prompt_sha256'] = sha(prompt_path)
     pointer = ('你是 batch-flow 角色会话。先用 Read 完整读取派发卡 %s（sha256 %s），按其中身份、范围、角色入口与交付形态工作；'
                '最终回复只给卡中规定的交付结构。' % (prompt_path, card['prompt_sha256']))
-    host = (spec or {}).get('host', 'claude')
     if host == 'agy' and tool in {'claude', 'claude-code'}:
         tool = 'claude-cli'  # outside Claude Code a bare claude role is a nested `claude -p`
-    need(not (host == 'agy' and is_agent_tool(tool)), 'AGY 编排者不能派发 Claude 子代理（%s）；角色改配 claude/claude-cli、agy 或 codex' % tool)
-    if is_agent_tool(tool):
+    if host != 'agy' and tool in NATIVE_TOOLS:
+        tool = 'agy'  # outside AGY a native AGY role runs as the AGY CLI
+    need(not (host == 'agy' and is_agent_tool(tool)), 'AGY 编排者不能派发 Claude 子代理（%s）；角色改配 agy-native、claude/claude-cli、agy 或 codex' % tool)
+    if native:
+        # Role is the card id, so the launcher's decision log and the child transcript name this card.
+        call = dict(TypeName=AGY_TYPES[role], Role=card_id, Prompt=pointer)
+        if str(model).lower() not in {'inherit', 'default', str((spec or {}).get('model', '')).lower()}:
+            call['Model'] = model  # the user's configured model; same as the orchestrator (or inherit) sends none
+        card['route'] = 'agy_native'
+        card['host_call'] = dict(tool='invoke_subagent', input=call)
+        card['define_call'] = dict(tool='define_subagent', input=agy_definition(call['TypeName']))
+    elif is_agent_tool(tool):
         alias = agent_model(model)
         need(alias in AGENT_MODELS, 'Agent 子代理模型须为 %s 或其完整 ID（如 claude-opus-5-5），当前 %r' % (sorted(AGENT_MODELS), model))
         need(effort == 'default' or effort in AGENT_EFFORTS, 'Agent effort 须为 default 或 %s，当前 %r' % (sorted(AGENT_EFFORTS), effort))
@@ -710,6 +746,10 @@ def reconcile(store, spec, started):
                 else:
                     out['interrupted'].append(dict(card=card['id'], result=interrupt(store, directory, card, 'CLI 运行随原编排会话终止（无 exit.json，进程已不在）', dict(pid=pid))))
                 continue
+            if card['route'] == 'agy_native':
+                outcome = reconcile_native(store, directory, card, spec, live)
+                out[outcome[0]].append(outcome[1])
+                continue
             handle = st.get('handle') or (card.get('resume') if card['route'] == 'send_message' else None)
             agent = find_agent(card, current if live else every, handle)
             if agent is not None and card['route'] == 'send_message' and line_count(agent) <= card.get('resume_offset', 0):
@@ -748,8 +788,75 @@ def mechanical_registrations(store):
     return done
 
 
+def agy_logged(spec, tool, label):
+    """The AGY launcher logs every allowed main-session call with its Role/Name label."""
+    try:
+        lines = (Path(spec['runtime']) / 'decisions.jsonl').read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if entry.get('tool') == tool and entry.get('label') == label and entry.get('decision') in {'allow', 'auto_approve'}:
+            return entry
+    return None
+
+
+def agy_child(spec, card):
+    """Actual child conversation of a native card: the child whose transcript names the card."""
+    try:
+        lines = (Path(spec['runtime']) / 'children.jsonl').read_text().splitlines()
+    except OSError:
+        return None
+    seen = set()
+    for line in lines:
+        try:
+            child = json.loads(line)
+        except ValueError:
+            continue
+        cid, path = child.get('conversationId'), child.get('transcriptPath')
+        if not cid or cid in seen or not path:
+            continue
+        seen.add(cid)
+        try:
+            if card['id'] in Path(path).read_text(encoding='utf-8', errors='replace'):
+                return cid
+        except OSError:
+            continue
+    return None
+
+
+def reconcile_native(store, directory, card, spec, live):
+    st = state(directory); result = directory / 'result.md'
+    invoked = agy_logged(spec, 'invoke_subagent', card['id']) if live else None
+    if live and not invoked and not result.exists():
+        return 'pending', card
+    receipt = directory / 'receipt.txt'
+    handle = st.get('handle') or agy_child(spec, card) or 'agy-invoke:' + card['id']
+    if invoked and not receipt.exists():
+        write_new(receipt, json.dumps(dict(card=card['id'], handle=handle, decision=invoked), ensure_ascii=False, indent=2))
+    if st.get('handle') != handle:
+        st['handle'] = handle; save_state(directory, st)
+    if receipt.exists():
+        register_receipt(store, directory, card, st, handle, receipt, spec)
+    if result.exists() and result.read_text().strip():
+        if not receipt.exists():
+            write_new(receipt, json.dumps(dict(card=card['id'], handle=handle, note='result.md written before restart'), ensure_ascii=False))
+        return 'collected', finish_card(store, directory, revision(store), handle)
+    if live:
+        return 'running', dict(card=card['id'], agent=handle,
+                               todo='子代理交付到达后，用 write_to_file（Overwrite=false）把最终报告原文写到 %s，再运行 next' % result)
+    return 'interrupted', dict(card=card['id'], result=interrupt(store, directory, card, '编排者重启，AGY 原生子代理随原会话终止且未交付'))
+
+
 def emit(store, card, runtime):
     st = state(card['dir'])
+    define = card.get('define_call')
+    if define and not agy_logged(runtime_spec(store, runtime), 'define_subagent', define['input']['Name']):
+        return dict(do='call', card=card['id'], tool=define['tool'], input=define['input'],
+                    say='先逐字照抄这个角色定义调用（任何字段都不改）；返回后立即再运行 next。')
     if card['ledger_start'] and not st.get('started'):
         start(argparse.Namespace(store=store, card=card['id'], revision=revision(store)))
     call = card['host_call']
@@ -798,7 +905,7 @@ def next_step(args):
     users = [dict(kind=a['kind'], target=a['target'], todo=a.get('orchestrator_todo') or a.get('instruction'))
              for a in gate['user_actions']]
     if base.get('running') or gate['running']:
-        return dict(base, do='wait', user_items=users, say='有工作在运行：结束本轮，等完成通知（AGY 用 command_status/wait 等该命令结束）；之后运行 next。'
+        return dict(base, do='wait', user_items=users, say='有工作在运行：running 中带 todo 的照做；否则结束本轮，等完成通知（AGY 用 command_status/wait/manage_subagents 等其结束）；之后运行 next。'
                     + ('另有待用户处理的事项，一并原样告诉用户。' if users else ''))
     if other or users:
         return dict(base, do='ask_user', items=other + users,

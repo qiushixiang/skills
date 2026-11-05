@@ -77,6 +77,10 @@ class LauncherTests(unittest.TestCase):
         card=shlex.join([self.spec['python'],str(launcher.SCRIPTS/'dispatch_card.py'),'next','--store',self.spec['store']])
         self.assertEqual(self.hook('PreToolUse',self.event('run_command',dict(CommandLine=card)))['decision'],'auto_approve')
         self.assertIn('dispatch_card.py',result_text(self.start_text))
+        invoke=dict(TypeName='batch_flow_executor',Role='card-1',Prompt='read card')
+        self.assertEqual(self.hook('PreToolUse',self.event('invoke_subagent',invoke))['decision'],'allow')
+        logged=[json.loads(l) for l in (self.runtime/'decisions.jsonl').read_text().splitlines()]
+        self.assertEqual((logged[-1]['tool'],logged[-1]['label']),('invoke_subagent','card-1'))  # next reads this label
         for invalid in [card.replace(' next ',' make '),card.replace(self.spec['store'],'/tmp/flow.json'),card+' --as-lead']:
             self.assertFalse(launcher.safe_command(invalid,self.spec),invalid)
 
