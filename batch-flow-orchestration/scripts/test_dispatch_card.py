@@ -189,6 +189,22 @@ class CardTests(unittest.TestCase):
             self.assertTrue(dc.agent_in_session(spec, 'a1'))
         self.assertTrue(dc.agent_in_session(None, 'a1'))
 
+    def test_unreachable_context_falls_back_fresh_with_reason(self):
+        self.build(lambda p: p['tasks']['execute'].update(session_policy='resume'))
+        s = json.loads(self.store.read_text()); proof = str(self.store.parent / 'proof.txt')
+        call = dict(tool='claude-agent', model='sonnet', effort='default', conversation_id='agent-old')
+        for i, (actor, kind, data) in enumerate([('orchestrator', 'start', dict(task='execute', call=call)),
+                                                 ('executor', 'finish', dict(attempt='A0001', result='FAILED', evidence=[proof]))]):
+            s, _ = flow.apply_request(s, {'request_id': 'u%d' % i, 'expected_revision': s['revision'], 'actor': actor,
+                                          'operations': [{'type': kind, 'data': data}]}, self.store.parent)
+        self.store.write_text(json.dumps(s))
+        spec = json.loads((self.runtime / 'spec.json').read_text()); spec.update(session_id='nosuch', workspace=str(self.workspace))
+        (self.runtime / 'spec.json').write_text(json.dumps(spec))
+        out = self.card('make', '--store', str(self.store), '--kind', 'EXECUTE', '--target', 'execute', '--runtime', str(self.runtime))
+        card = json.loads((self.store.parent / 'records' / 'dispatch' / out['card'] / 'card.json').read_text())
+        self.assertEqual((card['route'], card['resume']), ('agent', None)); self.assertIn('agent-old', card['replacement_reason'])
+        self.card('start', '--store', str(self.store), '--card', out['card'], '--revision', self.rev())
+
     def test_cli_card_and_errors(self):
         self.card('make', '--store', str(self.store), '--kind', 'THIRD_PARTY_REVIEW', '--target', 'third', '--runtime', str(self.runtime), ok=False)
         s = json.loads(self.store.read_text())

@@ -266,6 +266,16 @@ def make(args):
     need(tool and model, '调用配置缺 tool/model；先经 set_models 登记用户指定值')
     hint = payload.get('context_hint') or {}
     resume = hint.get('conversation_id') if hint.get('mode') == 'resume' and mode == 'dispatch' else None
+    replacement = None
+    if resume and is_agent_tool(tool) and not agent_in_session(spec, resume):
+        # Continuing is an optimisation; the ledger and delivery files carry the state. Fall back to a fresh
+        # context instead of blocking, and record why (the ledger requires it for resume-policy tasks).
+        replacement = '原上下文 %s 不在本编排会话（新会话或其他宿主），改用新上下文；交接靠台账与交付文件' % resume
+        resume = None
+    task = s['plan']['tasks'].get(args.target)
+    prev = flow.latest(s, args.target) if task else None
+    if not resume and not replacement and task and task.get('session_policy') == 'resume' and prev and mode == 'dispatch':
+        replacement = '按 context_hint 新建（%s）' % (hint.get('reason') or '原上下文不可续')
     stamp = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     card_id = re.sub(r'[^A-Za-z0-9._-]', '_', '%s-%s-r%s-%s-%s%s' % (args.target, args.kind, s['revision'], stamp, uuid.uuid4().hex[:4],
                                                                '-lead' if as_lead else ''))
@@ -277,7 +287,7 @@ def make(args):
                 access='write' if role in WRITE_ROLES else 'read', resume=resume, created_at=now(),
                 ledger_start='start' if args.target in s['plan']['tasks'] and args.kind in TASK_KINDS and mode == 'dispatch'
                 else 'decision_start' if args.kind == 'DECIDE' and mode == 'dispatch' else None,
-                retry_of=payload.get('retry_of'), continuation_of=payload.get('continuation_of'))
+                retry_of=payload.get('retry_of'), continuation_of=payload.get('continuation_of'), replacement_reason=replacement)
     prompt_path = directory / 'prompt.md'
     write_new(prompt_path, render_prompt(card, payload, s, store, task_base, workspace))
     card['prompt_file'] = str(prompt_path); card['prompt_sha256'] = sha(prompt_path)
@@ -290,8 +300,6 @@ def make(args):
         subtype = tool.split(':', 1)[1] if ':' in tool else AGENT_TYPES[role]
         card['agent_model'] = alias
         if resume:
-            need(agent_in_session(spec, resume), '续接目标 %s 不是本编排会话拉起的子代理（会话已换，或来自其他宿主）。'
-                 '用 --resume-launch 续原编排会话；否则由技术负责人决定新建并记录 replacement_reason' % resume)
             card['route'] = 'send_message'
             card['host_call'] = dict(tool='SendMessage', input=dict(to=resume, message=pointer))
         else:
@@ -413,7 +421,7 @@ def start(args):
     need(card['ledger_start'], '本动作没有 start 登记')
     call = dict(tool=card['tool'], model=card['model'], effort=card['effort'], conversation_id=card.get('resume') or 'pending:' + card['id'])
     if card['ledger_start'] == 'start':
-        data = {k: card[k] for k in ['retry_of', 'continuation_of'] if card.get(k)}
+        data = {k: card[k] for k in ['retry_of', 'continuation_of', 'replacement_reason'] if card.get(k)}
         argv = ['start', '--revision', str(args.revision), '--actor', card.get('actor', 'orchestrator'), '--task', card['target'],
                 '--tool', call['tool'], '--model', call['model'], '--effort', call['effort'], '--conversation', call['conversation_id']]
         result = run_flow(args.store, *argv, data=data or None)
