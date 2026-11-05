@@ -13,7 +13,7 @@ import uuid
 REQUIRED = {
     'agy': ['--mode', '--model', '--effort', '--output-format', '--conversation', '--settings'],
     'codex': ['--sandbox', '--model', '--config', '--json', '--add-dir', '--skip-git-repo-check'],
-    'claude': ['--permission-mode', '--permission-prompts', '--model', '--effort', '--resume', '--output-format'],
+    'claude': ['--permission-mode', '--permission-prompts', '--disallowedTools', '--model', '--effort', '--resume', '--output-format'],
 }
 EFFORTS = {
     'agy': {'low', 'medium', 'high', 'xhigh', 'max'},
@@ -86,7 +86,9 @@ def build_command(profile, args, prompt):
     binary = profile['binary']; backend = profile['backend']
     effort = effort_override(backend, args.effort)
     if backend == 'agy':
-        argv = [binary, '--mode', 'plan' if args.access == 'read' else 'accept-edits',
+        # Read roles must rerun builds/tests: plan mode only plans writing commands (verified
+        # 1.5.0), so read access is accept-edits plus a session deny on every file write/edit.
+        argv = [binary, '--mode', 'accept-edits',
                 '--model', args.model, '--output-format', 'json']
         if effort is not None:
             argv += ['--effort', effort]
@@ -94,13 +96,25 @@ def build_command(profile, args, prompt):
             argv += ['--conversation', args.conversation]
         for directory in args.add_dir:
             argv += ['--add-dir', directory]
-        if args.settings:
-            argv += ['--settings', settings_json(args.settings)]
+        settings = json.loads(settings_json(args.settings)) if args.settings else {}
+        if args.access == 'read':
+            permissions = settings.setdefault('permissions', {})
+            if not isinstance(permissions, dict):
+                raise ValueError('settings.permissions must be a JSON object')
+            deny = permissions.setdefault('deny', [])
+            if 'write_file(*)' not in deny:
+                deny.append('write_file(*)')
+        if settings:
+            argv += ['--settings', json.dumps(settings, ensure_ascii=False)]
         return argv + ['-p', prompt], None
     if backend == 'claude':
+        # Read roles must still rerun builds/tests: plan mode refuses writing shell commands
+        # (verified 2.1.318), so use default mode and remove only the file-edit tools.
         argv = [binary, '-p', '--model', args.model,
-                '--permission-mode', 'plan' if args.access == 'read' else 'acceptEdits',
+                '--permission-mode', 'default' if args.access == 'read' else 'acceptEdits',
                 '--permission-prompts', 'none', '--output-format', 'json']
+        if args.access == 'read':
+            argv += ['--disallowedTools', 'Edit Write NotebookEdit']
         if effort is not None:
             argv += ['--effort', effort]
         argv += ['--resume', args.conversation] if args.conversation else ['--session-id', str(uuid.uuid4())]

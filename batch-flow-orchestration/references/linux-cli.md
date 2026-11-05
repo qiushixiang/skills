@@ -48,7 +48,7 @@ Codex 始终使用明确的 read-only/workspace-write 沙箱，并传 --skip-git
 | Codex | read-only / workspace-write | exec 的目录和沙箱选项放在 resume 前，显式 ID | thread.started.thread_id |
 | Claude Code | plan / acceptEdits，permission-prompts=none | --resume | session_id |
 
-AGY/Claude 的 plan 是工作模式，不是文件只读隔离；本入口不实现 OS 角色隔离，也不认证模型实际用量。包装器拒绝已知绕过权限的配置值，但不是通用权限配置审计器。现有用户/项目设置仍可生效，需要硬隔离时按宿主权限与 OS 边界配置。
+read 模式（AGY accept-edits 加 write_file 拒绝、Claude default 去掉编辑工具）不是文件只读隔离；本入口不实现 OS 角色隔离，也不认证模型实际用量。包装器拒绝已知绕过权限的配置值，但不是通用权限配置审计器。现有用户/项目设置仍可生效，需要硬隔离时按宿主权限与 OS 边界配置。
 
 ### 固定设备测试入口的自动放行
 
@@ -82,4 +82,4 @@ collect 只读，不重派。检查 CLI 退出码、有效 JSON、非空原文�
 
 ## 4. 真实 CLI 接入验收
 
-用户授权相应模型调用后运行共用验收脚本：`python3 <技能目录>/scripts/test_agent_cli_live.py --backend <agy|codex|claude> --model <已批准模型> --effort <已批准值或default>`；旧 test_codex_cli_live.py 仅为同一脚本的兼容入口。此脚本在临时目录通过正式适配器执行两次真实调用并请求 read 模式：新建并记住随机标记，再用真实 UUID 和上轮成功记录续接，第二轮不提供标记却须返回它，并核对两次会话 ID 一致。AGY/Claude 的 plan 模式不是 OS 只读隔离。报告和原始记录留在临时目录，不接触任务台账或产品代码；失败保留证据并停止，不自动重试。仅 --version/help 或假 CLI 测试不称为真实模型及续接验收，单个后端成功也不替代其他后端验收。
+用户授权相应模型调用后运行共用验收脚本：`python3 <技能目录>/scripts/test_agent_cli_live.py --backend <agy|codex|claude> --model <已批准模型> --effort <已批准值或default>`；旧 test_codex_cli_live.py 仅为同一脚本的兼容入口。此脚本在临时目录通过正式适配器执行两次真实调用并请求 read 模式：新建并记住随机标记，再用真实 UUID 和上轮成功记录续接，第二轮不提供标记却须返回它，并核对两次会话 ID 一致。read 模式（AGY accept-edits 加 write_file 拒绝、Claude default 去掉编辑工具）不是 OS 只读隔离。报告和原始记录留在临时目录，不接触任务台账或产品代码；失败保留证据并停止，不自动重试。仅 --version/help 或假 CLI 测试不称为真实模型及续接验收，单个后端成功也不替代其他后端验收。

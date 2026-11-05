@@ -113,10 +113,10 @@ agy --mode accept-edits --model <MODEL> --effort <EFFORT> --output-format json -
 
 accept-edits 处理工作区内文件创建/修改，不是仅限本批文件的沙箱；已选 --project 时核对其工作区映射；--add-dir 只加本批已授权且确需的目录。不能用 --mode plan 执行应落盘的代码任务。
 
-**只读审阅、第三方、只返回规划内容的架构调用**把结论/计划/操作参数作为最终 response 返回（规划同时返回设计书 Markdown 原文），不写文件、不执行 flow.py 写操作；派发责任人原样保存并代交。plan 只影响工作方式，不是只读隔离；不因审阅角色无法写报告而给它 accept-edits，需改代码交执行者。
+**只读审阅、第三方、只返回规划内容的架构调用**把结论/计划/操作参数作为最终 response 返回（规划同时返回设计书 Markdown 原文），不写文件、不执行 flow.py 写操作；派发责任人原样保存并代交。不用 `--mode plan`：1.5.0 实测 plan 下模型只出计划、不执行会写文件的命令，审阅无法复跑构建/测试。改用 `accept-edits` 加本次 `--settings` 的 `permissions.deny: ["write_file(*)"]`（实测新建与编辑文件均被拒，终端命令照常运行；`agent_cli.py --access read` 已自动合并该规则）。这不是只读隔离，终端仍可写文件，只读靠角色约束；需改代码交执行者。
 
 ```text
-agy --mode plan --model <MODEL> --effort <EFFORT> --output-format json -p <只读核查并直接返回结论的PROMPT>
+agy --mode accept-edits --settings '{"permissions":{"deny":["write_file(*)"]}}' --model <MODEL> --effort <EFFORT> --output-format json -p <只读核查并直接返回结论的PROMPT>
 ```
 
 ```python

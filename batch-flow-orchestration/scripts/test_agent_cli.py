@@ -39,10 +39,21 @@ class AdapterTests(unittest.TestCase):
                                 self.assertEqual(argv[-3:],['resume',resume,'-'])
                         elif backend=='agy':
                             self.assertEqual(argv[-1],self.prompt.read_text())
-                            self.assertIn('plan' if access=='read' else 'accept-edits',argv)
+                            self.assertIn('accept-edits',argv)
+                            self.assertNotIn('plan',argv)
+                            if access=='read':
+                                deny=json.loads(argv[argv.index('--settings')+1])['permissions']['deny']
+                                self.assertIn('write_file(*)',deny)
+                            else:
+                                self.assertNotIn('--settings',argv)
                         else:
                             self.assertEqual(stdin,self.prompt.read_text())
-                            self.assertIn('plan' if access=='read' else 'acceptEdits',argv)
+                            self.assertIn('default' if access=='read' else 'acceptEdits',argv)
+                            self.assertNotIn('plan',argv)
+                            if access=='read':
+                                self.assertEqual(argv[argv.index('--disallowedTools')+1],'Edit Write NotebookEdit')
+                            else:
+                                self.assertNotIn('--disallowedTools',argv)
 
     def test_failed_and_empty_success_envelopes(self):
         for backend,good in [('agy',dict(conversation_id='01a1a540-b6eb-7ab0-aa1c-92f0cb428e69',status='SUCCESS',response='done')),
@@ -84,7 +95,7 @@ import json,sys
 if '--version' in sys.argv:
  print('fake-1');sys.exit(0)
 if '--help' in sys.argv:
- print('--mode --model --effort --output-format --conversation --settings --sandbox --config --json --add-dir --skip-git-repo-check --permission-mode --permission-prompts --resume SESSION_ID');sys.exit(0)
+ print('--mode --model --effort --output-format --conversation --settings --sandbox --config --json --add-dir --skip-git-repo-check --permission-mode --permission-prompts --disallowedTools --resume SESSION_ID');sys.exit(0)
 name=__file__.split('/')[-1]
 if name=='codex':
  for e in [{'type':'thread.started','thread_id':'01a1a540-b6eb-7ab0-aa1c-92f0cb428e69'},{'type':'item.completed','item':{'type':'agent_message','text':sys.stdin.read()}},{'type':'turn.completed'}]:print(json.dumps(e))

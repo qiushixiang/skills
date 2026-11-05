@@ -47,7 +47,7 @@ def main():
     report = dict(event='LIVE_ACCEPTANCE_PASSED', backend=args.backend, root=str(root), model=args.model,
                   effort=args.effort, conversation_id=first['conversation_id'],
                   same_session=True, retained_previous_marker=True,
-                  limit='Two real CLI calls with read access requested; not a product-task acceptance. AGY/Claude plan mode is not OS read-only isolation.')
+                  limit='Two real CLI calls with read access requested; not a product-task acceptance. AGY accept-edits with write_file deny / Claude default mode without edit tools is not OS read-only isolation.')
     agent_cli.save(root/'report.json', report)
     print(json.dumps(report), flush=True)
 
