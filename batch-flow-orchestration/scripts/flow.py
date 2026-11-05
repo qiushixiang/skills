@@ -276,6 +276,23 @@ def validate_context(c):
         require(not c.get('source_conversation_id'),'fresh context cannot inherit a source conversation')
 
 
+def tool_family(tool):
+    tool=str(tool or '')
+    if tool in {'claude-agent','claude-code'} or tool.startswith('claude-agent:'): return 'claude-agent'
+    return {'agy-cli':'agy','codex-cli':'codex'}.get(tool,tool)
+
+
+def same_backend(config, prior_tool):
+    """A context can only be resumed by the backend that created it (an AGY/Codex UUID is not a Claude agent ID).
+    Bare `claude` is a subagent in a Claude Code host and a CLI elsewhere, so it pairs with either Claude form."""
+    now, before = tool_family(config.get('tool')), tool_family(prior_tool)
+    if not prior_tool:
+        return now not in {'claude','claude-agent'}  # Unknown origin: never hand an unknown ID to SendMessage.
+    if 'claude' in {now, before}:
+        return {now, before} <= {'claude','claude-agent','claude-cli'}
+    return now == before
+
+
 def cli_context_resumable(config, cid):
     if not cid or cid.startswith('pending:'):
         return False
@@ -785,7 +802,7 @@ def status(s, at=None):
                 'instruction':'Linux CLI 使用此固定入口的 probe/run/collect；已有同版本 profile 时不重复探索调用方式。模型与 effort 使用本动作配置；正式 start 和 finish 仍由派发责任人登记。'}
         if task and item['kind'] in {'REVIEW','THIRD_PARTY_REVIEW','DESIGN','EXECUTE','REPAIR'}:
             prev=latest(s,tid)
-            can_resume=task.get('session_policy')=='resume' and prev and prev.get('executor_stage','primary') == item.get('executor_stage','primary') and prev['call']['conversation_id'] not in author_contexts(s) and cli_context_resumable(config,prev['call']['conversation_id'])
+            can_resume=task.get('session_policy')=='resume' and prev and prev.get('executor_stage','primary') == item.get('executor_stage','primary') and prev['call']['conversation_id'] not in author_contexts(s) and cli_context_resumable(config,prev['call']['conversation_id']) and same_backend(config,prev['call'].get('tool'))
             item['context_hint']={'mode':'resume' if can_resume else 'fresh','conversation_id':prev['call']['conversation_id'] if can_resume else None,'reason':'same-node follow-up; reread current inputs' if can_resume else 'first/new node, independent review, or prior context authored a changed plan'}
         elif item['kind'] in {'DECIDE','PLAN_REPAIR','PREPARE_RESUMPTION'}:
             dedicated = None
@@ -794,7 +811,7 @@ def status(s, at=None):
                 if s['plan'].get('context_groups') and target_group is not None and context_group(s,decision['blocks'])!=target_group: continue
                 context = (decision.get('resolution') or {}).get('context', {})
                 cid = context.get('conversation_id') or decision.get('handling', {}).get('call', {}).get('conversation_id')
-                if cli_context_resumable(config,cid) and not any(a['call']['conversation_id'] == cid for a in s['state']['attempts']):
+                if cli_context_resumable(config,cid) and same_backend(config,decision.get('handling',{}).get('call',{}).get('tool')) and not any(a['call']['conversation_id'] == cid for a in s['state']['attempts']):
                     dedicated = cid
                     break
             item['context_hint']={'mode':'resume' if dedicated else 'fresh', 'conversation_id':dedicated, 'reason':'同技术链路续原决策会话；无关域分开，跨组契约总体协调；失效重建保留原因、旧新ID与预算'}

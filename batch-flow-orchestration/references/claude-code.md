@@ -23,6 +23,8 @@ Shell 入口实际位于 `<技能目录>/scripts/start-claude-orchestrator.sh`�
 
 **技术负责人嵌套派发**：交给技术负责人的动作（`delegate_to_lead`，任务 dispatch_owner=architect）由编排者按卡拉起 `bf-architect`。载荷角色是执行者/审阅者时，技术负责人子代理运行 `dispatch_card.py make --as-lead` 生成子卡（卡 ID 以 `-lead` 结尾），按其 steps：`start`（actor architect）→ 前台 Agent 拉起 `bf-executor`/`bf-reviewer` → 保存 receipt/result → `finish`（actor 为执行角色）；前台等待不登记 register_dispatch。编排者拉起技术负责人的外层卡也是前台：2.1.318 实测，后台子代理发出的 Agent 调用会被宿主强制转为后台，技术负责人会在执行者完成前结束、无人 finish；前台链路实测逐层同步返回。代价是编排者和技术负责人会话在执行期间一直占用；编排者 pre_yield 不要求技术负责人持有的 attempt 有派发计时。`--as-lead` 只用于台账正式任务（TASK_KINDS 且目标是计划任务）；CONFIRM_CONDITION 等条件只由技术负责人核对，不另派执行者——实际工作走对应正式任务，避免两个执行者并行改同一文件。条件确认卡返回 WAIT_EVIDENCE 后，`finish` 记录台账进展标记（已结束尝试数、确认集合、计划版本）；标记不变时 `make` 拒绝重复派发（`--recheck` 显式复核），pre_yield 把它列为 WAITING_CONDITION 而不是 CONTINUE。载荷角色就是 architect 时由其本人处理。启动器只给 `bf-architect` Agent 工具，并设 `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2`（2.1.318 二进制确认：调用者深度达到上限时 Agent 被收回），执行者/审阅者不能再派发。guard 对子代理只加窄规则：任何子代理不得 Write/Edit flow.json；只有 `--lead-agent-type` 可调 Agent，且只能拉起 `--worker-agent-type` 并逐字匹配 `-lead` 卡；编排者不得生成或操作 `-lead` 卡，也不得以 architect 身份 start/register_dispatch。旧启动的会话需用 `--resume-launch` 重启才获得新角色定义与 hook。
 
+**上下文续接（Claude 宿主）**：session_policy / context_groups / context_hint 由 flow.py 决定，与宿主无关；续接由派发卡生成 `SendMessage(to=<agent ID>)`。2.1.318 实测：已结束的子代理收到 SendMessage 会从其记录恢复（同一会话内，及 `claude --resume` 同一会话后均可）；新启动的编排会话（新 session_id）够不到旧子代理。所以编排会话中断后一律用 `--resume-launch` 续原会话；派发卡发现续接目标不在本会话的子代理记录里会拒绝，交技术负责人决定新建（记 replacement_reason）。flow.py 只把同一后端创建的上下文提示为 resume：AGY/Codex 的 UUID 不会交给 SendMessage，换后端后自动按新建处理。
+
 ## 1. 两种方式与登记口径
 
 | 方式 | 适用 | 角色调用 | 会话标识 |

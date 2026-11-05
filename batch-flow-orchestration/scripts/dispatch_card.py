@@ -122,6 +122,15 @@ def is_agent_tool(tool):
     return tool in {'claude', 'claude-agent', 'claude-code'} or str(tool).startswith('claude-agent:')
 
 
+def agent_in_session(spec, agent_id):
+    """SendMessage resumes a finished subagent from its transcript only within the session that spawned it
+    (verified on 2.1.318 across `claude --resume`). A new launch has a new session and cannot reach old agents."""
+    if not spec or not spec.get('session_id') or not spec.get('workspace'):
+        return True  # Outside the launcher nothing can be checked; the host reports a missing agent.
+    project = Path.home() / '.claude' / 'projects' / re.sub(r'[^A-Za-z0-9]', '-', spec['workspace'])
+    return (project / spec['session_id'] / 'subagents' / ('agent-%s.jsonl' % agent_id)).is_file()
+
+
 def lead_dispatchable(s, kind, target):
     """Only formal plan tasks are dispatched by the lead; a confirmation is checked, never redone by a second executor."""
     return kind in TASK_KINDS and target in s['plan']['tasks']
@@ -281,6 +290,8 @@ def make(args):
         subtype = tool.split(':', 1)[1] if ':' in tool else AGENT_TYPES[role]
         card['agent_model'] = alias
         if resume:
+            need(agent_in_session(spec, resume), '续接目标 %s 不是本编排会话拉起的子代理（会话已换，或来自其他宿主）。'
+                 '用 --resume-launch 续原编排会话；否则由技术负责人决定新建并记录 replacement_reason' % resume)
             card['route'] = 'send_message'
             card['host_call'] = dict(tool='SendMessage', input=dict(to=resume, message=pointer))
         else:

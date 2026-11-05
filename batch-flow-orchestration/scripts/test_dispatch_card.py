@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -172,6 +173,21 @@ class CardTests(unittest.TestCase):
             {'type': 'start', 'data': dict(task='execute', call=dict(tool='claude-agent', model='sonnet', effort='default', conversation_id='x'))}]},
             self.store.parent)
         self.assertNotIn('c1', [a['target'] for a in flow.pre_yield(s)['actions']])
+
+    def test_resume_only_same_backend_and_same_session(self):
+        same = flow.same_backend
+        self.assertTrue(same(dict(tool='agy'), 'agy-cli')); self.assertFalse(same(dict(tool='claude'), 'agy'))
+        self.assertTrue(same(dict(tool='claude'), 'claude-agent')); self.assertFalse(same(dict(tool='claude-agent'), None))
+        self.assertTrue(same(dict(tool='codex'), None))
+        import dispatch_card as dc
+        home = Path(self.tmp.name) / 'home'
+        spec = dict(session_id='s1', workspace='/w/x')
+        with unittest.mock.patch.object(Path, 'home', return_value=home):
+            self.assertFalse(dc.agent_in_session(spec, 'a1'))
+            agent = home / '.claude' / 'projects' / '-w-x' / 's1' / 'subagents' / 'agent-a1.jsonl'
+            agent.parent.mkdir(parents=True); agent.write_text('{}')
+            self.assertTrue(dc.agent_in_session(spec, 'a1'))
+        self.assertTrue(dc.agent_in_session(None, 'a1'))
 
     def test_cli_card_and_errors(self):
         self.card('make', '--store', str(self.store), '--kind', 'THIRD_PARTY_REVIEW', '--target', 'third', '--runtime', str(self.runtime), ok=False)
