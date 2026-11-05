@@ -1218,6 +1218,14 @@ class FlowTests(unittest.TestCase):
         self.assertEqual([flow.used(self.s,b) for b in ['E','backup','lead']],[2,1,0])
         self.assertEqual(flow.performer(self.s,'execute')[0],'lead')
 
+    def test_backup_wildcard_covers_unfinished_handoff_tasks(self):
+        self.init_handoff_plan()
+        handoff=[tid for tid,t in self.s['plan']['tasks'].items() if t.get('handoff')]
+        self.model_update(backups={'*':{'tool':'agy','model':'wild','effort':'medium'}})
+        self.assertTrue(all(self.s['plan']['tasks'][t]['handoff']['backup']['model']=='wild' for t in handoff))
+        self.model_update(backups={'*':{'model':'wild2'},'execute':{'model':'explicit'}})
+        self.assertEqual(self.s['plan']['tasks']['execute']['handoff']['backup']['model'],'explicit')
+
     def test_model_update_cannot_change_principal_budget_or_scope(self):
         for patch in [{'principal':'different-owner'},{'budget':10},{'model':''},{'consumes':[]},{}]:
             with self.subTest(patch=patch):

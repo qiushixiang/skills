@@ -98,6 +98,8 @@ Linux CLI 配置中 effort=default 表示继承 CLI 自身配置/模型默认值
 flow.py set_models --actor orchestrator --revision <REV> --data '{"roles":{"executor":{"model":"<用户指定模型>"}},"backups":{},"reason":"按用户本次明确指定调整主执行者模型","user_evidence":["<用户原始答复路径>"]}'
 ```
 
+`backups` 以已有 handoff 的任务为键（备选挂在该任务的接管预算上，不是全局角色）。用户说“全部未完成任务”时可写 `"backups":{"*":{...}}`：脚本展开为所有有 handoff 且未 SATISFIED/RETIRED 的任务，显式任务键覆盖通配。向用户确认时问“挂在哪些任务/是否全部未完成任务”，不要求用户给任务 ID。
+
 操作复用CAS、幂等、原子事务及history；plan_version递增，state.plan_changes追加kind=user_model_update、用户依据哈希、原因及原/新计划哈希，不需要decision_id或架构作者context。此次编排登记不把当前会话标为技术计划作者，不使既有审阅仅因选模而失效；已存在的其他裁决与门禁不自动关闭。
 
 所有已开始/结束attempt的实际模型、performer_config、版本、证据、计时和预算保持原样。变更影响后续调用，正在运行的任务按原配置交付；不在台账冒改为新模型，不因改模型自动打断/重派或清零技术预算。明确需要中断换模时按用户意图与当前写入状态处理，并保留原调用结果。后续start按新的status.call_config核对宿主实际可用性；如工具/模型改变导致原会话不支持合规续接，以replacement_reason记录新上下文，不能借此自审、重领轮次或静默回退模型。主会话实际模型由宿主控制，set_models不能替用户切换宿主配置。

@@ -22,10 +22,17 @@ class CardTests(unittest.TestCase):
         self.task = root / 'task'; (self.task / '.batch-flow').mkdir(parents=True)
         self.store = self.task / '.batch-flow' / 'flow.json'
         proof = self.task / '.batch-flow' / 'proof.txt'; proof.write_text('ok')
+        self.build(lambda p: None)
+
+    def build(self, mutate):
+        if self.store.exists():
+            self.store.unlink()
+        proof = self.task / '.batch-flow' / 'proof.txt'
         p = plan()
         p['roles']['executor'] = dict(tool='claude-agent', model='sonnet', effort='default')
         p['roles']['reviewer'] = dict(tool='claude-agent', model='opus', effort='default')
         p['roles']['third_party'] = dict(tool='agy', model='gemini-3.8-flash', effort='default')
+        mutate(p)
         s = None
         for i, (actor, kind, data) in enumerate([
                 ('architect', 'init', {'plan': p, 'simulation': False, 'task_mode': 'local',
@@ -34,7 +41,7 @@ class CardTests(unittest.TestCase):
             s, _ = flow.apply_request(s, {'request_id': str(i), 'expected_revision': s['revision'] if s else 0, 'actor': actor,
                                           'operations': [{'type': kind, 'data': data}]}, self.store.parent)
         self.store.write_text(json.dumps(s))
-        self.runtime = self.task / '.batch-flow' / '.claude-launch' / ('a' * 32); self.runtime.mkdir(parents=True)
+        self.runtime = self.task / '.batch-flow' / '.claude-launch' / ('a' * 32); self.runtime.mkdir(parents=True, exist_ok=True)
         profile = self.runtime / 'agy-profile.json'
         profile.write_text(json.dumps(dict(format='batch-flow-cli/v1', backend='agy', binary='/bin/agy', version='1.5.0')))
         (self.runtime / 'spec.json').write_text(json.dumps(dict(store=str(self.store), workspace=str(self.workspace),
@@ -88,6 +95,33 @@ class CardTests(unittest.TestCase):
         self.assertEqual((a['result'], a['call']['conversation_id']), ('VERIFIED', 'agent-1'))
         self.assertEqual(self.card('show', '--store', str(self.store), '--card', cid)['state']['result'], 'VERIFIED')
 
+    def test_lead_dispatches_executor_with_nested_card(self):
+        def delegate(p):
+            p['tasks']['execute']['dispatch_owner'] = 'architect'
+            p['roles']['architect'].update(tool='claude', model='claude-opus-5-5', effort='medium')
+        self.build(delegate)
+        outer = self.card('make', '--store', str(self.store), '--kind', 'EXECUTE', '--target', 'execute', '--runtime', str(self.runtime))
+        d = self.store.parent / 'records' / 'dispatch' / outer['card']
+        card = json.loads((d / 'card.json').read_text())
+        self.assertEqual((card['role'], card['host_call']['input']['subagent_type'], card['ledger_start']), ('architect', 'bf-architect', None))
+        self.assertEqual(card['host_call']['input']['effort'], 'medium')
+        self.assertIn('--as-lead', (d / 'prompt.md').read_text())
+        inner = self.card('make', '--store', str(self.store), '--kind', 'EXECUTE', '--target', 'execute', '--runtime', str(self.runtime), '--as-lead')
+        cid = inner['card']; d = self.store.parent / 'records' / 'dispatch' / cid
+        card = json.loads((d / 'card.json').read_text())
+        call = card['host_call']['input']
+        self.assertTrue(cid.endswith('-lead') and card['lead'])
+        self.assertEqual((card['role'], card['actor'], call['subagent_type'], call['run_in_background']), ('executor', 'architect', 'bf-executor', False))
+        self.assertNotIn('register', ' '.join(inner['steps']).replace('register_dispatch', ''))
+        attempt = self.card('start', '--store', str(self.store), '--card', cid, '--revision', self.rev())['attempt']
+        s = json.loads(self.store.read_text())
+        self.assertEqual(next(a for a in s['state']['attempts'] if a['id'] == attempt)['dispatch_owner'], 'architect')
+        (d / 'receipt.txt').write_text('done. agentId: agent-9'); (d / 'result.md').write_text('结果：VERIFIED\n')
+        self.assertEqual(self.card('finish', '--store', str(self.store), '--card', cid, '--revision', self.rev(), '--conversation', 'agent-9')['result'], 'VERIFIED')
+        self.build(lambda p: None)
+        err = self.card('make', '--store', str(self.store), '--kind', 'EXECUTE', '--target', 'execute', '--runtime', str(self.runtime), '--as-lead', ok=False)
+        self.assertIn('delegate_to_lead', err['error'])
+
     def test_cli_card_and_errors(self):
         self.card('make', '--store', str(self.store), '--kind', 'THIRD_PARTY_REVIEW', '--target', 'third', '--runtime', str(self.runtime), ok=False)
         s = json.loads(self.store.read_text())
@@ -107,9 +141,16 @@ class CardTests(unittest.TestCase):
         review = self.card('make', '--store', str(self.store), '--kind', 'REVIEW', '--target', 'regular', '--runtime', str(self.runtime))
         rcard = json.loads((self.store.parent / 'records' / 'dispatch' / review['card'] / 'card.json').read_text())
         self.assertEqual((rcard['host_call']['input']['subagent_type'], rcard['access']), ('bf-reviewer', 'read'))
-        s['plan']['roles']['reviewer']['effort'] = 'high'; self.store.write_text(json.dumps(s))
+        s['plan']['roles']['reviewer'].update(tool='claude', model='claude-opus-5-5', effort='medium'); self.store.write_text(json.dumps(s))
+        review = self.card('make', '--store', str(self.store), '--kind', 'REVIEW', '--target', 'regular', '--runtime', str(self.runtime))
+        call = json.loads((self.store.parent / 'records' / 'dispatch' / review['card'] / 'card.json').read_text())['host_call']
+        self.assertEqual((call['tool'], call['input']['model'], call['input']['effort']), ('Agent', 'opus', 'medium'))
+        s['plan']['roles']['reviewer']['effort'] = 'turbo'; self.store.write_text(json.dumps(s))
         err = self.card('make', '--store', str(self.store), '--kind', 'REVIEW', '--target', 'regular', '--runtime', str(self.runtime), ok=False)
         self.assertIn('effort', err['error'])
+        s['plan']['roles']['reviewer'].update(effort='default', model='gpt-5'); self.store.write_text(json.dumps(s))
+        err = self.card('make', '--store', str(self.store), '--kind', 'REVIEW', '--target', 'regular', '--runtime', str(self.runtime), ok=False)
+        self.assertIn('模型', err['error'])
 
 
 if __name__ == '__main__':

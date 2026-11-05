@@ -30,8 +30,11 @@ import flow  # noqa: E402
 
 FORMAT = 'batch-flow-dispatch-card/v1'
 TASK_KINDS = {'DESIGN', 'EXECUTE', 'VERIFY', 'REVIEW', 'THIRD_PARTY_REVIEW', 'COMMIT', 'RELEASE', 'CONFIRM', 'REPAIR'}
-CLI_TOOLS = {'agy': 'agy', 'agy-cli': 'agy', 'codex': 'codex', 'codex-cli': 'codex', 'claude': 'claude', 'claude-cli': 'claude'}
+CLI_TOOLS = {'agy': 'agy', 'agy-cli': 'agy', 'codex': 'codex', 'codex-cli': 'codex', 'claude-cli': 'claude'}
 AGENT_MODELS = {'haiku', 'sonnet', 'opus', 'fable'}
+AGENT_EFFORTS = {'low', 'medium', 'high', 'xhigh', 'max'}
+# Inside a Claude Code host bare `claude` means a subagent; claude-cli is a nested `claude -p` whose auth
+# comes from agent_cli.claude_auth (the host strips CLAUDE_CODE_OAUTH_TOKEN from child shells).
 AGENT_TYPES = {'executor': 'bf-executor', 'architect': 'bf-architect', 'reviewer': 'bf-reviewer', 'third_party': 'bf-reviewer'}
 WRITE_ROLES = {'executor', 'architect'}
 ROLE_DOCS = {
@@ -116,7 +119,13 @@ def card_dir(store, card_id):
 
 
 def is_agent_tool(tool):
-    return tool in {'claude-agent', 'claude-code'} or str(tool).startswith('claude-agent:')
+    return tool in {'claude', 'claude-agent', 'claude-code'} or str(tool).startswith('claude-agent:')
+
+
+def agent_model(model):
+    """Agent takes a family alias; accept a full Claude model ID such as claude-opus-5-5."""
+    m = re.fullmatch(r'(?:claude-)?(haiku|sonnet|opus|fable)(?:-[0-9][0-9.-]*)?(?:\[1m\])?', str(model or '').strip().lower())
+    return m.group(1) if m else None
 
 
 def flow_cmd(store, *args):
@@ -186,7 +195,16 @@ def render_prompt(card, payload, s, store, task_base, workspace):
         lines.append('- 上下文：' + json.dumps(payload['context_hint'], ensure_ascii=False))
     lines += ['', '## 角色入口（先读）'] + ['- ' + str(SKILL / d) for d in docs]
     lines += ['', '## 工作内容（台账原文，不得改写或缩减）', '', payload.get('instruction', '').strip()]
-    if card['mode'] == 'delegate_to_lead':
+    if card['mode'] == 'delegate_to_lead' and is_agent_tool(card['tool']) and payload.get('role') not in (None, 'architect'):
+        inner = shlex.join([sys.executable, str(SCRIPTS / 'dispatch_card.py'), 'make', '--store', str(store), '--kind', kind,
+                            '--target', target, '--as-lead'])
+        lines += ['', '## 你是本动作的派发责任人（dispatch_owner=architect）',
+                  '载荷角色是 %s：不要自己实现、修复或审阅。运行下面的命令生成你的派发卡，按其 steps 逐字执行'
+                  '（start 以 architect 登记；Agent 前台调用并等待；回收后 finish 以执行角色登记）：' % payload.get('role'),
+                  '', '    ' + inner, '',
+                  '执行角色交付后，按技术负责人职责核对其原始证据与验收项；台账只经 flow.py 登记，不直接写 flow.json。'
+                  '你的交付写明子卡 ID、执行角色结果、核对结论，以及仍需派发责任人代交的操作（参数文件放在 ' + card['dir'] + ' 下）。']
+    elif card['mode'] == 'delegate_to_lead':
         lines += ['', '本动作由局部技术负责人处理：按职责实际处理，或经固定入口 ' + str(SCRIPTS / 'agent_cli.py') +
                   ' 派发并回收；需要登记的台账操作写成 --data 参数文件放在 ' + card['dir'] + ' 下，并在交付中列出。']
     delivery = EXECUTOR_DELIVERY if role == 'executor' else REVIEW_DELIVERY if role in {'reviewer', 'third_party'} else LEAD_DELIVERY
@@ -206,6 +224,12 @@ def make(args):
     task_base = Path((spec or {}).get('task_base') or store.parent.parent).resolve()
     a = find_action(s, args.kind, args.target)
     payload = a['subagent_payload']; mode = a['orchestrator_action']['mode']
+    as_lead = bool(getattr(args, 'as_lead', False))
+    if as_lead:
+        # The technical lead subagent dispatches the payload role itself (nested Agent, depth 2).
+        need(mode == 'delegate_to_lead', '--as-lead 只用于移交技术负责人的动作（mode=delegate_to_lead）')
+        need(payload.get('role') != 'architect', '本动作的责任角色就是技术负责人：由你本人处理，不再派发')
+        mode = 'dispatch'
     if mode == 'delegate_to_lead':
         role = 'architect'; config = dict(s['plan']['roles'].get('architect') or {})
         need(config, 'plan.roles.architect 未配置，无法移交局部技术负责人')
@@ -217,11 +241,13 @@ def make(args):
     hint = payload.get('context_hint') or {}
     resume = hint.get('conversation_id') if hint.get('mode') == 'resume' and mode == 'dispatch' else None
     stamp = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-    card_id = re.sub(r'[^A-Za-z0-9._-]', '_', '%s-%s-r%s-%s-%s' % (args.target, args.kind, s['revision'], stamp, uuid.uuid4().hex[:4]))
+    card_id = re.sub(r'[^A-Za-z0-9._-]', '_', '%s-%s-r%s-%s-%s%s' % (args.target, args.kind, s['revision'], stamp, uuid.uuid4().hex[:4],
+                                                               '-lead' if as_lead else ''))
     directory = cards_root(store) / card_id
     directory.mkdir(parents=True)
     card = dict(format=FORMAT, id=card_id, dir=str(directory), store=str(store), revision=s['revision'], kind=args.kind,
                 target=args.target, mode=mode, role=role, tool=tool, model=model, effort=effort,
+                actor='architect' if as_lead else 'orchestrator', lead=as_lead,
                 access='write' if role in WRITE_ROLES else 'read', resume=resume, created_at=now(),
                 ledger_start='start' if args.target in s['plan']['tasks'] and args.kind in TASK_KINDS and mode == 'dispatch'
                 else 'decision_start' if args.kind == 'DECIDE' and mode == 'dispatch' else None,
@@ -232,16 +258,21 @@ def make(args):
     pointer = ('你是 batch-flow 角色会话。先用 Read 完整读取派发卡 %s（sha256 %s），按其中身份、范围、角色入口与交付形态工作；'
                '最终回复只给卡中规定的交付结构。' % (prompt_path, card['prompt_sha256']))
     if is_agent_tool(tool):
-        need(model in AGENT_MODELS, 'Agent 子代理模型须为别名 %s，当前 %r' % (sorted(AGENT_MODELS), model))
-        need(effort == 'default', 'Agent 工具不能传 effort；登记 effort=default，或该角色改用 claude-cli')
+        alias = agent_model(model)
+        need(alias in AGENT_MODELS, 'Agent 子代理模型须为 %s 或其完整 ID（如 claude-opus-5-5），当前 %r' % (sorted(AGENT_MODELS), model))
+        need(effort == 'default' or effort in AGENT_EFFORTS, 'Agent effort 须为 default 或 %s，当前 %r' % (sorted(AGENT_EFFORTS), effort))
         subtype = tool.split(':', 1)[1] if ':' in tool else AGENT_TYPES[role]
+        card['agent_model'] = alias
         if resume:
             card['route'] = 'send_message'
             card['host_call'] = dict(tool='SendMessage', input=dict(to=resume, message=pointer))
         else:
             card['route'] = 'agent'
-            card['host_call'] = dict(tool='Agent', input=dict(description='%s %s' % (args.kind, args.target),
-                                     subagent_type=subtype, model=model, prompt=pointer, run_in_background=True))
+            call = dict(description='%s %s' % (args.kind, args.target), subagent_type=subtype, model=alias,
+                        prompt=pointer, run_in_background=not as_lead)
+            if effort != 'default':
+                call['effort'] = effort
+            card['host_call'] = dict(tool='Agent', input=call)
     elif tool in CLI_TOOLS:
         backend = CLI_TOOLS[tool]
         profiles = [p for p in (spec or {}).get('profiles', []) if load_json(p).get('backend') == backend]
@@ -254,10 +285,10 @@ def make(args):
         if not within(task_base, workspace):
             argv += ['--add-dir', str(task_base)]
         card['route'] = 'cli'
-        card['host_call'] = dict(tool='Bash', input=dict(command=shlex.join(argv), run_in_background=True,
+        card['host_call'] = dict(tool='Bash', input=dict(command=shlex.join(argv), run_in_background=not as_lead,
                                                           description='%s %s via %s' % (args.kind, args.target, backend)))
     else:
-        raise CardError('调用工具 %r 在 Claude Code 编排者中不可派发（支持 claude-agent[:类型]、claude-code、agy、codex、claude-cli）' % tool)
+        raise CardError('调用工具 %r 在 Claude Code 编排者中不可派发（支持 claude / claude-agent[:类型]（子代理）、agy、codex、claude-cli（外部进程，认证见 agent_cli token 文件））' % tool)
     write_new(directory / 'card.json', json.dumps(card, ensure_ascii=False, indent=2))
     return card
 
@@ -274,9 +305,35 @@ def save_state(directory, value):
     os.replace(tmp, path)
 
 
+def lead_steps(card, base, store):
+    d = card['dir']; call = card['host_call']
+    out = []
+    if card['ledger_start']:
+        out.append('1. 登记开始（actor architect）：' + shlex.join(base + ['start', '--store', store, '--card', card['id'], '--revision', '<当前revision>']))
+    else:
+        out.append('1. 本动作无 start 登记（%s）；直接派发。' % card['kind'])
+    out.append('2. 原样调用 %s（前台，等待结束），参数逐字使用：\n%s' % (call['tool'], json.dumps(call['input'], ensure_ascii=False, indent=2)))
+    if card['route'] in {'agent', 'send_message'}:
+        out.append('3. 把第 2 步工具返回原文（含 agentId）用 Write 新建为 %s/receipt.txt；把其中执行角色的最终报告原文 Write 为 %s/result.md。' % (d, d))
+    else:
+        out.append('3. 命令结束后无需另存，finish 会经 agent_cli collect 回收。')
+    if card['ledger_start'] == 'start':
+        out.append('4. 回收登记：' + shlex.join(base + ['finish', '--store', store, '--card', card['id'], '--revision', '<当前revision>']
+                                              + (['--conversation', '<agent ID>'] if card['route'] == 'agent' else [])) +
+                   '\n   交付列出 subject→版本时，先对每项运行 flow.py change_subject（--actor 为本卡角色，--evidence 为 result.md），再 finish。')
+    else:
+        out.append('4. 非任务动作：' + shlex.join(base + ['finish', '--store', store, '--card', card['id'], '--revision', '<当前revision>']
+                                             + (['--conversation', '<agent ID>'] if card['route'] == 'agent' else [])) +
+                   ' 只回收交付；需登记的操作在你的交付中列出。')
+    out.append('5. 前台派发不登记 register_dispatch：进度由编排者对你这张卡的计时覆盖。核对交付后按你自己卡中的交付结构回复。')
+    return out
+
+
 def steps(card):
     d = card['dir']; py = sys.executable; me = str(SCRIPTS / 'dispatch_card.py'); store = card['store']
     base = [py, me]
+    if card.get('lead'):
+        return lead_steps(card, base, store)
     out = []
     if card['ledger_start']:
         out.append('1. 登记开始：' + shlex.join(base + ['start', '--store', store, '--card', card['id'], '--revision', '<当前revision>']))
@@ -320,13 +377,13 @@ def start(args):
     call = dict(tool=card['tool'], model=card['model'], effort=card['effort'], conversation_id=card.get('resume') or 'pending:' + card['id'])
     if card['ledger_start'] == 'start':
         data = {k: card[k] for k in ['retry_of', 'continuation_of'] if card.get(k)}
-        argv = ['start', '--revision', str(args.revision), '--task', card['target'], '--tool', call['tool'], '--model', call['model'],
-                '--effort', call['effort'], '--conversation', call['conversation_id']]
+        argv = ['start', '--revision', str(args.revision), '--actor', card.get('actor', 'orchestrator'), '--task', card['target'],
+                '--tool', call['tool'], '--model', call['model'], '--effort', call['effort'], '--conversation', call['conversation_id']]
         result = run_flow(args.store, *argv, data=data or None)
         s = load_json(args.store)
         mine = [a for a in s['state']['attempts'] if a['task'] == card['target']]
         need(mine and mine[-1].get('result') is None, 'start 已写入但找不到运行中的 attempt；读取 status 核对')
-        st.update(started=now(), attempt=mine[-1]['id'], revision=result['revision'])
+        st.update(started=now(), attempt=mine[-1]['id'], revision=result['revision'], actor=card.get('actor', 'orchestrator'))
     else:
         result = run_flow(args.store, 'decision_start', '--revision', str(args.revision), '--actor', 'architect',
                           data=dict(id=card['target'], call=call))
@@ -404,6 +461,7 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     p = sub.add_parser('make'); p.add_argument('--store', required=True); p.add_argument('--kind', required=True)
     p.add_argument('--target', required=True); p.add_argument('--workspace'); p.add_argument('--runtime')
+    p.add_argument('--as-lead', action='store_true', help='technical lead subagent dispatching the payload role of a delegated action')
     p = sub.add_parser('show'); p.add_argument('--store', required=True); p.add_argument('--card')
     p = sub.add_parser('start'); p.add_argument('--store', required=True); p.add_argument('--card', required=True)
     p.add_argument('--revision', type=int, required=True)

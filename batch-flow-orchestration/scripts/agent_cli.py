@@ -3,7 +3,9 @@
 import argparse
 import datetime as dt
 import json
+import os
 from pathlib import Path
+import stat
 import shutil
 import subprocess
 import sys
@@ -35,6 +37,32 @@ def uuid_session(value):
         return isinstance(value, str) and str(uuid.UUID(value)) == value
     except (ValueError, AttributeError):
         return False
+
+
+TOKEN_FILE_ENV = 'BATCH_FLOW_CLAUDE_TOKEN_FILE'
+DEFAULT_TOKEN_FILE = '~/.config/claude-code/oauth_token'
+
+
+def claude_auth(environ=None):
+    """Auth for a nested `claude -p`.
+
+    Claude Code deletes CLAUDE_CODE_OAUTH_TOKEN from every shell it spawns (main session and subagents),
+    so a token exported in ~/.bashrc never reaches this adapter there. Without an inherited token or a
+    stored login, read a 0600 token file owned by the user and hand it to the child through
+    CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR, so the token never sits in argv, env or run records.
+    Returns (source, path or None)."""
+    env = os.environ if environ is None else environ
+    if env.get('CLAUDE_CODE_OAUTH_TOKEN') or env.get('ANTHROPIC_API_KEY') or env.get('CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR'):
+        return 'inherited', None
+    path = Path(os.path.expanduser(env.get(TOKEN_FILE_ENV) or DEFAULT_TOKEN_FILE))
+    if not path.is_file():
+        if env.get(TOKEN_FILE_ENV):
+            raise ValueError('%s points to a missing file: %s' % (TOKEN_FILE_ENV, path))
+        return 'stored-login', None  # ~/.claude/.credentials.json or nothing; the CLI reports "Not logged in".
+    info = path.stat()
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        raise ValueError('claude token file must be owned by you and mode 0600: %s' % path)
+    return 'token-file', path
 
 
 def now():
@@ -183,8 +211,12 @@ def check_profile(profile_path):
                          '; check sandbox mounts and executable interpreter; this does not prove a missing host installation') from error
     if actual != profile['version']:
         raise ValueError('CLI version changed; probe a new profile before dispatch')
-    return dict(event='CLI_CHECKED', backend=profile['backend'], binary=profile['binary'],
-                version=actual, validation='version only in current execution environment; no authentication/network/model check')
+    out = dict(event='CLI_CHECKED', backend=profile['backend'], binary=profile['binary'],
+               version=actual, validation='version only in current execution environment; no authentication/network/model check')
+    if profile['backend'] == 'claude':
+        source, path = claude_auth()
+        out['auth'] = dict(source=source, token_file=str(path) if path else None)
+    return out
 
 
 def settings_json(path):
@@ -263,6 +295,7 @@ def run(profile_path, args):
     if not prompt.strip():
         raise ValueError('empty prompt')
     argv, input_text = build_command(profile, args, prompt)
+    auth = claude_auth() if profile['backend'] == 'claude' else None  # Fail before creating the run dir.
     output = Path(args.run_dir).resolve()
     output.mkdir(mode=0o700)  # Exclusive: never overwrite or rerun a previous call.
     request = dict(task=args.task, backend=profile['backend'], version=profile['version'],
@@ -270,10 +303,22 @@ def run(profile_path, args):
                    conversation=args.conversation, argv=argv, stdin=input_text, started_at=now())
     request.update(effort_override=effort_override(profile['backend'], args.effort),
                    resume_from=getattr(args, 'resume_from', None))
+    env, fds, token = None, (), None
+    if auth:
+        source, token_path = auth
+        request['auth'] = dict(source=source, token_file=str(token_path) if token_path else None)
+        if token_path:
+            token = os.open(token_path, os.O_RDONLY)
+            env = dict(os.environ, CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR=str(token)); fds = (token,)
     save(output / 'request.json', request)
-    with (output / 'stdout').open('x') as stdout, (output / 'stderr').open('x') as stderr:
+    try:
+        stdout, stderr = (output / 'stdout').open('x'), (output / 'stderr').open('x')
         proc = subprocess.Popen(argv, cwd=args.cwd, stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
-                                stdout=stdout, stderr=stderr, text=True)
+                                stdout=stdout, stderr=stderr, text=True, env=env, pass_fds=fds)
+    finally:
+        if token is not None:
+            os.close(token)
+    with stdout, stderr:
         receipt = dict(event='CLI_STARTED', backend=profile['backend'], task=args.task,
                        pid=proc.pid, handle='pid:' + str(proc.pid), started_at=now(), run_dir=str(output))
         save(output / 'receipt.json', receipt)

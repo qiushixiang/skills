@@ -33,7 +33,8 @@ class GuardTests(unittest.TestCase):
         proc = subprocess.run([sys.executable, str(GUARD), '--host', 'claude', '--conversation', SID,
                                '--management-root', str(self.mgmt), '--read-root', str(self.base),
                                '--agent-model', 'sonnet', '--agent-model', 'opus',
-                               '--agent-type', 'bf-executor', '--agent-type', 'general-purpose']
+                               '--agent-type', 'bf-executor', '--agent-type', 'general-purpose',
+                               '--lead-agent-type', 'bf-architect', '--worker-agent-type', 'bf-executor', '--worker-agent-type', 'bf-reviewer']
                               + (['--card-root', str(self.mgmt / 'records' / 'dispatch')] if cards else []),
                               input=json.dumps(event), capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -107,6 +108,10 @@ class GuardTests(unittest.TestCase):
         self.assertIsNone(self.run_guard('Agent', ok, cards=True))
         self.assertIn('dispatch card', self.run_guard('Agent', dict(ok, prompt=prompt + ' and also fix X'), cards=True))
         self.assertIn('dispatch card', self.run_guard('Agent', dict(ok, model='opus'), cards=True))
+        self.assertIn('dispatch card', self.run_guard('Agent', dict(ok, effort='max'), cards=True))
+        (cards / 'c4').mkdir()
+        (cards / 'c4' / 'card.json').write_text(json.dumps(dict(host_call=dict(tool='Agent', input=dict(ok, effort='medium')))))
+        self.assertIsNone(self.run_guard('Agent', dict(ok, effort='medium'), cards=True))
         self.assertIsNone(self.run_guard('Bash', {'command': cli, 'run_in_background': True}, cards=True))
         self.assertIn('dispatch card', self.run_guard('Bash', {'command': cli + ' --add-dir /'}, cards=True))
         self.assertIsNone(self.run_guard('SendMessage', {'to': 'agent-1', 'message': prompt}, cards=True))
@@ -118,6 +123,27 @@ class GuardTests(unittest.TestCase):
         self.assertAllowed('Edit', {'file_path': str(self.src / 'main.c')}, agent_id='a1', agent_type='general-purpose')
         self.assertAllowed('Bash', {'command': 'make -j8'}, agent_id='a1', agent_type='general-purpose')
         self.assertAllowed('Bash', {'command': 'make -j8'}, session_id='other')
+
+    def test_lead_subagent_dispatch_rules(self):
+        cards = self.mgmt / 'records' / 'dispatch'
+        prompt = 'read lead card'
+        ok = dict(subagent_type='bf-executor', model='sonnet', prompt=prompt, description='d', run_in_background=False, effort='medium')
+        (cards / 'x-lead').mkdir(parents=True)
+        (cards / 'x-lead' / 'card.json').write_text(json.dumps(dict(lead=True, host_call=dict(tool='Agent', input=ok))))
+        lead = dict(agent_id='a1', agent_type='bf-architect')
+        self.assertIsNone(self.run_guard('Agent', ok, cards=True, **lead))
+        self.assertIn('as-lead', self.run_guard('Agent', dict(ok, prompt='do more'), cards=True, **lead))
+        self.assertIn('may dispatch only', self.run_guard('Agent', dict(ok, subagent_type='general-purpose'), cards=True, **lead))
+        self.assertIn('may not dispatch', self.run_guard('Agent', ok, cards=True, agent_id='a2', agent_type='bf-executor'))
+        self.assertIn('flow.py', self.run_guard('Write', {'file_path': str(self.mgmt / 'flow.json'), 'content': '{}'}, **lead))
+        self.assertIsNone(self.run_guard('Bash', {'command': 'python3 %s --store f start --actor architect' % (HERE / 'flow.py')}, **lead))
+        # The orchestrator cannot borrow the lead's card or identity.
+        self.assertIn('dispatch card', self.run_guard('Agent', ok, cards=True))
+        for command in ['python3 %s make --store f --kind EXECUTE --target T --as-lead' % (HERE / 'dispatch_card.py'),
+                        'python3 %s start --store f --card x-lead --revision 3' % (HERE / 'dispatch_card.py'),
+                        'python3 %s --store f start --actor architect --revision 3' % (HERE / 'flow.py')]:
+            with self.subTest(command=command):
+                self.assertDenied('Bash', {'command': command}, cards=True)
 
     def test_unreadable_input_fails_closed(self):
         proc = subprocess.run([sys.executable, str(GUARD), '--host', 'claude', '--conversation', SID,

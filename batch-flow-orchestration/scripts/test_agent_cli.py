@@ -2,6 +2,7 @@
 """CLI contracts tested with local fake executables; no models called."""
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -126,6 +127,34 @@ else:
                 self.assertEqual(cli.collect(self.args.run_dir)['conversation_id'],report['conversation_id'])
                 binary.write_text('#!'+sys.executable+'\nprint("changed-version")\n')
                 with self.assertRaisesRegex(ValueError,'version changed'):cli.run(profile,self.args)
+
+    def test_claude_token_file_reaches_child_by_descriptor_only(self):
+        binary=self.root/'claude'
+        binary.write_text('#!'+sys.executable+'''
+import json,os,sys
+if '--version' in sys.argv:print('fake-1');sys.exit(0)
+if '--help' in sys.argv:print('--permission-mode --permission-prompts --disallowedTools --model --effort --resume --output-format SESSION_ID');sys.exit(0)
+fd=os.environ.get('CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR')
+token=open('/proc/self/fd/'+fd).read().strip() if fd else 'none'
+cid=sys.argv[sys.argv.index('--session-id')+1]
+print(json.dumps({'session_id':cid,'subtype':'success','is_error':False,'result':token+'|'+str('CLAUDE_CODE_OAUTH_TOKEN' in os.environ)}))
+''')
+        binary.chmod(0o700);profile=self.root/'claude.json';cli.probe('claude',profile,str(binary))
+        token=self.root/'tok';token.write_text('secret-token\n');token.chmod(0o644)
+        env={k:v for k,v in os.environ.items() if k not in {'CLAUDE_CODE_OAUTH_TOKEN','ANTHROPIC_API_KEY','CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR'}}
+        env[cli.TOKEN_FILE_ENV]=str(token)
+        self.args.conversation=None;self.args.resume_from=None
+        with patch.dict(os.environ,env,clear=True):
+            self.args.run_dir=str(self.root/'tok-run-bad')
+            with self.assertRaisesRegex(ValueError,'0600'):cli.run(profile,self.args)
+            token.chmod(0o600);self.args.run_dir=str(self.root/'tok-run')
+            with patch('builtins.print'):self.assertEqual(cli.run(profile,self.args),0)
+            self.assertEqual(cli.check_profile(profile)['auth']['source'],'token-file')
+        self.assertEqual(cli.collect(self.args.run_dir)['response'],'secret-token|False')
+        request=(Path(self.args.run_dir)/'request.json').read_text()
+        self.assertNotIn('secret-token',request);self.assertIn('token-file',request)
+        with patch.dict(os.environ,dict(env,CLAUDE_CODE_OAUTH_TOKEN='x'),clear=True):
+            self.assertEqual(cli.claude_auth(),('inherited',None))
 
     def test_incomplete_run_does_not_claim_running(self):
         self.assertEqual(cli.collect(self.root)['event'],'CLI_INCOMPLETE')

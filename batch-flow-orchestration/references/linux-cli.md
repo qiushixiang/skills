@@ -83,3 +83,5 @@ collect 只读，不重派。检查 CLI 退出码、有效 JSON、非空原文�
 ## 4. 真实 CLI 接入验收
 
 用户授权相应模型调用后运行共用验收脚本：`python3 <技能目录>/scripts/test_agent_cli_live.py --backend <agy|codex|claude> --model <已批准模型> --effort <已批准值或default>`；旧 test_codex_cli_live.py 仅为同一脚本的兼容入口。此脚本在临时目录通过正式适配器执行两次真实调用并请求 read 模式：新建并记住随机标记，再用真实 UUID 和上轮成功记录续接，第二轮不提供标记却须返回它，并核对两次会话 ID 一致。read 模式（AGY accept-edits 加 write_file 拒绝、Claude default 去掉编辑工具）不是 OS 只读隔离。报告和原始记录留在临时目录，不接触任务台账或产品代码；失败保留证据并停止，不自动重试。仅 --version/help 或假 CLI 测试不称为真实模型及续接验收，单个后端成功也不替代其他后端验收。
+
+Claude 后端认证：在 Claude Code 宿主内，Bash 子进程拿不到 `CLAUDE_CODE_OAUTH_TOKEN`（宿主主动删除）。适配器依次使用继承的 token/API key、0600 token 文件（`$BATCH_FLOW_CLAUDE_TOKEN_FILE` 或 `~/.config/claude-code/oauth_token`，经文件描述符传入）、CLI 自身登录；`request.json` 只记来源与文件路径，`check` 输出 `auth.source`。

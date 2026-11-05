@@ -779,7 +779,7 @@ def status(s, at=None):
         backend={'agy':'agy','agy-cli':'agy','codex':'codex','codex-cli':'codex',
                  'claude':'claude','claude-cli':'claude'}.get(config.get('tool'))
         if backend and mode in {'dispatch','delegate_to_lead'}:
-            item['cli_adapter']={'backend':backend,
+            item['cli_adapter']={'backend':backend,'tool':config.get('tool'),
                 'entrypoint':str(Path(__file__).resolve().parent / 'agent_cli.py'),
                 'reference':str(Path(__file__).resolve().parent.parent / 'references' / 'linux-cli.md'),
                 'instruction':'Linux CLI 使用此固定入口的 probe/run/collect；已有同版本 profile 时不重复探索调用方式。模型与 effort 使用本动作配置；正式 start 和 finish 仍由派发责任人登记。'}
@@ -1018,7 +1018,16 @@ def operate(s, op, actor, root, at):
         user_hashes=evidence(d['user_evidence'],root)
         before_hash=digest(s['plan'])
         changed=False
-        for targets, backup in [(d['roles'],False),(d['backups'],True)]:
+        backups=dict(d['backups'])
+        if '*' in backups:
+            # Shorthand for "every unfinished task that has a handoff"; explicit task keys still override it.
+            states=status(s)['tasks']
+            wildcard=backups.pop('*')
+            expanded={tid:copy.deepcopy(wildcard) for tid,t in s['plan']['tasks'].items()
+                      if t.get('handoff') and states.get(tid) not in {'SATISFIED','RETIRED'}}
+            require(expanded,'backup wildcard matched no unfinished task with a handoff')
+            backups={**expanded,**backups}
+        for targets, backup in [(d['roles'],False),(backups,True)]:
             for target, patch in targets.items():
                 if backup:
                     require(target in s['plan']['tasks'] and s['plan']['tasks'][target].get('handoff'), 'backup target must be a task with an existing handoff')
@@ -1559,6 +1568,9 @@ def attach_host_capabilities(result, store):
             action['dispatch_card_command']=shlex.join([host['python'],str(Path(__file__).resolve().parent/'dispatch_card.py'),'make',
                                                         '--store',str(Path(store).resolve()),'--kind',action['kind'],'--target',action['target']])
         adapter=action.get('cli_adapter')
+        if adapter and host.get('host')=='claude' and adapter.get('tool')=='claude':
+            # In a Claude Code host bare `claude` is a subagent (see dispatch_card.py); only claude-cli is a nested CLI.
+            action.pop('cli_adapter');continue
         if not adapter:continue
         profile=host.get('profiles',{}).get(adapter['backend'])
         if host['status']=='bound' and profile:

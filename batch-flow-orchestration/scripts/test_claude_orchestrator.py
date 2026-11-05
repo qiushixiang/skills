@@ -20,7 +20,7 @@ class LauncherTests(unittest.TestCase):
         self.capture = root / 'capture.json'
         fake = self.bin / 'claude'
         fake.write_text('#!%s\nimport json,os,sys\nif "--version" in sys.argv:print("2.1.318 (Claude Code)");sys.exit(0)\n'
-                        'json.dump(dict(argv=sys.argv[1:],env=os.environ.get("BATCH_FLOW_CLAUDE_LAUNCH"),cwd=os.getcwd()),open(%r,"w"))\n'
+                        'json.dump(dict(argv=sys.argv[1:],env=os.environ.get("BATCH_FLOW_CLAUDE_LAUNCH"),depth=os.environ.get("CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"),cwd=os.getcwd()),open(%r,"w"))\n'
                         % (sys.executable, str(self.capture)))
         fake.chmod(0o755)
         self.env = dict(os.environ, PATH=str(self.bin) + ':/usr/bin:/bin')
@@ -48,7 +48,9 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(argv[argv.index('--model') + 1], 'haiku')
         agents = json.loads(argv[argv.index('--agents') + 1])
         self.assertNotIn('Write', agents['bf-reviewer']['tools']); self.assertIn('Edit', agents['bf-executor']['tools'])
-        self.assertTrue(all('Agent' not in a['tools'] for a in agents.values()))
+        self.assertEqual([n for n, a in agents.items() if 'Agent' in a['tools']], ['bf-architect'])
+        self.assertEqual(out['env']['CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH'], '2')
+        self.assertIn('--lead-agent-type', hooks['PreToolUse'][0]['hooks'][0]['command'])
         self.assertIn(str(HERE.parent), [argv[i + 1] for i, a in enumerate(argv) if a == '--add-dir'])
         for flag in ['--dangerously-skip-permissions', 'bypassPermissions', '--disallowedTools']:
             self.assertNotIn(flag, argv)
@@ -58,7 +60,7 @@ class LauncherTests(unittest.TestCase):
         cap = json.loads(self.capture.read_text())
         runtime = self.task / '.batch-flow' / '.claude-launch' / cap['env']
         spec = json.loads((runtime / 'spec.json').read_text())
-        self.assertEqual(cap['cwd'], str(self.ws.resolve()))
+        self.assertEqual((cap['cwd'], cap['depth']), (str(self.ws.resolve()), '2'))
         self.assertTrue((runtime / 'settings.json').is_file())
         self.assertTrue((self.task / '.batch-flow' / 'records' / 'dispatch').is_dir())
         bound = subprocess.run([sys.executable, str(HERE / 'flow.py'), 'capabilities', '--store', spec['store']],
