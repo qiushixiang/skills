@@ -830,6 +830,8 @@ def status(s, at=None):
             item['orchestrator_todo']=guidance + '只将 subagent_payload 交给指定角色；其中的 instruction 不是主会话 TODO。禁止直接执行 git add/commit/merge、产品构建或测试。'
         else:
             item['orchestrator_todo']=guidance
+    # Dispatch real work before confirmations: a confirmation checks evidence that pending work produces.
+    actions.sort(key=lambda a: a['kind'] == 'CONFIRM_CONDITION')
     batches = {bid: ('RETIRED' if b.get('retired') else 'DONE' if task_states[b['completion_task']] == 'SATISFIED' else 'INCOMPLETE') for bid, b in s['plan']['batches'].items()}
     return {'revision': s['revision'], 'plan_version': s['plan_version'], 'simulation': s['simulation'], 'user_mode': copy.deepcopy(s['state'].get('user_mode', {'mode':'present','authorization':None})), 'batches': batches, 'tasks': task_states, 'actions': actions, 'decision_states': {did: decision_state(s,d) for did,d in s['decisions'].items()}, 'unassigned_models': unassigned_models(s), 'review_budget_coverage':coverage, 'complete': all(v in {'DONE','RETIRED'} for v in batches.values())}
 

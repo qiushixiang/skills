@@ -50,14 +50,17 @@ def card_calls(card_root, lead=False):
     return calls
 
 
-def same(a, b):
-    # Strict: the string "false" is not the boolean false (Claude Code then runs the agent in the background).
-    return a == b and type(a) is type(b)
+def same(key, a, b):
+    if key == 'run_in_background':
+        # Compare what the host will do: Claude Code 2.1.318 runs an Agent in the foreground only for the JSON
+        # boolean false; anything else (true, the string "false", omitted) is background. Haiku sends strings.
+        return (a is not False) == (b is not False)
+    return a == b
 
 
 def matches_card(tool, inputs, card_root, keys, lead=False):
     for call in card_calls(card_root, lead):
-        if call.get('tool') == tool and all(same(inputs.get(k), call['input'].get(k)) for k in keys):
+        if call.get('tool') == tool and all(same(k, inputs.get(k), call['input'].get(k)) for k in keys):
             return True
     return False
 
@@ -113,7 +116,7 @@ def decide_subagent(event, lead_types, worker_types, card_root):
             return 'technical lead may dispatch only %s, got %r' % (sorted(worker_types), sub)
         if card_root is not None and not matches_card('Agent', inputs, card_root, ['subagent_type', 'model', 'prompt', 'effort', 'run_in_background'], lead=True):
             return ('lead dispatch must be copied verbatim from a dispatch_card.py --as-lead card; '
-                    'run_in_background must be the JSON boolean false, not a string')
+                    'run_in_background must be the JSON boolean false (a string runs in the background)')
     return None
 
 
@@ -156,8 +159,7 @@ def decide(event, conversation, management_roots, read_roots, agent_types, agent
             return 'subagent_type %r is not a registered role agent type' % kind
         if card_root is not None:
             if not matches_card('Agent', inputs, card_root, ['subagent_type', 'model', 'prompt', 'effort', 'run_in_background']):
-                return ('Agent dispatch must be copied verbatim from a dispatch card (dispatch_card.py make); '
-                        'run_in_background must be the JSON boolean from the card, not a string')
+                return 'Agent dispatch must be copied verbatim from a dispatch card (dispatch_card.py make)'
             return None
         if inputs.get('model') not in agent_models:
             return 'Agent dispatch must pass an explicit registered model, got %r' % inputs.get('model')

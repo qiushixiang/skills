@@ -323,9 +323,10 @@ def make(args):
             card['host_call'] = dict(tool='SendMessage', input=dict(to=resume, message=pointer))
         else:
             card['route'] = 'agent'
-            # Lead work runs in the foreground: a background subagent's own Agent calls are forced async
-            # (seen on 2.1.318), so a backgrounded lead would end before its executor and never finish it.
-            foreground = as_lead or mode == 'delegate_to_lead'
+            # Only the lead's nested dispatch is foreground (it must collect its executor). Orchestrator cards stay
+            # background with a timer: the haiku orchestrator cannot emit a JSON boolean false, and a background
+            # lead whose own child finishes is woken by the completion notice (seen on 2.1.318).
+            foreground = as_lead
             card['foreground'] = foreground
             call = dict(description='%s %s' % (args.kind, args.target), subagent_type=subtype, model=alias,
                         prompt=pointer, run_in_background=not foreground)
@@ -371,7 +372,7 @@ def lead_steps(card, base, store):
         out.append('1. 登记开始（actor architect）：' + shlex.join(base + ['start', '--store', store, '--card', card['id'], '--revision', '<当前revision>']))
     else:
         out.append('1. 本动作无 start 登记（%s）；直接派发。' % card['kind'])
-    out.append('2. 原样调用 %s（前台，等待结束），参数逐字使用（run_in_background 是 JSON 布尔 false，不是字符串 "false"）：\n%s'
+    out.append('2. 原样调用 %s（前台，等待结束），参数逐字使用（run_in_background 必须是 JSON 布尔 false，字符串会转成后台）：\n%s'
                % (call['tool'], json.dumps(call['input'], ensure_ascii=False, indent=2)))
     if card['route'] in {'agent', 'send_message'}:
         out.append('3. 把第 2 步工具返回原文（含 agentId）用 Write 新建为 %s/receipt.txt；把其中子代理的最终报告原文 Write 为 %s/result.md。'

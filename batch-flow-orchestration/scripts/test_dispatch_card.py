@@ -146,7 +146,7 @@ class CardTests(unittest.TestCase):
         self.assertIn('不是台账正式任务', self.card(*mk, '--as-lead', ok=False)['error'])
         out = self.card(*mk); d = self.store.parent / 'records' / 'dispatch' / out['card']
         card = json.loads((d / 'card.json').read_text())
-        self.assertFalse(card['host_call']['input']['run_in_background'])
+        self.assertTrue(card['host_call']['input']['run_in_background'])  # orchestrator cards stay background
         prompt = (d / 'prompt.md').read_text()
         self.assertIn('不派发执行者', prompt); self.assertNotIn('--as-lead', prompt)
         (d / 'receipt.txt').write_text('agentId: lead-1'); (d / 'result.md').write_text('结果：WAIT_EVIDENCE\n')

@@ -109,7 +109,9 @@ class GuardTests(unittest.TestCase):
         self.assertIn('dispatch card', self.run_guard('Agent', dict(ok, prompt=prompt + ' and also fix X'), cards=True))
         self.assertIn('dispatch card', self.run_guard('Agent', dict(ok, model='opus'), cards=True))
         self.assertIn('dispatch card', self.run_guard('Agent', dict(ok, effort='max'), cards=True))
-        self.assertIn('boolean', self.run_guard('Agent', dict(ok, run_in_background='true'), cards=True))
+        for value in ['true', 'false', True]:  # all run in the background on the host, like the card
+            self.assertIsNone(self.run_guard('Agent', dict(ok, run_in_background=value), cards=True))
+        self.assertIn('dispatch card', self.run_guard('Agent', dict(ok, run_in_background=False), cards=True))
         (cards / 'c4').mkdir()
         (cards / 'c4' / 'card.json').write_text(json.dumps(dict(host_call=dict(tool='Agent', input=dict(ok, effort='medium')))))
         self.assertIsNone(self.run_guard('Agent', dict(ok, effort='medium'), cards=True))
