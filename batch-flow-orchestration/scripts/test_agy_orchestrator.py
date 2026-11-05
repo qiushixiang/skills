@@ -14,6 +14,10 @@ from unittest.mock import patch
 import start_agy_orchestrator as launcher
 
 
+def result_text(result):
+    return result['injectSteps'][0]['systemMessage']['systemMessage']
+
+
 class LauncherTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name)
@@ -54,7 +58,7 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(self.hook('PreToolUse',event),{'decision':'allow'})
 
     def test_management_command_is_precise_and_cannot_escape(self):
-        self.start()
+        self.start_text=self.start()
         command=self.command('status')
         self.assertEqual(self.hook('PreToolUse',self.event('run_command',dict(CommandLine=command)))['decision'],'auto_approve')
         query=self.command('capabilities')
@@ -70,6 +74,11 @@ class LauncherTests(unittest.TestCase):
             self.assertFalse(launcher.safe_command(invalid,self.spec),invalid)
         literal=self.command('feedback','--note','literal $(not-executed)')
         self.assertTrue(launcher.safe_command(literal,self.spec))
+        card=shlex.join([self.spec['python'],str(launcher.SCRIPTS/'dispatch_card.py'),'next','--store',self.spec['store']])
+        self.assertEqual(self.hook('PreToolUse',self.event('run_command',dict(CommandLine=card)))['decision'],'auto_approve')
+        self.assertIn('dispatch_card.py',result_text(self.start_text))
+        for invalid in [card.replace(' next ',' make '),card.replace(self.spec['store'],'/tmp/flow.json'),card+' --as-lead']:
+            self.assertFalse(launcher.safe_command(invalid,self.spec),invalid)
 
     def test_file_tool_scope_including_symlinks_and_immutable_records(self):
         good=dict(TargetFile=str(self.records/'receipt.txt'),Overwrite=False,CodeContent='raw')

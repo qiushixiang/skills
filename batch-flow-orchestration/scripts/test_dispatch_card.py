@@ -46,7 +46,9 @@ class CardTests(unittest.TestCase):
         profile = self.runtime / 'agy-profile.json'
         profile.write_text(json.dumps(dict(format='batch-flow-cli/v1', backend='agy', binary='/bin/agy', version='1.5.0')))
         (self.runtime / 'spec.json').write_text(json.dumps(dict(store=str(self.store), workspace=str(self.workspace),
-                                                                  task_base=str(self.task), profiles=[str(profile)])))
+                                                                  task_base=str(self.task), profiles=[str(profile)],
+                                                                  launch_id='L1', session_id='s1', started_at='2000-01-01T00:00:00+00:00')))
+        self.home = Path(self.tmp.name) / 'home'
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -57,44 +59,120 @@ class CardTests(unittest.TestCase):
         self.assertEqual(proc.returncode == 0, ok, proc.stdout + proc.stderr)
         return out
 
+    def next(self):
+        proc = subprocess.run([sys.executable, '-c', 'import sys,runpy; from pathlib import Path; Path.home=lambda: Path(%r); '
+                               'sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0], run_name="__main__")' % str(self.home),
+                               str(CARD), 'next', '--store', str(self.store), '--runtime', str(self.runtime)], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)
+
+    def agent(self, session, agent_id, card, report=None):
+        d = self.home / '.claude' / 'projects' / __import__('re').sub(r'[^A-Za-z0-9]', '-', str(self.workspace)) / session / 'subagents'
+        d.mkdir(parents=True, exist_ok=True)
+        meta = dict(description=card, spawnDepth=1)
+        lines = [dict(type='user', message=dict(role='user', content='read card'))]
+        if report:
+            meta['finished'] = True
+            lines.append(dict(type='assistant', message=dict(content=[dict(type='tool_use', name='SubagentHandback', input=dict(message=report))])))
+        (d / ('agent-%s.meta.json' % agent_id)).write_text(json.dumps(meta))
+        (d / ('agent-%s.jsonl' % agent_id)).write_text(''.join(json.dumps(x) + '\n' for x in lines))
+
+    def restart(self, session, launch):
+        spec = json.loads((self.runtime / 'spec.json').read_text())
+        spec.update(launch_id=launch, started_at=flow.now())
+        if session:
+            spec['session_id'] = session
+        (self.runtime / 'spec.json').write_text(json.dumps(spec))
+
+    def attempt(self, task):
+        return [a for a in json.loads(self.store.read_text())['state']['attempts'] if a['task'] == task][-1]
+
+    def test_next_drives_the_whole_cycle(self):
+        out = self.next()
+        self.assertEqual((out['do'], out['tool']), ('call', 'Agent'))
+        cid = out['card']; call = out['input']
+        self.assertEqual((call['description'], call['subagent_type'], call['run_in_background']), (cid, 'bf-executor', True))
+        self.assertIsNone(self.attempt('execute').get('result'))
+        again = self.next()  # call not made yet: same card again, nothing new
+        self.assertEqual((again['do'], again['card']), ('call', cid))
+        self.assertEqual(len(list((self.store.parent / 'records' / 'dispatch').iterdir())), 1)
+        self.agent('s1', 'ag1', cid)
+        self.assertEqual(self.next()['do'], 'wait')
+        self.assertEqual(self.attempt('execute')['dispatch']['handle'], 'ag1')
+        self.agent('s1', 'ag1', cid, report='结果：VERIFIED\n改动与版本：无\n')
+        out = self.next()
+        self.assertEqual(out['collected'][0]['result'], 'VERIFIED')
+        self.assertEqual((self.attempt('execute')['result'], self.attempt('execute')['call']['conversation_id']), ('VERIFIED', 'ag1'))
+        d = self.store.parent / 'records' / 'dispatch' / cid
+        self.assertTrue((d / 'result.md').read_text().startswith('结果：VERIFIED'))
+        self.assertIn('ag1', (d / 'receipt.txt').read_text())
+        self.assertEqual(out['do'], 'call'); self.assertNotEqual(out['card'], cid)  # moves on to the next action
+
+    def test_restart_collects_finished_and_retries_lost_work(self):
+        cid = self.next()['card']; self.agent('s1', 'ag1', cid)
+        self.assertEqual(self.next()['do'], 'wait')
+        self.restart('s2', 'L2')  # orchestrator restarted: the running subagent died with s1
+        out = self.next()
+        self.assertEqual(out['interrupted'], [dict(card=cid, result='INVALID')])
+        first = [a for a in json.loads(self.store.read_text())['state']['attempts'] if a['task'] == 'execute'][0]
+        self.assertEqual(first['result'], 'INVALID')
+        self.assertTrue((self.store.parent / 'records' / 'dispatch' / cid / 'lost.json').is_file())
+        self.assertEqual(out['do'], 'call')
+        retry = self.attempt('execute'); self.assertIsNone(retry.get('result'))
+        self.assertTrue(retry.get('retry_of'))
+        # The retry finished in s2 but the orchestrator restarted before collecting: the report is not lost.
+        self.agent('s2', 'ag2', out['card'], report='结果：VERIFIED\n')
+        self.restart('s3', 'L3')
+        self.assertEqual(self.next()['collected'][0]['result'], 'VERIFIED')
+        self.assertEqual(self.attempt('execute')['result'], 'VERIFIED')
+
+    def test_agy_host_uses_the_same_next(self):
+        self.build(lambda p: p['roles']['executor'].update(tool='agy', model='gemini-3.8-flash', effort='default'))
+        agy = self.task / '.batch-flow' / '.agy-launch' / ('b' * 32); agy.mkdir(parents=True)
+        spec = json.loads((self.runtime / 'spec.json').read_text())
+        for k in ['session_id']: spec.pop(k)
+        profile = agy / 'agy-profile.json'; profile.write_text((self.runtime / 'agy-profile.json').read_text())
+        spec.update(profiles=[str(profile)], launch_id='A1'); (agy / 'spec.json').write_text(json.dumps(spec))
+        (agy / 'owner.json').write_text(json.dumps(dict(conversation_id='agy-main')))
+        self.runtime = agy
+        out = self.next()
+        self.assertEqual((out['do'], out['tool']), ('call', 'run_command'))
+        self.assertIn('agent_cli.py run', out['input']['CommandLine'])
+        cid = out['card']; run = self.store.parent / 'records' / 'dispatch' / cid / 'run'
+        self.assertEqual(self.next()['card'], cid)  # not started on the host yet: same call again
+        run.mkdir(); (run / 'receipt.json').write_text(json.dumps(dict(pid=__import__('os').getpid())))
+        self.assertEqual(self.next()['do'], 'wait')
+        self.assertEqual(self.attempt('execute')['dispatch']['owner_conversation_id'], 'agy-main')
+        dead = subprocess.Popen(['true']); dead.wait()
+        (run / 'receipt.json').unlink(); (run / 'receipt.json').write_text(json.dumps(dict(pid=dead.pid)))
+        self.restart(None, 'A2')
+        out = self.next()
+        self.assertEqual(out['interrupted'], [dict(card=cid, result='INVALID')])
+        self.assertEqual(out['tool'], 'run_command')
+
     def rev(self):
         return str(json.loads(self.store.read_text())['revision'])
 
-    def test_agent_card_full_cycle(self):
+    def test_card_contents(self):
         out = self.card('make', '--store', str(self.store), '--kind', 'EXECUTE', '--target', 'execute', '--runtime', str(self.runtime))
         self.assertEqual(out['route'], 'agent')
         cid = out['card']; d = self.store.parent / 'records' / 'dispatch' / cid
         card = json.loads((d / 'card.json').read_text())
         call = card['host_call']['input']
-        self.assertEqual((card['host_call']['tool'], call['subagent_type'], call['model']), ('Agent', 'bf-executor', 'sonnet'))
+        self.assertEqual((card['host_call']['tool'], call['subagent_type'], call['model'], card['launch']), ('Agent', 'bf-executor', 'sonnet', 'L1'))
         self.assertIn(str(d / 'prompt.md'), call['prompt']); self.assertIn(card['prompt_sha256'], call['prompt'])
         prompt = (d / 'prompt.md').read_text()
         self.assertIn('test action', prompt); self.assertIn('结果：VERIFIED | WAIT_EVIDENCE', prompt)
         self.assertIn('references/roles/executor.md', prompt)
-        started = self.card('start', '--store', str(self.store), '--card', cid, '--revision', self.rev())
-        attempt = started['attempt']
+        self.card('start', '--store', str(self.store), '--card', cid, '--revision', self.rev())
         self.card('start', '--store', str(self.store), '--card', cid, '--revision', self.rev(), ok=False)
-        self.card('register', '--store', str(self.store), '--card', cid, '--revision', self.rev(), '--handle', 'agent-1',
-                  '--timer-handle', 'b1', '--timer-ticket', str(d / 'timer-1.ticket'), ok=False)
-        (d / 'receipt.txt').write_text('Async agent launched. agentId: agent-1')
-        timer = subprocess.Popen([sys.executable, str(HERE / 'progress_timer.py'), 'wait', '--ticket', str(d / 'timer-1.ticket'),
-                                  '--task', 'execute', '--goal', 'g', '--seconds', '60'], stdout=subprocess.PIPE, text=True)
-        self.addCleanup(timer.stdout.close); self.addCleanup(timer.wait); self.addCleanup(timer.kill)
-        self.assertIn('TIMER_STARTED', timer.stdout.readline())
-        self.card('register', '--store', str(self.store), '--card', cid, '--revision', self.rev(), '--handle', 'agent-1',
-                  '--timer-handle', 'b1', '--timer-ticket', str(d / 'timer-1.ticket'))
         self.card('finish', '--store', str(self.store), '--card', cid, '--revision', self.rev(), '--conversation', 'agent-1', ok=False)
+        (d / 'receipt.txt').write_text('agentId: agent-1')
         (d / 'result.md').write_text('**结果：** RESULT_TYPO\n')
-        bad = self.card('finish', '--store', str(self.store), '--card', cid, '--revision', self.rev(), '--conversation', 'agent-1', ok=False)
-        self.assertIn('结果', bad['error'])
-        (d / 'result.md').unlink(); (d / 'result.md').write_text('结果：VERIFIED\n改动与版本：无\n')
+        self.assertIn('结果', self.card('finish', '--store', str(self.store), '--card', cid, '--revision', self.rev(), '--conversation', 'agent-1', ok=False)['error'])
+        (d / 'result.md').unlink(); (d / 'result.md').write_text('结果：VERIFIED\n')
         self.card('finish', '--store', str(self.store), '--card', cid, '--revision', self.rev(), '--conversation', 'other', ok=False)
-        done = self.card('finish', '--store', str(self.store), '--card', cid, '--revision', self.rev(), '--conversation', 'agent-1')
-        self.assertEqual(done['result'], 'VERIFIED')
-        s = json.loads(self.store.read_text())
-        a = next(x for x in s['state']['attempts'] if x['id'] == attempt)
-        self.assertEqual((a['result'], a['call']['conversation_id']), ('VERIFIED', 'agent-1'))
-        self.assertEqual(self.card('show', '--store', str(self.store), '--card', cid)['state']['result'], 'VERIFIED')
+        self.assertEqual(self.card('finish', '--store', str(self.store), '--card', cid, '--revision', self.rev(), '--conversation', 'agent-1')['result'], 'VERIFIED')
 
     def test_lead_dispatches_executor_with_nested_card(self):
         def delegate(p):
@@ -213,23 +291,6 @@ class CardTests(unittest.TestCase):
                                   capture_output=True, text=True)
             self.assertEqual(json.loads(proc.stdout).get('route'), route, proc.stdout)
         self.card('start', '--store', str(self.store), '--card', out['card'], '--revision', self.rev())
-
-    def test_abandon_lost_agent_records_invalid_and_offers_retry(self):
-        out = self.card('make', '--store', str(self.store), '--kind', 'EXECUTE', '--target', 'execute', '--runtime', str(self.runtime))
-        cid = out['card']; d = self.store.parent / 'records' / 'dispatch' / cid
-        self.card('start', '--store', str(self.store), '--card', cid, '--revision', self.rev())
-        (d / 'receipt.txt').write_text('agentId: agent-gone')
-        st = json.loads((d / 'state.json').read_text()); st['handle'] = 'agent-gone'; (d / 'state.json').write_text(json.dumps(st))
-        spec = json.loads((self.runtime / 'spec.json').read_text()); spec.update(session_id='new', workspace=str(self.workspace))
-        (self.runtime / 'spec.json').write_text(json.dumps(spec))
-        ab = ['abandon', '--store', str(self.store), '--card', cid, '--reason', 'host session ended', '--runtime', str(self.runtime)]
-        res = self.card(*ab, '--revision', self.rev())
-        self.assertEqual(res['result'], 'INVALID')
-        s = json.loads(self.store.read_text())
-        self.assertEqual(s['state']['attempts'][-1]['result'], 'INVALID')
-        action = next(a for a in flow.status(s)['actions'] if a['target'] == 'execute')
-        self.assertEqual(action.get('retry_of'), s['state']['attempts'][-1]['id'])
-        self.card(*ab, '--revision', self.rev(), ok=False)
 
     def test_cli_card_and_errors(self):
         self.card('make', '--store', str(self.store), '--kind', 'THIRD_PARTY_REVIEW', '--target', 'third', '--runtime', str(self.runtime), ok=False)

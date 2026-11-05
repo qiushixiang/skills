@@ -30,6 +30,7 @@ FLAGS={
                '--reason','--summary','--note','--tool','--model','--effort','--conversation','--result',
                '--evidence','--blocks','--clarification','--context-mode','--audit-log','--audit-management-root'},
     'progress_timer.py':{'--ticket','--task','--goal','--handle','--seconds'},
+    'dispatch_card.py':{'--store','--card'},
     'agent_cli.py':{'--profile','--task','--cwd','--model','--effort','--prompt-file','--run-dir',
                     '--access','--conversation','--resume-from','--add-dir'},
 }
@@ -54,11 +55,24 @@ def within(path,root):
     return path==root or root in path.parents
 
 
+def next_command(spec):
+    return shlex.join([spec['python'],str(SCRIPTS/'dispatch_card.py'),'next','--store',spec['store']])
+
+
+def loop_text(spec):
+    return ('\n工作方式（与 Claude Code 编排者相同）：只运行 '+next_command(spec)+'，按输出的 do 字段办：'
+            'do=call 时逐字照抄 tool 与 input 发起这一个调用（字段一个不改），返回后立即再运行 next；'
+            'do=wait 时用 command_status/wait 等在跑的命令结束，再运行 next；'
+            'do=ask_user 时把 items 原样告诉用户，拿到原话后按 todo 用 flow.py 登记，再运行 next；'
+            'do=report/done 时把 say、problems、disposition 原样告诉用户。回收、登记、重启后的清理都由 next 完成。'
+            '中断后直接重新启动编排者即可。')
+
+
 def capabilities():
     return ('AGY batch-flow 编排者能力\n'
             '允许：台账管理、定义/派发/回收代理、进度与一次性计时、用户汇报。\n'
             '文件：只读技能 Markdown 和管理记录；只新建 records 内的 json/txt/md 记录。\n'
-            '命令：仅固定 flow.py、progress_timer.py 和已核查 profile 的 agent_cli.py。\n'
+            '命令：仅固定 dispatch_card.py next、flow.py、progress_timer.py 和已核查 profile 的 agent_cli.py。\n'
             '禁止：直接改业务代码、git add/commit/merge、产品构建/测试、任意 shell、MCP。\n'
             '执行者：独立工具配置；主会话门禁不施加到子代理，原有权限审批仍有效。\n'
             '终端：本编排会话关闭 AGY 终端沙箱；固定脚本白名单和执行前门禁仍有效。\n'
@@ -90,7 +104,7 @@ def safe_command(command,spec):
     script=Path(argv[1])
     if not script.is_absolute():return False
     script=script.resolve()
-    if script not in {SCRIPTS/'flow.py',SCRIPTS/'progress_timer.py',SCRIPTS/'agent_cli.py'}:return False
+    if script not in {SCRIPTS/'flow.py',SCRIPTS/'progress_timer.py',SCRIPTS/'agent_cli.py',SCRIPTS/'dispatch_card.py'}:return False
     args=argv[2:]
     if '--' in args:return False
     def option(flag):
@@ -103,6 +117,9 @@ def safe_command(command,spec):
         if option('--store')!=spec['store']:return False
         if any(token in args for token in ['--cwd','--repo','--paths','--git-ref']):return False
         return any(token in FLOW_COMMANDS for token in args) and not any(token in args for token in ['snapshot','record'])
+    if script.name=='dispatch_card.py':
+        # The orchestrator's single command; it makes, starts, collects and registers cards itself.
+        return args[0] in {'next','show'} and option('--store')==spec['store']
     if script.name=='progress_timer.py':
         ticket=option('--ticket')
         return args[0] in {'wait','cancel'} and bool(ticket) and within(ticket,spec['records'])
@@ -189,7 +206,7 @@ def hook(event_name,runtime,event,environ=None):
         paths+='\n能力可随时重新查询：'+shlex.join([spec['python'],str(SCRIPTS/'flow.py'),'capabilities','--store',spec['store']])+'。status/pre_yield 的 host_capabilities 和派发动作 cli_adapter.profile 也会重新提供路径；上下文压缩后先查询，不猜测 profile，不把遗忘路径当成无权限或要求用户换模型。'
         if spec.get('terminal_sandbox') is False:
             paths+='\n本编排会话的终端沙箱已关闭，命令仍必须通过固定脚本门禁，不传 BypassSandbox。首次 start/decision_start 前对拟用 profile 运行 agent_cli.py check --profile <路径> --model <配置模型> --effort <配置值> --cwd <工作目录>，续接另给 --conversation <实际UUID> --resume-from <上轮成功run-dir>，保存真实输出；失败先处理环境，不登记技术尝试。effort=default 表示不覆盖CLI配置，不发送字符串default、不改成medium。逻辑会话名不可用于Codex续接，旧handling登记修复按contexts.md。check 不调用模型，也不证明认证或网络已就绪。不得直接运行 agy/codex/claude 或读取其认证配置。代理进程沿各自原有权限和沙箱执行。'
-        return {'injectSteps':[{'systemMessage':{'systemMessage':capabilities()+paths}}]}
+        return {'injectSteps':[{'systemMessage':{'systemMessage':capabilities()+loop_text(spec)+paths}}]}
     if not owner_path.exists():
         return {'decision':'deny','reason':'launcher SessionStart binding is missing'} if event_name=='PreToolUse' else {}
     owner=load(owner_path)['conversation_id']
@@ -227,7 +244,8 @@ def hook(event_name,runtime,event,environ=None):
                 return {'decision':'continue','reason':'orchestrator role audit '+audit['status']+'; preserve evidence and resolve host/audit issues without product work'}
             return {'decision':'stop','reason':'No initialized ledger yet; report missing approved plan/role configuration to the user. This is not project completion.'}
         command=[spec['python'],str(SCRIPTS/'stop_hook_pre_yield.py'),'--host','agy','--store',spec['store'],
-                 '--role','orchestrator','--conversation',owner,'--audit-log',str(Path(runtime)/'audit.jsonl')]
+                 '--role','orchestrator','--conversation',owner,'--audit-log',str(Path(runtime)/'audit.jsonl'),
+                 '--next-command',next_command(spec)]
         result=subprocess.run(command,input=json.dumps(event),capture_output=True,text=True,timeout=15,check=True)
         return json.loads(result.stdout)
     return {}
@@ -300,7 +318,7 @@ def launch(args):
     spec['runtime']=str(runtime)
     argv=[binary,'--agent',AGENT,'--model',args.model,'--effort',args.effort,'--mode','accept-edits',
           '--settings',json.dumps({'toolPermission':'request-review','enableTerminalSandbox':False}),
-          '--prompt-interactive','你是 batch-flow 编排者。'+capabilities()+'\n当前任务 base：'+str(task_base)+'\n本任务台账：'+str(store)+'\n只协调这个任务，不搜索或切换其他任务。\n技能入口：'+str(SKILL/'SKILL.md')+'\nAGY 原生指南：'+str(SKILL/'references/hosts-agy-codex.md')+'\n先读取指南，按本任务台账状态协调；没有批准计划就报告缺项，不自行做技术工作。']
+          '--prompt-interactive','你是 batch-flow 编排者。'+capabilities()+'\n当前任务 base：'+str(task_base)+'\n本任务台账：'+str(store)+'\n只协调这个任务，不搜索或切换其他任务。'+loop_text(spec)+'\n现在运行 next。']
     if not within(task_base,workspace):argv[1:1]=['--add-dir',str(task_base)]
     print(capabilities(),flush=True)
     print('主模型：'+args.model+' / '+args.effort+'；台账：'+str(store),flush=True)
@@ -310,8 +328,11 @@ def launch(args):
         return 0
     store.parent.mkdir(parents=True,exist_ok=True)
     (workspace/'.agents').mkdir(parents=True,exist_ok=True)
-    with (workspace/'.agents/.batch-flow-orchestrator.lock').open('a') as workspace_lock, (store.parent/'.agy-orchestrator.lock').open('a') as ledger_lock:
-        for lock in [workspace_lock,ledger_lock]:
+    with (workspace/'.agents/.batch-flow-orchestrator.lock').open('a') as workspace_lock, (store.parent/'.agy-orchestrator.lock').open('a') as ledger_lock, \
+            (store.parent/'.orchestrator.lock').open('a') as any_host_lock:
+        # .orchestrator.lock is shared with the Claude Code launcher: one orchestrator per ledger on any host,
+        # so cards of an earlier launch can be treated as finished or interrupted by dispatch_card.py next.
+        for lock in [workspace_lock,ledger_lock,any_host_lock]:
             try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
             except BlockingIOError:raise ValueError('an orchestrator launcher already owns this workspace or ledger')
         runtime.mkdir(parents=True,mode=0o700)
@@ -328,6 +349,7 @@ def launch(args):
                 except (OSError,ValueError,subprocess.SubprocessError) as error:
                     if backend=='agy':raise
                     print(backend+' CLI profile unavailable: '+str(error),file=sys.stderr)
+        spec['started_at']=__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()
         atomic(runtime/'spec.json',spec)
         installed=install(workspace,runtime,spec)
         env=os.environ.copy();env[ENV_KEY]=spec['launch_id']

@@ -99,7 +99,7 @@ class GuardTests(unittest.TestCase):
         cards = self.mgmt / 'records' / 'dispatch'
         prompt = 'read card X sha 1'
         cli = 'python3 %s run --profile p --task T' % (HERE / 'agent_cli.py')
-        for name, call in [('c1', dict(tool='Agent', input=dict(subagent_type='bf-executor', model='sonnet', prompt=prompt, run_in_background=True))),
+        for name, call in [('c1', dict(tool='Agent', input=dict(description='d', subagent_type='bf-executor', model='sonnet', prompt=prompt, run_in_background=True))),
                            ('c2', dict(tool='Bash', input=dict(command=cli))),
                            ('c3', dict(tool='SendMessage', input=dict(to='agent-1', message=prompt)))]:
             (cards / name).mkdir(parents=True)
@@ -116,10 +116,11 @@ class GuardTests(unittest.TestCase):
         (cards / 'c4' / 'card.json').write_text(json.dumps(dict(host_call=dict(tool='Agent', input=dict(ok, effort='medium')))))
         self.assertIsNone(self.run_guard('Agent', dict(ok, effort='medium'), cards=True))
         self.assertIsNone(self.run_guard('Bash', {'command': cli, 'run_in_background': True}, cards=True))
-        self.assertIn('dispatch card', self.run_guard('Bash', {'command': cli + ' --add-dir /'}, cards=True))
+        self.assertIn('dispatch_card.py next', self.run_guard('Bash', {'command': cli + ' --add-dir /'}, cards=True))
         self.assertIsNone(self.run_guard('SendMessage', {'to': 'agent-1', 'message': prompt}, cards=True))
         self.assertIn('dispatch card', self.run_guard('SendMessage', {'to': 'agent-1', 'message': 'just do it'}, cards=True))
-        self.assertIsNone(self.run_guard('Bash', {'command': 'python3 %s make --store f --kind EXECUTE --target T' % (HERE / 'dispatch_card.py')}, cards=True))
+        self.assertIsNone(self.run_guard('Bash', {'command': 'python3 %s next --store f' % (HERE / 'dispatch_card.py')}, cards=True))
+        self.assertDenied('Bash', {'command': 'python3 %s make --store f --kind EXECUTE --target T' % (HERE / 'dispatch_card.py')}, cards=True)
         self.assertIn('record', self.run_guard('Bash', {'command': 'python3 %s --store f record --cwd /x' % (HERE / 'flow.py')}, cards=True))
 
     def test_subagents_and_other_sessions_untouched(self):

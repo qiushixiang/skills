@@ -3,9 +3,12 @@
 
 Nothing is written to .claude/ or global settings: hooks and role agents are passed per launch
 (--settings / --agents) and the runtime directory under the ledger keeps them as evidence.
-Subcommand `context` is the SessionStart hook that re-injects capabilities after compaction/resume.
+Subcommand `context` is the SessionStart hook that re-injects capabilities after compaction.
+Recovery is a restart: every launch is a new session, and `dispatch_card.py next` reconciles what the
+previous launch left (collects finished work, records interrupted work as INVALID so status retries it).
 """
 import argparse
+import datetime
 import fcntl
 import json
 import os
@@ -57,35 +60,25 @@ def agents():
             for name, (tools, label) in ROLE_TOOLS.items()}
 
 
+def next_command(spec):
+    return shlex.join([spec['python'], str(SCRIPTS / 'dispatch_card.py'), 'next', '--store', spec['store']])
+
+
 def capabilities(spec):
-    py = spec['python']; store = spec['store']
-    status = shlex.join([py, str(SCRIPTS / 'flow.py'), '--store', store, 'status'])
-    show = shlex.join([py, str(SCRIPTS / 'dispatch_card.py'), 'show', '--store', store])
-    yield_cmd = shlex.join([py, str(SCRIPTS / 'flow.py'), '--store', store, 'pre_yield', '--conversation', spec['session_id'],
-                            '--audit-log', str(Path(spec['runtime']) / 'audit.jsonl')])
+    status = shlex.join([spec['python'], str(SCRIPTS / 'flow.py'), '--store', spec['store'], 'status'])
     return '\n'.join([
         'Claude Code batch-flow 编排者（受限启动，会话 %s）' % spec['session_id'],
-        '任务目录：' + spec['task_base'], '台账：' + store, '记录目录：' + spec['records'],
-        '源码工作目录：' + spec['workspace'], '技能目录：' + str(SKILL),
+        '任务目录：' + spec['task_base'], '台账：' + spec['store'], '源码工作目录：' + spec['workspace'], '技能目录：' + str(SKILL),
         '',
-        '允许：flow.py（不含 record/snapshot）、dispatch_card.py、progress_timer.py、agent_cli.py check/collect；'
-        '读任务目录和技能目录；在台账目录内新建记录文件（不覆盖）；Agent、SendMessage 和 agent_cli.py run 只能逐字照抄派发卡。',
+        '你只做一件事：运行 ' + next_command(spec) + '，按输出的 do 字段办：',
+        '- do=call：逐字照抄 tool 与 input 发起这一个调用（字段一个不改），返回后立即再运行 next。',
+        '- do=wait：结束本轮，等完成通知；任何完成通知到达后运行 next。',
+        '- do=ask_user：把 items 原样告诉用户；拿到用户原话后按 todo 用 flow.py 登记（如 set_models/authorize），再运行 next。',
+        '- do=report / done：把 say、problems、disposition 原样告诉用户。',
+        '回收、登记、重启后的清理都由 next 完成，不需要你判断。用户问进度时可运行 ' + status + '。',
+        '用户说停：停止发起新调用并结束本轮；要恢复时重启编排者即可（next 会处理上次留下的工作）。',
         '禁止：读业务源码、改代码或设计书、Git 写、产品构建/测试、任意 shell 组合。被 ROLE_BOUNDARY_BLOCKED 拦截时不要换方式绕过，向用户报告。',
-        '',
-        '工作循环：',
-        '1. 运行 ' + status + '，看 actions。',
-        '2. mode=request_user：把 orchestrator_todo 中的待决项原样问用户；拿到原话后按协议登记（set_models/authorize 等）。',
-        '   mode=register / collect_progress：按 orchestrator_todo 机械登记或收集进度，不作技术判断；动作带 register_command 时逐字照抄'
-        '（只登记，随后的 DECIDE 等技术动作仍按其 dispatch_card_command 派给角色，不自己做、不直接请用户批预算）。',
-        '3. mode=dispatch / delegate_to_lead：运行该动作的 dispatch_card_command，然后严格按输出 steps 逐步执行，命令和工具参数逐字照抄，'
-        '<当前revision> 用刚读到的 revision，其余尖括号值用上一步工具返回的真实值。',
-        '4. 后台子代理/进程完成会有通知，不轮询、不猜测结果；计时到期按卡第 6 步汇报并重启计时。'
-        '同一轮有多个动作时先派正式任务，条件确认（CONFIRM_CONDITION）放后。',
-        '   pre_yield 里的 WAITING_CONDITION：上次确认已返回 WAIT_EVIDENCE 且台账无进展，不要重复派发，向用户说明在等哪个任务或实证。',
-        '5. 上下文压缩、重启或忘记进度时运行 ' + show + ' 查看各卡状态，再继续未完成的步骤；不要重复派发已 start 的卡。'
-        '某卡带 lost 字段（子代理随原编排会话终止，不会再有通知）时照抄其中的 abandon 命令，再按 status 重派。',
-        '6. 结束本轮前运行 ' + yield_cmd + '；未通过时按输出处理。',
-        '技术内容（实现、审阅、裁决、方案）一律交给角色，你只协调和登记。',
+        '技术内容（实现、审阅、裁决、方案）一律交给角色，你只协调。',
     ])
 
 
@@ -107,7 +100,7 @@ def settings(spec):
         'PreToolUse': [{'matcher': '*', 'hooks': [guard]}],
         'PostToolUse': [{'matcher': '*', 'hooks': [cmd(str(SCRIPTS / 'role_audit.py'), 'record', '--host', 'claude', '--conversation', sid, '--log', log)]}],
         'Stop': [{'hooks': [cmd(str(SCRIPTS / 'stop_hook_pre_yield.py'), '--host', 'claude', '--store', store, '--role', 'orchestrator',
-                                '--conversation', sid, '--audit-log', log)]}],
+                                '--conversation', sid, '--audit-log', log, '--next-command', next_command(spec))]}],
     }}
 
 
@@ -125,15 +118,6 @@ def context_hook(runtime):
 
 def build(args):
     workspace = Path(args.workspace).resolve(strict=True)
-    if args.resume_launch:
-        store = Path(args.store).resolve() if args.store else None
-        if store is None:
-            raise ValueError('--resume-launch requires --store of the bound ledger')
-        runtime = store.parent / '.claude-launch' / args.resume_launch
-        spec = json.loads((runtime / 'spec.json').read_text())
-        if Path(spec['store']).resolve() != store:
-            raise ValueError('launch belongs to another ledger')
-        return spec, runtime, True
     if not args.task_base:
         if not sys.stdin.isatty():
             raise ValueError('specify the current task directory with --task-base; no task is selected automatically')
@@ -151,12 +135,11 @@ def build(args):
     spec = dict(launch_id=launch_id, session_id=str(uuid.uuid4()), python=sys.executable, workspace=str(workspace),
                 task_base=str(task_base), store=str(store), records=str(store.parent / 'records'), runtime=str(runtime),
                 profiles=[], model=args.model, effort=args.effort)
-    return spec, runtime, False
+    return spec, runtime
 
 
-def argv_for(spec, binary, runtime, resumed):
-    argv = [binary, '--model', spec['model']]
-    argv += ['--resume', spec['session_id']] if resumed else ['--session-id', spec['session_id']]
+def argv_for(spec, binary, runtime):
+    argv = [binary, '--model', spec['model'], '--session-id', spec['session_id']]
     argv += ['--settings', str(Path(runtime) / 'settings.json'), '--agents', json.dumps(agents(), ensure_ascii=False),
              '--append-system-prompt', capabilities(spec)]
     if spec.get('effort'):
@@ -166,8 +149,7 @@ def argv_for(spec, binary, runtime, resumed):
     for extra in [spec['task_base'], str(SKILL)]:
         if not within(extra, spec['workspace']):
             argv += ['--add-dir', extra]
-    if not resumed:
-        argv.append('你是本任务的 batch-flow 编排者。按系统提示中的工作循环，从第 1 步开始。')
+    argv.append('你是本任务的 batch-flow 编排者。现在运行 next。')
     return argv
 
 
@@ -180,38 +162,39 @@ def launch(args):
     version = subprocess.run([binary, '--version'], capture_output=True, text=True, check=True, timeout=15).stdout.split()[0]
     if version not in VERIFIED_VERSIONS:
         raise ValueError('launcher verified for Claude Code %s; review hook/agent interfaces before upgrading (found %s)' % (sorted(VERIFIED_VERSIONS), version))
-    spec, runtime, resumed = build(args)
-    argv = argv_for(spec, binary, runtime, resumed)
+    spec, runtime = build(args)
+    argv = argv_for(spec, binary, runtime)
     if args.dry_run:
         print(json.dumps(dict(event='CLAUDE_LAUNCH_DRY_RUN', spec=spec, settings=settings(spec), argv=argv,
                                     env={ENV_KEY: spec['launch_id'], DEPTH_KEY: SPAWN_DEPTH}), ensure_ascii=False, indent=2))
         return 0
     store = Path(spec['store'])
     store.parent.mkdir(parents=True, exist_ok=True)
-    with (store.parent / '.claude-orchestrator.lock').open('a') as lock:
+    # .orchestrator.lock is shared with the AGY launcher: one orchestrator per ledger on any host.
+    with (store.parent / '.claude-orchestrator.lock').open('a') as lock, (store.parent / '.orchestrator.lock').open('a') as any_host:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB); fcntl.flock(any_host, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise ValueError('another Claude Code orchestrator launcher owns this ledger')
-        if not resumed:
-            runtime.mkdir(parents=True, mode=0o700)
-            (Path(spec['records']) / 'dispatch').mkdir(parents=True, exist_ok=True)
-            import agent_cli
-            for backend in ['agy', 'codex', 'claude']:
-                executable = shutil.which(backend)
-                if not executable:
-                    continue
-                profile = runtime / (backend + '-profile.json')
-                try:
-                    agent_cli.probe(backend, profile, executable)
-                    spec['profiles'].append(str(profile))
-                except (OSError, ValueError, subprocess.SubprocessError) as error:
-                    print(backend + ' CLI profile unavailable: ' + str(error), file=sys.stderr)
-            atomic(runtime / 'spec.json', spec)
-        # Rewritten on resume too, so a resumed session gets the current hook rules (role agents come from argv).
+            raise ValueError('another orchestrator launcher (Claude Code or AGY) owns this ledger')
+        runtime.mkdir(parents=True, mode=0o700)
+        (Path(spec['records']) / 'dispatch').mkdir(parents=True, exist_ok=True)
+        import agent_cli
+        for backend in ['agy', 'codex', 'claude']:
+            executable = shutil.which(backend)
+            if not executable:
+                continue
+            profile = runtime / (backend + '-profile.json')
+            try:
+                agent_cli.probe(backend, profile, executable)
+                spec['profiles'].append(str(profile))
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                print(backend + ' CLI profile unavailable: ' + str(error), file=sys.stderr)
+        # Taken under the ledger lock: cards of earlier launches cannot still be running in Claude Code.
+        spec['started_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        atomic(runtime / 'spec.json', spec)
         atomic(runtime / 'settings.json', settings(spec))
         print(capabilities(spec), flush=True)
-        print('launch_id=%s session_id=%s（续接：--resume-launch %s --store %s）' % (spec['launch_id'], spec['session_id'], spec['launch_id'], spec['store']), flush=True)
+        print('launch_id=%s session_id=%s（中断后直接重新启动即可）' % (spec['launch_id'], spec['session_id']), flush=True)
         env = os.environ.copy(); env[ENV_KEY] = spec['launch_id']; env[DEPTH_KEY] = SPAWN_DEPTH
         return subprocess.call(argv, cwd=spec['workspace'], env=env)
 
@@ -226,7 +209,6 @@ def main():
     parser.add_argument('--store', help='flow.json inside the task; default <task-base>/.batch-flow/flow.json')
     parser.add_argument('--model', default='haiku', help='orchestrator model (default haiku)')
     parser.add_argument('--effort', choices=['low', 'medium', 'high', 'xhigh', 'max'], help='omit to inherit CLI config')
-    parser.add_argument('--resume-launch', help='launch_id to resume the same orchestrator session')
     parser.add_argument('--binary', default='claude')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()

@@ -72,11 +72,11 @@ class LauncherTests(unittest.TestCase):
                                  input=json.dumps(dict(session_id=sid, source='compact')), capture_output=True, text=True)
             text = json.loads(ctx.stdout).get('hookSpecificOutput', {}).get('additionalContext', '')
             self.assertEqual('dispatch_card.py' in text, expect)
-        proc = subprocess.run([sys.executable, str(LAUNCHER), '--workspace', str(self.ws), '--store', spec['store'],
-                               '--resume-launch', spec['launch_id']], capture_output=True, text=True, env=self.env)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        argv = json.loads(self.capture.read_text())['argv']
-        self.assertEqual(argv[argv.index('--resume') + 1], spec['session_id']); self.assertNotIn('--session-id', argv)
+        self.assertTrue(spec['started_at'])
+        stop = json.loads((runtime / 'settings.json').read_text())['hooks']['Stop'][0]['hooks'][0]['command']
+        self.assertIn('--next-command', stop)
+        proc = self.launch('--resume-launch', spec['launch_id'])  # restart is a new launch; no resume
+        self.assertEqual(proc.returncode, 2)
 
     def test_shell_wrapper_symlink_uses_link_dir_as_workspace(self):
         link = self.ws / 'start-claude-orchestrator.sh'

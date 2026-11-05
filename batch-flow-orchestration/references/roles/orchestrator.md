@@ -23,7 +23,20 @@
 
 Linux CLI 的 `cli_adapter` 指向[固定派发入口](../linux-cli.md)。按其 probe/run/collect 调用和回收，不临时编写 CLI 调用脚本；已有同版本 profile 不重新探索调用方法。原生代理工具仍按宿主说明。
 
-Claude Code 主会话在 Linux 上经[受限启动器](../claude-code.md#0-编排者受限启动与派发卡linux推荐)启动，派发动作一律先运行 status 给出的 `dispatch_card_command`，再逐字照抄卡中步骤，不自拟派发提示。AGY 主会话在 Linux 上使用[受限启动器与原生派发指南](../hosts-agy-codex.md#agy-编排者linux-受限启动)，不要把角色进程的 CLI run 命令当作主会话启动方式。启动器显示并注入能力，先定义专用执行者再派发，不使用 self 克隆编排者。
+主会话在 Linux 上经本宿主受限启动器启动：[Claude Code](../claude-code.md#0-编排者受限启动与派发卡linux推荐)、[AGY](../hosts-agy-codex.md#agy-编排者linux-受限启动)。不要把角色进程的 CLI run 命令当作主会话启动方式。
+
+### 派发只用 next（两宿主相同）
+
+编排者只运行 `scripts/dispatch_card.py next --store <台账>`，按输出 `do` 办：
+
+- `call`：逐字照抄 `tool` 与 `input` 发起这一个调用（字段一个不改），返回后立即再运行 next。
+- `wait`：有工作在运行，结束本轮等完成通知（AGY 用 command_status/wait），之后运行 next。
+- `ask_user`：把 items 原样告诉用户；拿到原话后按 todo 用 flow.py 登记（set_models/authorize 等），再运行 next。
+- `report` / `done`：把 say、problems、disposition 原样告诉用户。
+
+next 自己完成：生成派发卡与提示、start、回执、register_dispatch（宿主通知作计时）、回收交付写 result.md、finish、机械的 REGISTER_DECISION/CLOSE_DECISION，以及正式任务先于条件确认、等待中的确认不重派。编排者不再手写回执、计时或登记命令。
+
+**中断即重启**：不续接旧编排会话。两宿主启动器共用台账锁 `.orchestrator.lock`，同一台账同时只有一个编排者；所以新启动的第一次 next 把此前启动留下的未回收卡一律视为已结束：已交付的照常回收；随会话终止或 CLI 运行失败的按宿主中断登记 INVALID（附 lost.json），status 以 retry_of 重派、不增加技术轮次；仍存活的 CLI 进程继续等待。用户说停时停止发起新调用并结束本轮，恢复时重启即可。
 
 每次读取下一动作先按顶层 `orchestrator_todo` 和 `orchestrator_action` 协调、派发或登记；`subagent_payload.instruction` 是实际责任人的工作内容，只传给指定角色，不当作编排者自己的执行指令。字段含义见[下一动作协议](../protocol-dispatch.md)。
 

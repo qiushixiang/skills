@@ -1635,10 +1635,10 @@ def attach_host_capabilities(result, store):
     target=result.get('next',result)
     if target is not result:target['host_capabilities']=host
     for action in target.get('actions',[]):
-        if host.get('host')=='claude' and host['status']=='bound' and action.get('orchestrator_action',{}).get('mode') in {'dispatch','delegate_to_lead'}:
-            # Claude Code orchestrators dispatch through a card instead of composing the role prompt.
-            action['dispatch_card_command']=shlex.join([host['python'],str(Path(__file__).resolve().parent/'dispatch_card.py'),'make',
-                                                        '--store',str(Path(store).resolve()),'--kind',action['kind'],'--target',action['target']])
+        if host['status']=='bound' and action.get('orchestrator_action',{}).get('mode') in {'dispatch','delegate_to_lead'}:
+            # Orchestrators (Claude Code and AGY) never compose a dispatch: `dispatch_card.py next` makes, starts and collects cards.
+            action['next_command']=shlex.join([host['python'],str(Path(__file__).resolve().parent/'dispatch_card.py'),'next',
+                                               '--store',str(Path(store).resolve())])
         if action.get('kind')=='CLOSE_DECISION':
             action['register_command']=shlex.join([host.get('python') or sys.executable,str(Path(__file__).resolve()),'--store',str(Path(store).resolve()),
                 'close','--actor','orchestrator','--revision','<当前revision>','--id',action['target'],'--note','恢复条件已由 status 判定齐全，机械闭环'])

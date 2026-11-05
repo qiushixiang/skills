@@ -78,6 +78,7 @@ def main():
     parser.add_argument('--conversation',help='bound owner conversation ID; required for a live hook')
     parser.add_argument('--audit-log',type=Path,help='optional bound role audit log; missing/invalid log blocks when enabled')
     parser.add_argument('--audit-management-root',type=Path,action='append',default=[])
+    parser.add_argument('--next-command',help='Claude Code launcher: the one command that advances the orchestrator')
     args=parser.parse_args()
     event, err = read_event()
     if not isinstance(event, dict):
@@ -136,6 +137,8 @@ def main():
     actions=', '.join(str(a.get('target')) for a in report.get('actions',[]))
     problems='; '.join(str(p.get('reason')) for p in report.get('dispatch_problems',[]))
     message=f"batch-flow {report.get('disposition','UNKNOWN')}: {actions or problems or 'inspect current responsibility and recovery conditions'}"
+    if args.next_command:
+        message+='。运行 '+args.next_command+' 并按其 do 字段处理'
     print(json.dumps(response(args.host,True,message),ensure_ascii=False))
 
 if __name__=='__main__':

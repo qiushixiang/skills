@@ -8,7 +8,7 @@ description: 按已批准配置真实派发代理，登记回执、计时和回�
 
 **调用入口先固定**：Linux 上派发 AGY、Codex CLI、Claude Code CLI，一律按[Linux CLI 固定入口](../../references/linux-cli.md)使用 `scripts/agent_cli.py` 的 probe/run/collect；profile 同版本复用，不每次探索参数或重写调用器。原生工具按宿主只读一份：[AGY 与 Codex](../../references/hosts-agy-codex.md)、[Claude Code](../../references/claude-code.md)。正式台账登记、授权、预算和计时仍按下述流程执行。
 
-Claude Code 担任主编排者时按[受限启动与派发卡](../../references/claude-code.md#0-编排者受限启动与派发卡linux推荐)：每个派发动作先 `dispatch_card.py make`，照卡调用与登记。AGY 担任主编排者时按[受限启动与原生定义/派发](../../references/hosts-agy-codex.md#agy-编排者linux-受限启动)使用启动器及 define_subagent/invoke_subagent；独立 CLI 角色才使用上述包装器。原生接口不能表达已批准的模型/effort 时走固定 CLI 入口，不静默改用 flash 或继承主模型。
+Claude Code 或 AGY 担任主编排者时，一律经各自受限启动器并[只运行 next](../../references/roles/orchestrator.md#派发只用-next两宿主相同)：卡、调用、回执、计时与回收登记由 `dispatch_card.py next` 完成，下述登记规则由它机械执行。AGY 编排者经 next 走固定 CLI 入口，不再手工 define_subagent/invoke_subagent；原生接口不能表达已批准的模型/effort，也无法由脚本回收。
 
 当前 `dispatch_owner` 核对授权、实际模型/工具/effort、版本、预算与上下文；先 start，再真实调用宿主工具。首派给完整 task.instruction 和已有设计书定位（批准的小任务可无设计书），续接给生效差异，换人/兜底给完整当前指令。运行句柄、不可变原始回执、原生 timer ID 或脚本 ticket 到手后 register_dispatch；快速结束直接 finish。重复派发写任务前先核实原句柄。
 

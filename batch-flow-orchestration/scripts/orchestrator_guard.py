@@ -84,14 +84,14 @@ def check_bash(inputs, cwd, read_roots, card_root=None):
             return 'python is allowed only to run the skill management scripts'
         if script.name == 'flow.py' and ('--' in words[2:] or 'snapshot' in words[2:] or 'record' in words[2:]):
             return 'flow.py record/snapshot capture product commands and diffs; that is executor work'
-        if script.name == 'dispatch_card.py' and ('--as-lead' in words[2:] or any(w.endswith('-lead') for w in words[2:])):
-            return 'dispatch_card.py --as-lead belongs to the technical lead subagent, not the orchestrator'
+        if script.name == 'dispatch_card.py' and (words[2:3] not in (['next'], ['show']) or '--as-lead' in words[2:]):
+            return 'the orchestrator runs only dispatch_card.py next (it makes, starts, collects and registers cards itself)'
         if script.name == 'flow.py' and any(w == '--actor' for w in words[2:]) and 'architect' in words[2:] and \
                 any(op in words[2:] for op in ['start', 'register_dispatch']):
             return 'start/register as architect is the technical lead dispatch; delegate the card instead'
         if script.name == 'agent_cli.py' and 'run' in words[2:3] and card_root is not None and \
                 not matches_card('Bash', dict(command=command.strip()), card_root, ['command']):
-            return 'agent_cli.py run must be copied verbatim from a dispatch card (dispatch_card.py make)'
+            return 'agent_cli.py run must be copied verbatim from dispatch_card.py next'
         return None
     if exe in READ_COMMANDS:
         paths = [word for word in words[1:] if not word.startswith('-')]
@@ -158,8 +158,8 @@ def decide(event, conversation, management_roots, read_roots, agent_types, agent
         if kind == 'fork' or kind not in agent_types:
             return 'subagent_type %r is not a registered role agent type' % kind
         if card_root is not None:
-            if not matches_card('Agent', inputs, card_root, ['subagent_type', 'model', 'prompt', 'effort', 'run_in_background']):
-                return 'Agent dispatch must be copied verbatim from a dispatch card (dispatch_card.py make)'
+            if not matches_card('Agent', inputs, card_root, ['description', 'subagent_type', 'model', 'prompt', 'effort', 'run_in_background']):
+                return 'Agent dispatch must be copied verbatim from dispatch_card.py next (a dispatch card)'
             return None
         if inputs.get('model') not in agent_models:
             return 'Agent dispatch must pass an explicit registered model, got %r' % inputs.get('model')

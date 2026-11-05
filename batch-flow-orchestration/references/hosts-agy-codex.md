@@ -27,7 +27,7 @@ python3 <技能目录>/scripts/start_agy_orchestrator.py --workspace <源码项�
 
 - view_file 只读技能 Markdown、绑定台账、管理 records 和启动器记录的子会话宿主元数据。
 - write_to_file 只允许 `Overwrite=false`，在 `<台账父目录>/records` 新建 json/txt/md；不允许改源码、正式台账、启动器配置、agent 定义或 hooks。
-- run_command 只允许绝对 Python 路径调用固定 flow.py/progress_timer.py/agent_cli.py，使用规范 shell 引用；不支持 shell 拼接、解释器任意代码、record/snapshot、参数缩写、复用终端或修改权限配置。flow.py 必须显式绑定本次 store。CLI 角色进程只能用启动器核查并保护的 profile；不传任意 settings，不扩大项目目录范围。
+- run_command 只允许绝对 Python 路径调用固定 dispatch_card.py next/show（绑定本次 store）及 flow.py/progress_timer.py/agent_cli.py，使用规范 shell 引用；不支持 shell 拼接、解释器任意代码、record/snapshot、参数缩写、复用终端或修改权限配置。flow.py 必须显式绑定本次 store。CLI 角色进程只能用启动器核查并保护的 profile；不传任意 settings，不扩大项目目录范围。
 - 原生任务管理只查 list/status，不允许 send_input 注入别的终端；进度 schedule 只允许最多 600 秒的一次性计时。
 
 **编排者终端不使用沙箱**：按用户选择，启动器不传 --sandbox，在本次 --settings 显式设 enableTerminalSandbox=false、toolPermission=request-review；不改全局配置，不设置 always-proceed 或全局 command(*)。自定义主 agent 不再强制 commandExecutionPolicy=sandbox。所有命令在宿主执行前仍经 PreToolUse 精确核对固定脚本、受保护 profile 和参数范围；任意 shell、直接运行 agy/codex/claude、业务构建及编辑仍拒绝。不传 BypassSandbox，也不把代理配置或认证目录加入主会话文件工具白名单。已有权限审批仍适用。
@@ -52,7 +52,12 @@ Stop 同时连接 pre_yield 和[角色审计](role-audit.md)，明确用户停�
 
 新项目尚无正式台账时，Stop 只核查已采集的角色审计；审计正常即可报告缺少批准计划/角色配置并等待用户，不假报项目完成，也不因不存在 flow.json 无限续作。有正式台账后恢复完整 pre_yield 门禁。
 
+**编排方式与 Claude Code 相同**：编排者[只运行 next](roles/orchestrator.md#派发只用-next两宿主相同)。本宿主的调用形态是 `run_command`（CommandLine 为卡中的 `agent_cli.py run`），角色 tool 为 agy/codex/claude-cli（AGY 宿主内裸 claude 视为 claude-cli）；Claude 子代理类配置在 AGY 下报错，不静默替换。next 以 `run/exit.json` 回收，进程仍在则等待；台账锁与 Claude 启动器共用，中断后直接重新启动。
+
 ## AGY 原生：定义执行者，再实际派发
+
+以下原生接口供维护核查和非启动器场景使用；受限启动器下的编排者经 next 派发，不手工 define_subagent/invoke_subagent。
+
 
 本启动器的自定义主代理在真实 1.4.12 运行时要求 PascalCase 定义字段（Name/Description/SystemPrompt），小写形式会明确报缺少这些必填项。[官方 hooks 工具表](https://antigravity.google/docs/hooks/#agent-collaboration)描述的 snake_case 属于不同接口，不能替代当前运行时校验。此处固定使用已验证启动方式和下列定义，不每轮重新猜参数。
 
