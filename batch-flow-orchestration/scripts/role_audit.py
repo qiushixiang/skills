@@ -20,12 +20,18 @@ AGENT_TOOLS={'invoke_subagent','spawn_agent','followup_task','send_message','sen
              'agent','task','wait_agent','list_agents','interrupt_agent','wait','write_stdin',
              'define_subagent','manage_subagents','manage_task','schedule','ask_question','list_permissions'}
 AGENT_TOOLS.update({'command_status','finish','wait_5_seconds'})
+# Claude Code coordination tools (2.1.318).
+AGENT_TOOLS.update({'taskstop','taskoutput','toolsearch','askuserquestion','listagents','croncreate',
+                    'crondelete','cronlist','schedulewakeup','pushnotification','skill'})
+MANAGEMENT=['flow.py','agent_cli.py','progress_timer.py','dispatch_card.py','workflow_metrics.py']
 
 
 def append_event(log, host, conversation, event, begin=False):
     actual=event.get('conversationId') if host=='agy' else event.get('session_id')
     if not conversation or actual!=conversation:
         return False
+    if host=='claude' and event.get('agent_id'):
+        return False  # Claude Code subagents share session_id; their calls are not orchestrator calls.
     row=dict(format=FORMAT,session_id=actual,kind='begin' if begin else 'tool',
              time=dt.datetime.now(dt.timezone.utc).isoformat())
     if not begin:
@@ -59,8 +65,8 @@ def shell_check(command, cwd, roots):
         return 'unavailable','missing shell command'
     try:literal=shlex.split(command)
     except ValueError:literal=[]
-    if len(literal)>1 and command==shlex.join(literal) and Path(literal[0]).name in {'python','python3'} and Path(literal[1]).resolve() in [SCRIPTS/name for name in ['flow.py','agent_cli.py','progress_timer.py']]:
-        if Path(literal[1]).name=='flow.py' and ('--' in literal[2:] or 'snapshot' in literal[2:]):
+    if len(literal)>1 and command==shlex.join(literal) and re.fullmatch(r'python(3(\.\d+)?)?',Path(literal[0]).name) and Path(literal[1]).resolve() in [SCRIPTS/name for name in MANAGEMENT]:
+        if Path(literal[1]).name=='flow.py' and ('--' in literal[2:] or 'snapshot' in literal[2:] or 'record' in literal[2:]):
             return 'violation','orchestrator used a management helper for product command/diff capture'
         return 'clean','canonical literal management command'
     # Dynamic shell/code wrappers require a stronger host audit, not guessed intent.
@@ -90,13 +96,13 @@ def shell_check(command, cwd, roots):
                 return 'violation','orchestrator called a Git write operation: '+operation
             if operation in {'status','rev-parse','ls-files','version'}:continue
             return 'unavailable','Git operation is outside the mechanical metadata subset'
-        if executable in {'python','python3'} and len(words)>1:
+        if re.fullmatch(r'python(3(\.\d+)?)?',executable) and len(words)>1:
             script=Path(words[1])
             if not script.is_absolute():
                 if not cwd:return 'unavailable','script path lacks cwd'
                 script=Path(cwd)/script
-            if script.resolve() in [SCRIPTS/name for name in ['flow.py','agent_cli.py','progress_timer.py']]:
-                if script.name=='flow.py' and ('--' in words[2:] or 'snapshot' in words[2:]):
+            if script.resolve() in [SCRIPTS/name for name in MANAGEMENT]:
+                if script.name=='flow.py' and ('--' in words[2:] or 'snapshot' in words[2:] or 'record' in words[2:]):
                     return 'violation','orchestrator used a management helper for product command/diff capture'
                 continue
         # A script invocation is technical work even if its name is not build.sh.

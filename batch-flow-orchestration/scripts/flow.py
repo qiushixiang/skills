@@ -1517,16 +1517,18 @@ def shortcut(args, root):
 def host_capabilities(store, environ=None):
     """Recover only the launch bound to this process and store; never search other sessions."""
     env=os.environ if environ is None else environ
-    launch_id=env.get('BATCH_FLOW_AGY_LAUNCH')
+    host='agy' if env.get('BATCH_FLOW_AGY_LAUNCH') else 'claude' if env.get('BATCH_FLOW_CLAUDE_LAUNCH') else None
+    launch_id=env.get('BATCH_FLOW_AGY_LAUNCH') or env.get('BATCH_FLOW_CLAUDE_LAUNCH')
     if not launch_id:
-        return dict(status='unbound',profiles={},reason='not running in an AGY launcher session; this does not mean a CLI is uninstalled')
+        return dict(status='unbound',profiles={},reason='not running in an AGY/Claude Code launcher session; this does not mean a CLI is uninstalled')
     try:
         require(len(launch_id)==32 and all(c in '0123456789abcdef' for c in launch_id),'invalid launcher identity')
-        store=Path(store).resolve();root=store.parent/'.agy-launch';runtime=(root/launch_id).resolve()
+        store=Path(store).resolve();root=store.parent/('.agy-launch' if host=='agy' else '.claude-launch');runtime=(root/launch_id).resolve()
         require(runtime.parent==root.resolve(),'runtime escaped the bound management directory')
         spec=json.loads((runtime/'spec.json').read_text())
         require(spec.get('launch_id')==launch_id and Path(spec['store']).resolve()==store and Path(spec['runtime']).resolve()==runtime,'launcher/store binding mismatch')
-        owner=json.loads((runtime/'owner.json').read_text())
+        # Claude Code sessions are pre-bound with --session-id; AGY reports its ID at SessionStart.
+        owner=json.loads((runtime/'owner.json').read_text()) if host=='agy' else {'conversation_id':spec.get('session_id')}
         require(bool(owner.get('conversation_id')),'SessionStart binding missing')
         profiles={}
         for name in spec.get('profiles',[]):
@@ -1537,7 +1539,7 @@ def host_capabilities(store, environ=None):
             require(profile.get('format')=='batch-flow-cli/v1' and backend in {'agy','codex','claude'},'invalid launcher CLI profile')
             require(backend not in profiles,'ambiguous launcher backend profile')
             profiles[backend]=dict(path=str(path),version=profile['version'],binary=profile['binary'])
-        return dict(status='bound',launch_id=launch_id,workspace=spec['workspace'],
+        return dict(status='bound',host=host,launch_id=launch_id,workspace=spec['workspace'],conversation_id=owner['conversation_id'],
                     task_base=spec.get('task_base'),store=str(store),python=spec['python'],profiles=profiles,
                     query_command=shlex.join([spec['python'],str(Path(__file__).resolve()),'capabilities','--store',str(store)]),
                     limit='Launcher metadata only; use agent_cli.py check/run for actual CLI availability. Never guess a profile or switch models because startup context was lost.')
@@ -1546,12 +1548,16 @@ def host_capabilities(store, environ=None):
 
 
 def attach_host_capabilities(result, store):
-    if not os.environ.get('BATCH_FLOW_AGY_LAUNCH'):return result
+    if not (os.environ.get('BATCH_FLOW_AGY_LAUNCH') or os.environ.get('BATCH_FLOW_CLAUDE_LAUNCH')):return result
     host=host_capabilities(store)
     result['host_capabilities']=host
     target=result.get('next',result)
     if target is not result:target['host_capabilities']=host
     for action in target.get('actions',[]):
+        if host.get('host')=='claude' and host['status']=='bound' and action.get('orchestrator_action',{}).get('mode') in {'dispatch','delegate_to_lead'}:
+            # Claude Code orchestrators dispatch through a card instead of composing the role prompt.
+            action['dispatch_card_command']=shlex.join([host['python'],str(Path(__file__).resolve().parent/'dispatch_card.py'),'make',
+                                                        '--store',str(Path(store).resolve()),'--kind',action['kind'],'--target',action['target']])
         adapter=action.get('cli_adapter')
         if not adapter:continue
         profile=host.get('profiles',{}).get(adapter['backend'])

@@ -25,6 +25,15 @@ class AuditTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(audit.shell_check(command,str(self.root),[]) [0],'violation')
 
+    def test_claude_subagent_calls_are_not_orchestrator_calls(self):
+        audit.append_event(self.log,'claude','owner',dict(session_id='owner',agent_id='a1',agent_type='bf-executor',
+                           tool_name='Edit',tool_input=dict(file_path=str(self.root/'src.c')),cwd=str(self.root)))
+        self.tool('ToolSearch',dict(query='select:SendMessage'))
+        self.tool('Bash',dict(command='python3 '+str(audit.SCRIPTS/'dispatch_card.py')+' show --store f'))
+        self.assertEqual(self.report()['status'],'clean')
+        self.tool('Bash',dict(command='python3 '+str(audit.SCRIPTS/'flow.py')+' --store f record --cwd x'))
+        self.assertEqual(self.report()['status'],'violation')
+
     def test_dispatch_payload_does_not_count_as_direct_execution(self):
         self.tool('Agent',dict(prompt='Run git commit and ./build.sh in the executor'))
         self.assertEqual(self.report()['status'],'clean')

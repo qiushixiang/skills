@@ -8,7 +8,7 @@ description: 检查宿主真实计时与 stop hook 能力并验证任务绑定�
 
 优先当前宿主实际暴露、可唤醒负责会话的一次性原生 schedule。AGY [官方 schedule](https://www.antigravity.google/docs/commands/schedule) 支持 DurationSeconds、Prompt、TimerCondition；使用一次 600 秒，到期汇报后按需重设，任务结束取消，headless 会等待 timer。2026-10-26 本机 Codex CLI 0.164.0 无定时创建入口；[官方 automations](https://learn.chatgpt.com/docs/automations?surface=app)未给 CLI 管理界面。Codex App/Web 仅实际暴露可用工具且能唤醒时使用；queue、sleep 和完成通知不是 schedule。无原生能力用 progress_timer.py；无宿主通知须主动短轮询，不能承诺离线保证。
 
-Claude Code 两种使用方式的计时与 hook 配置见 [Claude Code 宿主](../../references/claude-code.md)。
+Claude Code 编排者的前置工具拦截（orchestrator_guard.py）、两种使用方式的计时与 hook 配置见 [Claude Code 宿主](../../references/claude-code.md)。
 
 stop hook 显式绑定 `python3 <技能目录>/scripts/stop_hook_pre_yield.py --host <agy、codex或claude> --store <本任务绝对flow.json> --role <orchestrator或architect> --conversation <负责会话真实ID>`。缺少会话绑定不会启用拦截；不扫描固定产品路径，不拦其他执行或审阅会话。局部负责人只检查承接范围；等待外部依赖时先交回全局编排，不能声称存在未登记的后台进程。
 

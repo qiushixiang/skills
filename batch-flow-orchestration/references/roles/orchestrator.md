@@ -23,7 +23,7 @@
 
 Linux CLI 的 `cli_adapter` 指向[固定派发入口](../linux-cli.md)。按其 probe/run/collect 调用和回收，不临时编写 CLI 调用脚本；已有同版本 profile 不重新探索调用方法。原生代理工具仍按宿主说明。
 
-AGY 主会话在 Linux 上使用[受限启动器与原生派发指南](../hosts-agy-codex.md#agy-编排者linux-受限启动)，不要把角色进程的 CLI run 命令当作主会话启动方式。启动器显示并注入能力，先定义专用执行者再派发，不使用 self 克隆编排者。
+Claude Code 主会话在 Linux 上经[受限启动器](../claude-code.md#0-编排者受限启动与派发卡linux推荐)启动，派发动作一律先运行 status 给出的 `dispatch_card_command`，再逐字照抄卡中步骤，不自拟派发提示。AGY 主会话在 Linux 上使用[受限启动器与原生派发指南](../hosts-agy-codex.md#agy-编排者linux-受限启动)，不要把角色进程的 CLI run 命令当作主会话启动方式。启动器显示并注入能力，先定义专用执行者再派发，不使用 self 克隆编排者。
 
 每次读取下一动作先按顶层 `orchestrator_todo` 和 `orchestrator_action` 协调、派发或登记；`subagent_payload.instruction` 是实际责任人的工作内容，只传给指定角色，不当作编排者自己的执行指令。字段含义见[下一动作协议](../protocol-dispatch.md)。
 

@@ -5,3 +5,4 @@ __pycache__/
 .agy-launch/
 *.log
 .venv/
+.claude-launch/

@@ -4,6 +4,23 @@
 
 本文只写 Claude Code 的派发、续接、回收、计时和 stop hook 接法；职责、上下文隔离、预算与登记规则不变，仍按[协作指南](agent-collaboration.md)、[上下文规则](contexts.md)和[协议](protocol.md)执行。参数以本机 `claude --help` 为准，CLI 升级后重新核对；不使用 `--dangerously-skip-permissions`、`bypassPermissions` 或其他绕过权限的参数。
 
+## 0. 编排者受限启动与派发卡（Linux，推荐）
+
+用户选定 Claude Code 主会话担任编排者（可用 haiku 等轻量模型）时，经启动器开会话，不手工拼 hook 与派发提示：
+
+Shell 入口实际位于 `<技能目录>/scripts/start-claude-orchestrator.sh`，项目根的同名文件仅为指向它的相对软链接。通过项目根软链接启动时默认使用链接所在目录作为源码工作目录；直接运行技能脚本时默认使用当前目录，也可显式 `--workspace` 覆盖。未给 `--task-base` 时在终端询问，不自动选择任务。
+
+```text
+./start-claude-orchestrator.sh
+./start-claude-orchestrator.sh --task-base <当前具体任务目录>
+./start-claude-orchestrator.sh --task-base <任务目录> --model <主模型> [--effort <effort>] [--dry-run]
+./start-claude-orchestrator.sh --store <flow.json> --resume-launch <launch_id>   # 续接同一编排会话
+```
+
+启动器只在 `<台账目录>/.claude-launch/<launch_id>/` 写 spec、settings、审计日志和 CLI profile，不写 `.claude/` 或全局配置；以 `--session-id` 预绑会话，经 `--settings` 挂 SessionStart（压缩/续接后重注入能力）、UserPromptSubmit/PostToolUse（[角色审计](role-audit.md)）、PreToolUse（`orchestrator_guard.py`，带 `--card-root`）、Stop（pre_yield）；经 `--agents` 定义 `bf-executor`/`bf-architect`（可编辑）和 `bf-reviewer`（无编辑工具），角色均无 Agent 工具；环境变量 `BATCH_FLOW_CLAUDE_LAUNCH` 使 `flow.py status` 给出 host_capabilities、CLI profile 和每个派发动作的 `dispatch_card_command`。仅 2.1.318 已验证，升级后先核对接口。
+
+派发卡 `scripts/dispatch_card.py`：`make` 把一个 dispatch/delegate_to_lead 动作生成不可变的 `records/dispatch/<卡>/prompt.md`（通用角色头、设计书定位、角色入口、台账原文 instruction、交付结构、原始载荷）和逐字可抄的宿主调用：claude-agent/claude-code 角色为 Agent（短提示指向 prompt.md 及其 sha256，`resume` 时为 SendMessage），agy/codex/claude-cli 为 `agent_cli.py run` 后台命令；`start`/`register`/`finish` 按卡机械调用 flow.py（显式 `--revision`），finish 从交付首行“结果：<值>”取结果，缺失则退回角色，不代填；`show` 在压缩后恢复各卡进度。拦截脚本只放行与某张卡完全一致的 Agent、SendMessage 和 `agent_cli.py run`，编排者无法自拟派发内容。Agent 路由要求模型为别名、effort=default（Agent 工具不能传 effort）；非任务动作（如 CONFIRM_CONDITION）只回收交付，登记由派发责任人按交付原文代交。
+
 ## 1. 两种方式与登记口径
 
 | 方式 | 适用 | 角色调用 | 会话标识 |
@@ -19,7 +36,16 @@
 
 **续接**：同批执行返修、同节点合规 R2 用 SendMessage 发给登记的 agent ID，只补本轮差异；不能凭“最近的执行者”猜目标，不并发驱动同一子代理。
 
-**只读审阅**：子代理默认继承会话权限，只读靠角色提示约束。需要硬隔离时，由用户在 `.claude/agents/` 定义只含 `Read, Grep, Glob, Bash` 的审阅 agent 类型，并在 roles 中登记（tool 写 `claude-agent:<类型名>`）；技能不自行创建或修改该目录。
+**只读审阅**：子代理默认继承会话权限，只读靠角色提示约束。需要硬隔离时，由用户在 `.claude/agents/` 定义只含 `Read, Grep, Glob, Bash` 的审阅 agent 类型，并在 roles 中登记（tool 写 `claude-agent:<类型名>`）；技能不自行创建或修改该目录。也可在用户同意后于编排者启动时传 `--agents '<JSON>'` 定义本会话的角色类型（相当于 AGY define_subagent，不写目录），如执行者 `tools: [Read, Write, Edit, Bash]`、审阅者 `tools: [Read, Grep, Glob, Bash]`，并把类型名登记进 orchestrator_guard 的 `--agent-type`。2.1.318 实测：角色 tools 只能在会话可用工具内收窄，不能恢复会话级 `--disallowedTools` 已禁的工具；审阅者无 Write/Edit 但 Bash 仍可写文件，不是 OS 只读。
+
+**编排者工具边界**：不要用启动参数 `--disallowedTools` 或 settings 的 deny 限制编排者，它们对整个会话生效，子代理同样继承（2.1.318 实测：主会话禁 Write 后子代理也没有 Write）。改用只绑定编排者主会话的 PreToolUse 前置拦截 `scripts/orchestrator_guard.py`：宿主对子代理内的调用会带 `agent_id`/`agent_type`，主会话调用没有，脚本据此只拦主会话，其他会话和子代理原样放行；`--resume` 续接保持同一 session_id，绑定继续有效。白名单：技能管理脚本（flow.py/agent_cli.py/progress_timer.py/workflow_metrics.py/dispatch_card.py，不含 record、snapshot 与 `--` 代跑）、读根内的 ls/pwd/stat/readlink 与 Read/Grep/Glob、管理目录内新建文件（不覆盖、不写 flow.json）、`--agent-type` 登记类型且显式传登记 `--agent-model` 的 Agent 派发（拒绝 fork、Explore 等），以及 SendMessage/TaskStop/ToolSearch/AskUserQuestion/定时类工具（给 `--card-root` 时 Agent、SendMessage、`agent_cli.py run` 须与派发卡一致）；其余（Edit、构建/测试/Git/sudo、管道与替换、未知工具与 MCP）一律拒绝。第 0 节启动器已自动配置；手工接入时仅在用户同意后写入编排者启动所用的 settings（不覆盖已有 hook），示例：
+
+```json
+{"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command",
+  "command": "python3 <技能目录>/scripts/orchestrator_guard.py --host claude --conversation <编排者session-id> --management-root <任务base>/.batch-flow --read-root <任务base> --agent-model sonnet --agent-model opus"}]}]}}
+```
+
+这是前置拦截，与[角色审计](role-audit.md)的事后检测互补，不替代 OS 隔离。维护后运行 `scripts/test_orchestrator_guard.py`；接入时用临时目录验证管理脚本放行、产品命令/越界写/未登记子代理类型被拒、子代理写入不受影响。
 
 **并行写入**：子代理共享主工作区。共享文件保持单一写入者，有冲突写入串行；确需隔离时可在授权内用 `isolation: "worktree"`，其改动位于独立 worktree，合并属于交付的一部分，由执行者交付说明、审阅覆盖。
 
@@ -47,7 +73,7 @@ claude -p --session-id <UUID> --model <MODEL> --effort <EFFORT> --permission-mod
 
 `acceptEdits` 放行工作区内文件编辑，`--permission-prompts none` 使任何需要确认的操作自动拒绝而非挂起；构建/测试命令需在 `--allowedTools` 中精确列出，不用 `Bash(*)`。工作目录必须是本批实际开发根。
 
-**只读审阅、第三方、只返回规划内容的架构调用**：
+**只读审阅、第三方、只返回规划内容的架构调用**（不用 `plan` 模式：2.1.318 实测 plan 下模型拒绝执行会写文件的命令，审阅无法复跑构建/测试；`agent_cli.py --access read` 已按此生成）：
 
 ```text
 claude -p --session-id <UUID> --model <MODEL> --effort <EFFORT> --permission-mode default --permission-prompts none --disallowedTools "Edit Write NotebookEdit" --allowedTools "Bash(<复跑验证命令的限定规则>)" --output-format json
