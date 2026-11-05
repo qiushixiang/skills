@@ -824,9 +824,36 @@ def decision_state(s, d):
     return d['status']
 
 
-def pre_yield(s, owner='orchestrator', boundary_audit=None):
+def progress_marker(s):
+    """What a pending confirmation can be waiting on: finished attempts, confirmations and the plan."""
+    return dict(results=sum(1 for a in s['state']['attempts'] if a.get('result')),
+                confirmations=sorted(s['state']['confirmations']), plan_version=s['plan_version'])
+
+
+def waiting_conditions(s, root):
+    """CONFIRM_CONDITION targets whose latest dispatch card came back WAIT_EVIDENCE with no ledger progress since.
+
+    Dispatching the same check again cannot change the answer, so these are waiting, not work.
+    Only Claude-host dispatch cards record the marker; other hosts are unaffected."""
+    base=Path(root)/'records'/'dispatch'; latest_card={}
+    if not base.is_dir(): return {}
+    for path in base.glob('*/card.json'):
+        try:
+            card=json.loads(path.read_text()); st=json.loads((path.parent/'state.json').read_text())
+        except (OSError,ValueError):
+            continue
+        if card.get('kind')!='CONFIRM_CONDITION' or not st.get('finished'): continue
+        prev=latest_card.get(card.get('target'))
+        if prev is None or st['finished']>prev[1]['finished']: latest_card[card.get('target')]=(card,st)
+    marker=progress_marker(s)
+    return {target:card['id'] for target,(card,st) in latest_card.items()
+            if st.get('result')=='WAIT_EVIDENCE' and st.get('progress_marker')==marker}
+
+
+def pre_yield(s, owner='orchestrator', boundary_audit=None, root=None):
     """Advisory stop-hook result. Never starts work or changes the ledger."""
     report=status(s)
+    waiting=waiting_conditions(s,root) if root is not None else {}
     owned={tid for tid,t in s['plan']['tasks'].items() if owner=='orchestrator' or t.get('dispatch_owner','orchestrator')==owner}
     if owner != 'orchestrator':
         owned.difference_update(a['task'] for a in s['state']['attempts'] if not a.get('result') and tracking.accounting_kind(s,a)!='withdrawn' and a.get('dispatch_owner','orchestrator') != owner)
@@ -838,11 +865,14 @@ def pre_yield(s, owner='orchestrator', boundary_audit=None):
         if a['target'] in owned: return True
         decision=s['decisions'].get(a['target']) or s['decisions'].get(a.get('decision'))
         return bool(decision and decision['blocks'] and set(decision['blocks']) <= owned)
-    work=[a for a in report['actions'] if relevant(a) and a['role']!='user' and a['kind'] not in {'REQUEST_AUTHORIZATION','ASSIGN_MODELS'}]
+    work=[a for a in report['actions'] if relevant(a) and a['role']!='user' and a['kind'] not in {'REQUEST_AUTHORIZATION','ASSIGN_MODELS'}
+          and not (a['kind']=='CONFIRM_CONDITION' and a['target'] in waiting)]
     problems=[]; running=[]
     for tid,state in report['tasks'].items():
         if state!='RUNNING' or tid not in owned: continue
         a=latest(s,tid);running.append(tid);receipt=a.get('dispatch')
+        if owner=='orchestrator' and a.get('dispatch_owner','orchestrator')!='orchestrator':
+            continue  # A lead-dispatched attempt (foreground nested call) is tracked by the lead, not by orchestrator timers.
         if not receipt:
             problems.append(dict(task=tid,attempt=a['id'],reason='missing actual dispatch and timer receipt; inspect host before retrying'))
             continue
@@ -860,6 +890,8 @@ def pre_yield(s, owner='orchestrator', boundary_audit=None):
         except (OSError,ValueError,KeyError,TypeError,OverflowError):
             problems.append(dict(task=tid,attempt=a['id'],reason='timer receipt unavailable; verify actual task and timer state'))
     user=[a for a in report['actions'] if (a['role']=='user' or a['kind'] in {'REQUEST_AUTHORIZATION','ASSIGN_MODELS'}) and relevant(a)]
+    user+=[dict(kind='WAITING_CONDITION',target=target,card=card,role='user',
+                instruction='上次确认卡返回 WAIT_EVIDENCE 且台账无进展；不重复派发，等待依赖任务完成或用户补证') for target,card in waiting.items()]
     local_complete=owner=='architect' and all(report['tasks'][tid] in {'SATISFIED','RETIRED','INACTIVE'} for tid in owned)
     disposition='CONTINUE' if work or problems else 'WAIT_HOST' if running else 'WAIT_USER' if user else 'COMPLETE' if (report['complete'] or local_complete) else 'STALLED'
     audit_report=boundary_audit or {'status':'not_configured'}
@@ -1681,7 +1713,7 @@ def main():
                 if args.audit_log and (args.actor or 'orchestrator')=='orchestrator':
                     from role_audit import audit
                     boundary_audit=audit(args.audit_log,args.conversation,[path.parent]+args.audit_management_root)
-                result=attach_host_capabilities(pre_yield(s,args.actor or 'orchestrator',boundary_audit),path)
+                result=attach_host_capabilities(pre_yield(s,args.actor or 'orchestrator',boundary_audit,path.parent),path)
                 print(json.dumps(result,ensure_ascii=False,indent=2))
                 return 0 if result['can_yield'] else 1
             result={'ok':True,'revision':s['revision']} if args.command=='validate' else tracking.metrics(s,status(s),now()) if args.command=='metrics' else status(s)

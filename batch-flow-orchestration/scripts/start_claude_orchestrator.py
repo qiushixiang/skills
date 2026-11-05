@@ -78,7 +78,9 @@ def capabilities(spec):
         '   mode=register / collect_progress：按 orchestrator_todo 机械登记或收集进度，不作技术判断。',
         '3. mode=dispatch / delegate_to_lead：运行该动作的 dispatch_card_command，然后严格按输出 steps 逐步执行，命令和工具参数逐字照抄，'
         '<当前revision> 用刚读到的 revision，其余尖括号值用上一步工具返回的真实值。',
-        '4. 后台子代理/进程完成会有通知，不轮询、不猜测结果；计时到期按卡第 6 步汇报并重启计时。',
+        '4. 后台子代理/进程完成会有通知，不轮询、不猜测结果；计时到期按卡第 6 步汇报并重启计时。'
+        '移交技术负责人的卡是前台调用，会等到技术负责人（及其拉起的执行者）完成才返回。',
+        '   pre_yield 里的 WAITING_CONDITION：上次确认已返回 WAIT_EVIDENCE 且台账无进展，不要重复派发，向用户说明在等哪个任务或实证。',
         '5. 上下文压缩或忘记进度时运行 ' + show + ' 查看各卡状态，再继续未完成的步骤；不要重复派发已 start 的卡。',
         '6. 结束本轮前运行 ' + yield_cmd + '；未通过时按输出处理。',
         '技术内容（实现、审阅、裁决、方案）一律交给角色，你只协调和登记。',

@@ -116,11 +116,47 @@ class CardTests(unittest.TestCase):
         attempt = self.card('start', '--store', str(self.store), '--card', cid, '--revision', self.rev())['attempt']
         s = json.loads(self.store.read_text())
         self.assertEqual(next(a for a in s['state']['attempts'] if a['id'] == attempt)['dispatch_owner'], 'architect')
+        self.assertEqual(flow.pre_yield(s)['dispatch_problems'], [])  # lead-held attempt, no orchestrator timer
         (d / 'receipt.txt').write_text('done. agentId: agent-9'); (d / 'result.md').write_text('结果：VERIFIED\n')
         self.assertEqual(self.card('finish', '--store', str(self.store), '--card', cid, '--revision', self.rev(), '--conversation', 'agent-9')['result'], 'VERIFIED')
         self.build(lambda p: None)
         err = self.card('make', '--store', str(self.store), '--kind', 'EXECUTE', '--target', 'execute', '--runtime', str(self.runtime), '--as-lead', ok=False)
         self.assertIn('delegate_to_lead', err['error'])
+
+    def confirmation_fixture(self, delegate):
+        def mutate(p):
+            p['roles']['architect'].update(tool='claude', model='claude-opus-5-5', effort='default')
+            p['decision_points']['contract']['blocks'] = ['execute']
+            if delegate:
+                p['tasks']['execute']['dispatch_owner'] = 'architect'
+        self.build(mutate)
+        s = json.loads(self.store.read_text()); proof = str(self.store.parent / 'proof.txt')
+        for i, (actor, kind, data) in enumerate([
+                ('executor', 'signal', dict(id='D1', signal='contract_change', reason='r', blocks=['execute'], decision_point='contract', evidence=[proof])),
+                ('architect', 'resolve', dict(id='D1', summary='s', evidence=[proof], user_evidence=[], requirements=[
+                    dict(id='c1', kind='confirmation', owner='executor', depends_on=[], instruction='entry fixed')]))]):
+            s, _ = flow.apply_request(s, {'request_id': 'c%d' % i, 'expected_revision': s['revision'], 'actor': actor,
+                                          'operations': [{'type': kind, 'data': data}]}, self.store.parent)
+        self.store.write_text(json.dumps(s))
+
+    def test_waiting_confirmation_is_not_redispatched(self):
+        self.confirmation_fixture(delegate=True)
+        mk = ['make', '--store', str(self.store), '--kind', 'CONFIRM_CONDITION', '--target', 'c1', '--runtime', str(self.runtime)]
+        self.assertIn('不是台账正式任务', self.card(*mk, '--as-lead', ok=False)['error'])
+        out = self.card(*mk); d = self.store.parent / 'records' / 'dispatch' / out['card']
+        card = json.loads((d / 'card.json').read_text())
+        self.assertFalse(card['host_call']['input']['run_in_background'])
+        prompt = (d / 'prompt.md').read_text()
+        self.assertIn('不派发执行者', prompt); self.assertNotIn('--as-lead', prompt)
+        (d / 'receipt.txt').write_text('agentId: lead-1'); (d / 'result.md').write_text('结果：WAIT_EVIDENCE\n')
+        self.card('finish', '--store', str(self.store), '--card', out['card'], '--revision', self.rev(), '--conversation', 'lead-1')
+        self.assertIn('--recheck', self.card(*mk, ok=False)['error'])
+        s = json.loads(self.store.read_text())
+        gate = flow.pre_yield(s, 'orchestrator', None, self.store.parent)
+        self.assertNotIn('c1', [a['target'] for a in gate['actions']])
+        self.assertIn('c1', [a['target'] for a in gate['user_actions']])
+        self.assertIn('c1', [a['target'] for a in flow.pre_yield(s)['actions']])
+        self.card(*mk, '--recheck')
 
     def test_cli_card_and_errors(self):
         self.card('make', '--store', str(self.store), '--kind', 'THIRD_PARTY_REVIEW', '--target', 'third', '--runtime', str(self.runtime), ok=False)

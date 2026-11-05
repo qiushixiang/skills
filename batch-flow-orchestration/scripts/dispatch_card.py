@@ -122,6 +122,11 @@ def is_agent_tool(tool):
     return tool in {'claude', 'claude-agent', 'claude-code'} or str(tool).startswith('claude-agent:')
 
 
+def lead_dispatchable(s, kind, target):
+    """Only formal plan tasks are dispatched by the lead; a confirmation is checked, never redone by a second executor."""
+    return kind in TASK_KINDS and target in s['plan']['tasks']
+
+
 def agent_model(model):
     """Agent takes a family alias; accept a full Claude model ID such as claude-opus-5-5."""
     m = re.fullmatch(r'(?:claude-)?(haiku|sonnet|opus|fable)(?:-[0-9][0-9.-]*)?(?:\[1m\])?', str(model or '').strip().lower())
@@ -195,7 +200,8 @@ def render_prompt(card, payload, s, store, task_base, workspace):
         lines.append('- 上下文：' + json.dumps(payload['context_hint'], ensure_ascii=False))
     lines += ['', '## 角色入口（先读）'] + ['- ' + str(SKILL / d) for d in docs]
     lines += ['', '## 工作内容（台账原文，不得改写或缩减）', '', payload.get('instruction', '').strip()]
-    if card['mode'] == 'delegate_to_lead' and is_agent_tool(card['tool']) and payload.get('role') not in (None, 'architect'):
+    if card['mode'] == 'delegate_to_lead' and is_agent_tool(card['tool']) and payload.get('role') not in (None, 'architect') \
+            and lead_dispatchable(s, kind, target):
         inner = shlex.join([sys.executable, str(SCRIPTS / 'dispatch_card.py'), 'make', '--store', str(store), '--kind', kind,
                             '--target', target, '--as-lead'])
         lines += ['', '## 你是本动作的派发责任人（dispatch_owner=architect）',
@@ -204,6 +210,11 @@ def render_prompt(card, payload, s, store, task_base, workspace):
                   '', '    ' + inner, '',
                   '执行角色交付后，按技术负责人职责核对其原始证据与验收项；台账只经 flow.py 登记，不直接写 flow.json。'
                   '你的交付写明子卡 ID、执行角色结果、核对结论，以及仍需派发责任人代交的操作（参数文件放在 ' + card['dir'] + ' 下）。']
+    elif card['mode'] == 'delegate_to_lead' and is_agent_tool(card['tool']):
+        lines += ['', '## 你负责核对本动作（不派发执行者）',
+                  '这是条件确认/裁决类动作，不是台账正式任务：不要拉起执行者或审阅者，也不要自己实现。实际工作由对应正式任务完成；'
+                  '你只核对已有原始证据是否满足条件。依赖未完成就返回 WAIT_EVIDENCE 并写明在等哪个任务或哪项用户实证。'
+                  '需要登记的台账操作写成 --data 参数文件放在 ' + card['dir'] + ' 下，并在交付中列出。']
     elif card['mode'] == 'delegate_to_lead':
         lines += ['', '本动作由局部技术负责人处理：按职责实际处理，或经固定入口 ' + str(SCRIPTS / 'agent_cli.py') +
                   ' 派发并回收；需要登记的台账操作写成 --data 参数文件放在 ' + card['dir'] + ' 下，并在交付中列出。']
@@ -225,10 +236,16 @@ def make(args):
     a = find_action(s, args.kind, args.target)
     payload = a['subagent_payload']; mode = a['orchestrator_action']['mode']
     as_lead = bool(getattr(args, 'as_lead', False))
+    if args.kind == 'CONFIRM_CONDITION' and not getattr(args, 'recheck', False):
+        waiting = flow.waiting_conditions(s, store.parent).get(args.target)
+        need(not waiting, '上次确认卡 %s 返回 WAIT_EVIDENCE，之后台账没有进展（无新结果/确认/计划）；不重复派发。'
+                          '等依赖任务完成或用户补证；确需复核时加 --recheck' % waiting)
     if as_lead:
         # The technical lead subagent dispatches the payload role itself (nested Agent, depth 2).
         need(mode == 'delegate_to_lead', '--as-lead 只用于移交技术负责人的动作（mode=delegate_to_lead）')
         need(payload.get('role') != 'architect', '本动作的责任角色就是技术负责人：由你本人处理，不再派发')
+        need(lead_dispatchable(s, args.kind, args.target),
+             '%s %s 不是台账正式任务：条件确认只由技术负责人核对，不另派执行者（实际工作走对应正式任务）' % (args.kind, args.target))
         mode = 'dispatch'
     if mode == 'delegate_to_lead':
         role = 'architect'; config = dict(s['plan']['roles'].get('architect') or {})
@@ -268,8 +285,12 @@ def make(args):
             card['host_call'] = dict(tool='SendMessage', input=dict(to=resume, message=pointer))
         else:
             card['route'] = 'agent'
+            # Lead work runs in the foreground: a background subagent's own Agent calls are forced async
+            # (seen on 2.1.318), so a backgrounded lead would end before its executor and never finish it.
+            foreground = as_lead or mode == 'delegate_to_lead'
+            card['foreground'] = foreground
             call = dict(description='%s %s' % (args.kind, args.target), subagent_type=subtype, model=alias,
-                        prompt=pointer, run_in_background=not as_lead)
+                        prompt=pointer, run_in_background=not foreground)
             if effort != 'default':
                 call['effort'] = effort
             card['host_call'] = dict(tool='Agent', input=call)
@@ -314,7 +335,8 @@ def lead_steps(card, base, store):
         out.append('1. 本动作无 start 登记（%s）；直接派发。' % card['kind'])
     out.append('2. 原样调用 %s（前台，等待结束），参数逐字使用：\n%s' % (call['tool'], json.dumps(call['input'], ensure_ascii=False, indent=2)))
     if card['route'] in {'agent', 'send_message'}:
-        out.append('3. 把第 2 步工具返回原文（含 agentId）用 Write 新建为 %s/receipt.txt；把其中执行角色的最终报告原文 Write 为 %s/result.md。' % (d, d))
+        out.append('3. 把第 2 步工具返回原文（含 agentId）用 Write 新建为 %s/receipt.txt；把其中子代理的最终报告原文 Write 为 %s/result.md。'
+                   '若返回的是 "Async agent launched" 而不是报告，说明宿主改成了后台：等它的完成通知再写 result.md，不要提前结束。' % (d, d))
     else:
         out.append('3. 命令结束后无需另存，finish 会经 agent_cli collect 回收。')
     if card['ledger_start'] == 'start':
@@ -325,14 +347,17 @@ def lead_steps(card, base, store):
         out.append('4. 非任务动作：' + shlex.join(base + ['finish', '--store', store, '--card', card['id'], '--revision', '<当前revision>']
                                              + (['--conversation', '<agent ID>'] if card['route'] == 'agent' else [])) +
                    ' 只回收交付；需登记的操作在你的交付中列出。')
-    out.append('5. 前台派发不登记 register_dispatch：进度由编排者对你这张卡的计时覆盖。核对交付后按你自己卡中的交付结构回复。')
+    if card.get('lead'):
+        out.append('5. 前台派发不登记 register_dispatch：执行期间你保持等待。核对交付后按你自己卡中的交付结构回复。')
+    else:
+        out.append('5. 前台调用期间本会话等待技术负责人（含其拉起的执行者）完成；结束后按其交付“需登记的操作”原文代交。')
     return out
 
 
 def steps(card):
     d = card['dir']; py = sys.executable; me = str(SCRIPTS / 'dispatch_card.py'); store = card['store']
     base = [py, me]
-    if card.get('lead'):
+    if card.get('lead') or card.get('foreground'):
         return lead_steps(card, base, store)
     out = []
     if card['ledger_start']:
@@ -440,7 +465,8 @@ def finish(args):
     value = parse_result(text)
     out = dict(ok=True, card=card['id'], result=value, result_file=str(result_path), conversation_id=conversation)
     if card['ledger_start'] != 'start':
-        st.update(finished=now(), conversation_id=conversation, result=value); save_state(directory, st)
+        st.update(finished=now(), conversation_id=conversation, result=value,
+                  progress_marker=flow.progress_marker(load_json(args.store))); save_state(directory, st)
         out['note'] = '非任务动作：未写台账。按 result.md“需登记的操作”原文代交（actor 为原责任角色）。'
         return out
     need(st.get('attempt'), '本卡未登记 start')
@@ -462,6 +488,7 @@ def main():
     p = sub.add_parser('make'); p.add_argument('--store', required=True); p.add_argument('--kind', required=True)
     p.add_argument('--target', required=True); p.add_argument('--workspace'); p.add_argument('--runtime')
     p.add_argument('--as-lead', action='store_true', help='technical lead subagent dispatching the payload role of a delegated action')
+    p.add_argument('--recheck', action='store_true', help='dispatch a confirmation again although nothing progressed since its last WAIT_EVIDENCE')
     p = sub.add_parser('show'); p.add_argument('--store', required=True); p.add_argument('--card')
     p = sub.add_parser('start'); p.add_argument('--store', required=True); p.add_argument('--card', required=True)
     p.add_argument('--revision', type=int, required=True)
