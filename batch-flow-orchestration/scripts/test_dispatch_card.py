@@ -214,6 +214,23 @@ class CardTests(unittest.TestCase):
             self.assertEqual(json.loads(proc.stdout).get('route'), route, proc.stdout)
         self.card('start', '--store', str(self.store), '--card', out['card'], '--revision', self.rev())
 
+    def test_abandon_lost_agent_records_invalid_and_offers_retry(self):
+        out = self.card('make', '--store', str(self.store), '--kind', 'EXECUTE', '--target', 'execute', '--runtime', str(self.runtime))
+        cid = out['card']; d = self.store.parent / 'records' / 'dispatch' / cid
+        self.card('start', '--store', str(self.store), '--card', cid, '--revision', self.rev())
+        (d / 'receipt.txt').write_text('agentId: agent-gone')
+        st = json.loads((d / 'state.json').read_text()); st['handle'] = 'agent-gone'; (d / 'state.json').write_text(json.dumps(st))
+        spec = json.loads((self.runtime / 'spec.json').read_text()); spec.update(session_id='new', workspace=str(self.workspace))
+        (self.runtime / 'spec.json').write_text(json.dumps(spec))
+        ab = ['abandon', '--store', str(self.store), '--card', cid, '--reason', 'host session ended', '--runtime', str(self.runtime)]
+        res = self.card(*ab, '--revision', self.rev())
+        self.assertEqual(res['result'], 'INVALID')
+        s = json.loads(self.store.read_text())
+        self.assertEqual(s['state']['attempts'][-1]['result'], 'INVALID')
+        action = next(a for a in flow.status(s)['actions'] if a['target'] == 'execute')
+        self.assertEqual(action.get('retry_of'), s['state']['attempts'][-1]['id'])
+        self.card(*ab, '--revision', self.rev(), ok=False)
+
     def test_cli_card_and_errors(self):
         self.card('make', '--store', str(self.store), '--kind', 'THIRD_PARTY_REVIEW', '--target', 'third', '--runtime', str(self.runtime), ok=False)
         s = json.loads(self.store.read_text())

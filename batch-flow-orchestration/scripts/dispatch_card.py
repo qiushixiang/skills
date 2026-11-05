@@ -435,8 +435,15 @@ def steps(card):
 
 def show(card):
     st = state(card['dir'])
-    return dict(card=card['id'], route=card['route'], role=card['role'], kind=card['kind'], target=card['target'],
-                prompt_file=card['prompt_file'], state=st, steps=steps(card))
+    out = dict(card=card['id'], route=card['route'], role=card['role'], kind=card['kind'], target=card['target'],
+               prompt_file=card['prompt_file'], state=st, steps=steps(card))
+    spec = runtime_spec(card['store'])
+    if st.get('handle') and not st.get('finished') and card['route'] in {'agent', 'send_message'} and spec \
+            and not agent_in_session(spec, st['handle']):
+        out['lost'] = ('子代理 %s 不在当前编排会话（原会话已结束，它随之终止，不会再有完成通知）。运行：' % st['handle'] +
+                       shlex.join([sys.executable, str(SCRIPTS / 'dispatch_card.py'), 'abandon', '--store', card['store'], '--card', card['id'],
+                                   '--revision', '<当前revision>', '--reason', '原编排会话结束，子代理随之终止']))
+    return out
 
 
 def start(args):
@@ -526,6 +533,38 @@ def finish(args):
     return out
 
 
+def abandon(args):
+    """A dispatched subagent died with the host session that spawned it (e.g. the orchestrator was restarted
+    or its model switched): its transcript is not in the current launch session, so no completion notice
+    can ever arrive. Record the attempt as INVALID with the lost-agent evidence; status then offers a
+    retry (retry_of) that does not add a technical round. Never used for a live agent."""
+    directory = card_dir(args.store, args.card); card = load_json(directory / 'card.json'); st = state(directory)
+    need(card['ledger_start'] == 'start' and st.get('attempt') and not st.get('finished'), '只用于已 start、未回收的任务卡')
+    need(card['route'] in {'agent', 'send_message'}, '只用于子代理卡；CLI 卡用 agent_cli collect 判断')
+    spec = runtime_spec(args.store, getattr(args, 'runtime', None))
+    need(spec is not None, '须在启动器会话中运行（需要当前会话 ID 判断子代理是否存活）')
+    handle = st.get('handle')
+    need(handle, '本卡没有登记子代理 ID（register）；先核对 receipt.txt')
+    need(not agent_in_session(spec, handle), '子代理 %s 属于当前会话，可能仍在运行：等完成通知，不要放弃' % handle)
+    project = Path.home() / '.claude' / 'projects' / re.sub(r'[^A-Za-z0-9]', '-', spec['workspace'])
+    found = sorted(project.glob('*/subagents/agent-%s.jsonl' % handle))
+    info = dict(handle=handle, current_session=spec['session_id'], reason=args.reason, at=now(),
+                transcripts=[dict(path=str(f), session=f.parent.parent.name, bytes=f.stat().st_size,
+                                  modified=dt.datetime.fromtimestamp(f.stat().st_mtime, dt.timezone.utc).isoformat()) for f in found])
+    lost = directory / 'lost.json'
+    write_new(lost, json.dumps(info, ensure_ascii=False, indent=2))
+    for timer in sorted(directory.glob('timer-*.ticket')):
+        subprocess.run([sys.executable, str(SCRIPTS / 'progress_timer.py'), 'cancel', '--ticket', str(timer)], capture_output=True, text=True)
+    s = load_json(args.store)
+    attempt = next(a for a in s['state']['attempts'] if a['id'] == st['attempt'])
+    data = dict(attempt=st['attempt'], result='INVALID', evidence=[str(lost), str(directory / 'receipt.txt')],
+                call=dict(tool=card['tool'], model=card['model'], effort=card['effort'], conversation_id=handle))
+    res = run_flow(args.store, 'finish', '--revision', str(args.revision), '--actor', attempt.get('performer_role') or card['role'], data=data)
+    st.update(finished=now(), conversation_id=handle, result='INVALID', abandoned=str(lost), revision=res['revision']); save_state(directory, st)
+    return dict(ok=True, card=card['id'], result='INVALID', revision=res['revision'],
+                next='重读 status：该任务会以 retry_of 重新出现，按新卡派发（不增加技术轮次）')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest='command', required=True)
@@ -541,6 +580,9 @@ def main():
     p.add_argument('--timer-handle', required=True); p.add_argument('--timer-ticket', required=True)
     p = sub.add_parser('finish'); p.add_argument('--store', required=True); p.add_argument('--card', required=True)
     p.add_argument('--revision', type=int, required=True); p.add_argument('--conversation')
+    p = sub.add_parser('abandon', help='record a subagent lost with its host session as INVALID so status offers a retry')
+    p.add_argument('--store', required=True); p.add_argument('--card', required=True); p.add_argument('--revision', type=int, required=True)
+    p.add_argument('--reason', required=True); p.add_argument('--runtime')
     args = parser.parse_args()
     try:
         if args.command == 'make':
@@ -549,9 +591,14 @@ def main():
             if args.card:
                 out = show(load_json(card_dir(args.store, args.card) / 'card.json'))
             else:
-                out = [dict(card=c.parent.name, state=state(c.parent)) for c in sorted(cards_root(args.store).glob('*/card.json'))]
+                out = []
+                for c in sorted(cards_root(args.store).glob('*/card.json')):
+                    row = dict(card=c.parent.name, state=state(c.parent))
+                    lost = show(load_json(c)).get('lost')
+                    if lost: row['lost'] = lost
+                    out.append(row)
         else:
-            out = dict(start=start, register=register, finish=finish)[args.command](args)
+            out = dict(start=start, register=register, finish=finish, abandon=abandon)[args.command](args)
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
     except (CardError, flow.FlowError, OSError, KeyError, ValueError) as error:
