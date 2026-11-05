@@ -1639,6 +1639,9 @@ def attach_host_capabilities(result, store):
             # Claude Code orchestrators dispatch through a card instead of composing the role prompt.
             action['dispatch_card_command']=shlex.join([host['python'],str(Path(__file__).resolve().parent/'dispatch_card.py'),'make',
                                                         '--store',str(Path(store).resolve()),'--kind',action['kind'],'--target',action['target']])
+        if action.get('kind')=='CLOSE_DECISION':
+            action['register_command']=shlex.join([host.get('python') or sys.executable,str(Path(__file__).resolve()),'--store',str(Path(store).resolve()),
+                'close','--actor','orchestrator','--revision','<当前revision>','--id',action['target'],'--note','恢复条件已由 status 判定齐全，机械闭环'])
         if action.get('kind')=='REGISTER_DECISION' and action.get('issue'):
             action['register_command']=shlex.join([host.get('python') or sys.executable,str(Path(__file__).resolve()),'--store',str(Path(store).resolve()),
                 'signal','--actor','orchestrator','--revision','<当前revision>','--from-issue',action['issue']['key']])

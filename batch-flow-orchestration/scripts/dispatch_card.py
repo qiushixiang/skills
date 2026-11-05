@@ -303,6 +303,7 @@ def make(args):
     card = dict(format=FORMAT, id=card_id, dir=str(directory), store=str(store), revision=s['revision'], kind=args.kind,
                 target=args.target, mode=mode, role=role, tool=tool, model=model, effort=effort,
                 actor='architect' if as_lead else 'orchestrator', lead=as_lead,
+                subjects=flow.current_subjects(s, args.target) if args.target in s['plan']['tasks'] else None,
                 access='write' if role in WRITE_ROLES else 'read', resume=resume, created_at=now(),
                 ledger_start='start' if args.target in s['plan']['tasks'] and args.kind in TASK_KINDS and mode == 'dispatch'
                 else 'decision_start' if args.kind == 'DECIDE' and mode == 'dispatch' else None,
@@ -382,7 +383,8 @@ def lead_steps(card, base, store):
     if card['ledger_start'] == 'start':
         out.append('4. 回收登记：' + shlex.join(base + ['finish', '--store', store, '--card', card['id'], '--revision', '<当前revision>']
                                               + (['--conversation', '<agent ID>'] if card['route'] == 'agent' else [])) +
-                   '\n   交付列出 subject→版本时，先对每项运行 flow.py change_subject（--actor 为本卡角色，--evidence 为 result.md），再 finish。')
+                   '\n   交付里的 subject 版本与台账当前版本 %s 不同时，先以执行角色或 architect 运行 flow.py change_subject（--evidence 为 result.md），再 finish。'
+                   % json.dumps(card.get('subjects') or {}, ensure_ascii=False))
     else:
         out.append('4. 非任务动作：' + shlex.join(base + ['finish', '--store', store, '--card', card['id'], '--revision', '<当前revision>']
                                              + (['--conversation', '<agent ID>'] if card['route'] == 'agent' else [])) +
@@ -422,7 +424,9 @@ def steps(card):
     if card['ledger_start'] == 'start':
         out.append('8. 回收登记：' + shlex.join(base + ['finish', '--store', store, '--card', card['id'], '--revision', '<当前revision>']
                                               + (['--conversation', '<agent ID>'] if card['route'] == 'agent' else [])) +
-                   '\n   交付列出 subject→版本时，先对每项运行 flow.py change_subject（--actor 为本卡角色，--evidence 为 result.md），再 finish。')
+                   '\n   直接运行 finish。台账当前版本：%s。只有交付里的 subject 版本与此不同时 finish 才会报版本不符；'
+                   '那时版本登记（change_subject）属执行者/技术负责人，编排者不代做，把 finish 的报错原样交给用户。'
+                   % json.dumps(card.get('subjects') or {}, ensure_ascii=False))
     else:
         out.append('8. 非任务动作：finish 只回收并保存交付（不写台账）；交付中“需登记的操作”由派发责任人按原文代交，actor 为原责任角色：' +
                    shlex.join(base + ['finish', '--store', store, '--card', card['id'], '--revision', '<当前revision>']))
