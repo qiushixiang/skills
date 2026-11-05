@@ -158,6 +158,21 @@ class CardTests(unittest.TestCase):
         self.assertIn('c1', [a['target'] for a in flow.pre_yield(s)['actions']])
         self.card(*mk, '--recheck')
 
+    def test_confirmation_waits_while_owned_work_runs(self):
+        self.build(lambda p: p['roles']['architect'].update(tool='claude', model='opus', effort='default'))
+        s = json.loads(self.store.read_text()); proof = str(self.store.parent / 'proof.txt')
+        for i, (actor, kind, data) in enumerate([
+                ('executor', 'signal', dict(id='D1', signal='contract_change', reason='r', blocks=['done'], decision_point='contract', evidence=[proof])),
+                ('architect', 'resolve', dict(id='D1', summary='s', evidence=[proof], user_evidence=[], requirements=[
+                    dict(id='c1', kind='confirmation', owner='architect', depends_on=[], instruction='check')]))]):
+            s, _ = flow.apply_request(s, {'request_id': 'w%d' % i, 'expected_revision': s['revision'], 'actor': actor,
+                                          'operations': [{'type': kind, 'data': data}]}, self.store.parent)
+        self.assertIn('c1', [a['target'] for a in flow.pre_yield(s)['actions']])
+        s, _ = flow.apply_request(s, {'request_id': 'w9', 'expected_revision': s['revision'], 'actor': 'orchestrator', 'operations': [
+            {'type': 'start', 'data': dict(task='execute', call=dict(tool='claude-agent', model='sonnet', effort='default', conversation_id='x'))}]},
+            self.store.parent)
+        self.assertNotIn('c1', [a['target'] for a in flow.pre_yield(s)['actions']])
+
     def test_cli_card_and_errors(self):
         self.card('make', '--store', str(self.store), '--kind', 'THIRD_PARTY_REVIEW', '--target', 'third', '--runtime', str(self.runtime), ok=False)
         s = json.loads(self.store.read_text())

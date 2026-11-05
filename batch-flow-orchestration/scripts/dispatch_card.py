@@ -333,7 +333,8 @@ def lead_steps(card, base, store):
         out.append('1. 登记开始（actor architect）：' + shlex.join(base + ['start', '--store', store, '--card', card['id'], '--revision', '<当前revision>']))
     else:
         out.append('1. 本动作无 start 登记（%s）；直接派发。' % card['kind'])
-    out.append('2. 原样调用 %s（前台，等待结束），参数逐字使用：\n%s' % (call['tool'], json.dumps(call['input'], ensure_ascii=False, indent=2)))
+    out.append('2. 原样调用 %s（前台，等待结束），参数逐字使用（run_in_background 是 JSON 布尔 false，不是字符串 "false"）：\n%s'
+               % (call['tool'], json.dumps(call['input'], ensure_ascii=False, indent=2)))
     if card['route'] in {'agent', 'send_message'}:
         out.append('3. 把第 2 步工具返回原文（含 agentId）用 Write 新建为 %s/receipt.txt；把其中子代理的最终报告原文 Write 为 %s/result.md。'
                    '若返回的是 "Async agent launched" 而不是报告，说明宿主改成了后台：等它的完成通知再写 result.md，不要提前结束。' % (d, d))

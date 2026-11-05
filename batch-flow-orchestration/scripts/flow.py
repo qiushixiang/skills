@@ -865,8 +865,11 @@ def pre_yield(s, owner='orchestrator', boundary_audit=None, root=None):
         if a['target'] in owned: return True
         decision=s['decisions'].get(a['target']) or s['decisions'].get(a.get('decision'))
         return bool(decision and decision['blocks'] and set(decision['blocks']) <= owned)
+    busy=any(report['tasks'].get(tid)=='RUNNING' for tid in owned)
+    # A confirmation only checks existing evidence. While owned work is still running, checking now
+    # cannot change the answer and may race the running writer, so it waits instead of forcing CONTINUE.
     work=[a for a in report['actions'] if relevant(a) and a['role']!='user' and a['kind'] not in {'REQUEST_AUTHORIZATION','ASSIGN_MODELS'}
-          and not (a['kind']=='CONFIRM_CONDITION' and a['target'] in waiting)]
+          and not (a['kind']=='CONFIRM_CONDITION' and (a['target'] in waiting or busy))]
     problems=[]; running=[]
     for tid,state in report['tasks'].items():
         if state!='RUNNING' or tid not in owned: continue

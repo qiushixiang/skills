@@ -99,7 +99,7 @@ class GuardTests(unittest.TestCase):
         cards = self.mgmt / 'records' / 'dispatch'
         prompt = 'read card X sha 1'
         cli = 'python3 %s run --profile p --task T' % (HERE / 'agent_cli.py')
-        for name, call in [('c1', dict(tool='Agent', input=dict(subagent_type='bf-executor', model='sonnet', prompt=prompt))),
+        for name, call in [('c1', dict(tool='Agent', input=dict(subagent_type='bf-executor', model='sonnet', prompt=prompt, run_in_background=True))),
                            ('c2', dict(tool='Bash', input=dict(command=cli))),
                            ('c3', dict(tool='SendMessage', input=dict(to='agent-1', message=prompt)))]:
             (cards / name).mkdir(parents=True)
@@ -109,6 +109,7 @@ class GuardTests(unittest.TestCase):
         self.assertIn('dispatch card', self.run_guard('Agent', dict(ok, prompt=prompt + ' and also fix X'), cards=True))
         self.assertIn('dispatch card', self.run_guard('Agent', dict(ok, model='opus'), cards=True))
         self.assertIn('dispatch card', self.run_guard('Agent', dict(ok, effort='max'), cards=True))
+        self.assertIn('boolean', self.run_guard('Agent', dict(ok, run_in_background='true'), cards=True))
         (cards / 'c4').mkdir()
         (cards / 'c4' / 'card.json').write_text(json.dumps(dict(host_call=dict(tool='Agent', input=dict(ok, effort='medium')))))
         self.assertIsNone(self.run_guard('Agent', dict(ok, effort='medium'), cards=True))
@@ -133,6 +134,7 @@ class GuardTests(unittest.TestCase):
         lead = dict(agent_id='a1', agent_type='bf-architect')
         self.assertIsNone(self.run_guard('Agent', ok, cards=True, **lead))
         self.assertIn('as-lead', self.run_guard('Agent', dict(ok, prompt='do more'), cards=True, **lead))
+        self.assertIn('boolean', self.run_guard('Agent', dict(ok, run_in_background='false'), cards=True, **lead))
         self.assertIn('may dispatch only', self.run_guard('Agent', dict(ok, subagent_type='general-purpose'), cards=True, **lead))
         self.assertIn('may not dispatch', self.run_guard('Agent', ok, cards=True, agent_id='a2', agent_type='bf-executor'))
         self.assertIn('flow.py', self.run_guard('Write', {'file_path': str(self.mgmt / 'flow.json'), 'content': '{}'}, **lead))
