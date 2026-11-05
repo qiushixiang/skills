@@ -48,6 +48,8 @@ LEAD_FLOW = {'DESIGN': 'workflows/plan-sync/SKILL.md', 'PLAN_REPAIR': 'workflows
              'PREPARE_RESUMPTION': 'workflows/recovery/SKILL.md', 'CONFIRM_CONDITION': 'workflows/recovery/SKILL.md',
              'REVIEW': 'workflows/review/SKILL.md', 'THIRD_PARTY_REVIEW': 'workflows/review/SKILL.md'}
 EXECUTOR_DELIVERY = """结果：VERIFIED | WAIT_EVIDENCE | FAILED | ARCH_DECISION_REQUIRED
+（结果只按本卡工作内容和验收判定：本卡要求的改动、构建与验证都完成即 VERIFIED。由后续审阅、板测等其他节点产生的实证不属本卡，
+不因其尚未运行写 WAIT_EVIDENCE；WAIT_EVIDENCE 只用于本卡要求的验证因外部条件无法完成。）
 改动与版本：<改动文件/范围；git 固定引用或 snapshot 记录路径；需更新的 subject→版本>
 验证证据：<flow.py record 生成的记录路径及对应验收项>
 未运行/失败：<项目、原因、最小缺项>
@@ -122,13 +124,23 @@ def is_agent_tool(tool):
     return tool in {'claude', 'claude-agent', 'claude-code'} or str(tool).startswith('claude-agent:')
 
 
+# An executor keeps its context only while it is small: a long transcript dilutes attention, anchors the
+# executor on its own earlier approach and gets compacted lossily. Rework state lives in delivery files.
+EXECUTOR_RESUME_MAX_BYTES = 300 * 1024
+
+
+def agent_transcript(spec, agent_id):
+    if not spec or not spec.get('session_id') or not spec.get('workspace'):
+        return None
+    project = Path.home() / '.claude' / 'projects' / re.sub(r'[^A-Za-z0-9]', '-', spec['workspace'])
+    return project / spec['session_id'] / 'subagents' / ('agent-%s.jsonl' % agent_id)
+
+
 def agent_in_session(spec, agent_id):
     """SendMessage resumes a finished subagent from its transcript only within the session that spawned it
     (verified on 2.1.318 across `claude --resume`). A new launch has a new session and cannot reach old agents."""
-    if not spec or not spec.get('session_id') or not spec.get('workspace'):
-        return True  # Outside the launcher nothing can be checked; the host reports a missing agent.
-    project = Path.home() / '.claude' / 'projects' / re.sub(r'[^A-Za-z0-9]', '-', spec['workspace'])
-    return (project / spec['session_id'] / 'subagents' / ('agent-%s.jsonl' % agent_id)).is_file()
+    path = agent_transcript(spec, agent_id)
+    return True if path is None else path.is_file()  # Outside the launcher nothing can be checked.
 
 
 def lead_dispatchable(s, kind, target):
@@ -272,6 +284,13 @@ def make(args):
         # context instead of blocking, and record why (the ledger requires it for resume-policy tasks).
         replacement = '原上下文 %s 不在本编排会话（新会话或其他宿主），改用新上下文；交接靠台账与交付文件' % resume
         resume = None
+    if resume and is_agent_tool(tool) and role == 'executor':
+        path = agent_transcript(spec, resume)
+        size = path.stat().st_size if path is not None and path.is_file() else 0
+        if size > EXECUTOR_RESUME_MAX_BYTES:
+            replacement = ('执行者原上下文 %s 记录 %d KB，超过续接上限 %d KB；新上下文按交付文件交接，避免长上下文干扰'
+                           % (resume, size // 1024, EXECUTOR_RESUME_MAX_BYTES // 1024))
+            resume = None
     task = s['plan']['tasks'].get(args.target)
     prev = flow.latest(s, args.target) if task else None
     if not resume and not replacement and task and task.get('session_policy') == 'resume' and prev and mode == 'dispatch':

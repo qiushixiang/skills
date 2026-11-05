@@ -203,6 +203,15 @@ class CardTests(unittest.TestCase):
         out = self.card('make', '--store', str(self.store), '--kind', 'EXECUTE', '--target', 'execute', '--runtime', str(self.runtime))
         card = json.loads((self.store.parent / 'records' / 'dispatch' / out['card'] / 'card.json').read_text())
         self.assertEqual((card['route'], card['resume']), ('agent', None)); self.assertIn('agent-old', card['replacement_reason'])
+        home = Path(self.tmp.name) / 'home'
+        agent = home / '.claude' / 'projects' / __import__('re').sub(r'[^A-Za-z0-9]', '-', str(self.workspace)) / 'nosuch' / 'subagents' / 'agent-agent-old.jsonl'
+        agent.parent.mkdir(parents=True)
+        for size, route in [(1000, 'send_message'), (400 * 1024, 'agent')]:
+            agent.write_text('x' * size)
+            proc = subprocess.run([sys.executable, '-c', 'import sys,runpy; from pathlib import Path; Path.home=lambda: Path(%r); sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0], run_name="__main__")' % str(home),
+                                   str(CARD), 'make', '--store', str(self.store), '--kind', 'EXECUTE', '--target', 'execute', '--runtime', str(self.runtime)],
+                                  capture_output=True, text=True)
+            self.assertEqual(json.loads(proc.stdout).get('route'), route, proc.stdout)
         self.card('start', '--store', str(self.store), '--card', out['card'], '--revision', self.rev())
 
     def test_cli_card_and_errors(self):
