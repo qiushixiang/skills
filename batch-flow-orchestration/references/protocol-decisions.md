@@ -23,6 +23,24 @@
 
 负责人用resolve.summary记诊断、采用或否决的workaround及依据；已有临时授权作为user_evidence引用，恢复工作用既有task/confirmation条件表达，版本/实施/验证依旧按正式操作登记。不要在blocks里阻塞决定自身必需的恢复任务；修复与审阅真实完成后才能close。交付/问题记录说明临时方案的适用边界、残余限制、保留/移除条件和后续责任，不另起workaround文档套件。实际实现、返修及验证按技术预算计入，不能借临时方案免扣或重置预算。
 
+## WAIT_EVIDENCE 诊断与重检
+
+正式任务返回未分类的 WAIT_EVIDENCE 时，status 生成 `evidence:<attempt ID>` 问题，包括没有 consumes 的 confirmation 任务。派发责任人机械执行 `signal --from-issue <key>`，随后派 architect DECIDE；不凭等待结果请求用户，也不重复原任务。已明确分类的 environment / decision_pause 仍走[有限续作](protocol-budget.md#技术预算记账与续作)。同一次等待先登记一个诊断，不同时生成重复的证据与预算问题；诊断闭环不追加或重置预算，原额度耗尽仍受预算门禁限制。
+
+只读审阅的等待先按[审阅留证例外](../workflows/review/SKILL.md)核验宿主保存的原始工具记录（CLI 为 run/stdout）：其中已有验证实际运行成功、仅 record 落盘失败的，按已运行采信，不得把审阅环境写 records、/tmp 或 `flow.py record` 成功列为恢复条件或前检门槛，也不为此扩大审阅写权限。测试本身因只读未能运行时，恢复条件只能选择只读环境可运行的代表性验证，或引用有写权限节点已留存的原始记录。
+
+非任务 CONFIRM_CONDITION 缺证时，各宿主统一登记正式操作，不依赖卡片缓存：
+
+```text
+flow.py decision_progress --actor orchestrator --revision <REV> --data '{"id":"<原裁决ID>","status":"waiting","requirement":"<原确认条件ID>","evidence":["<原始等待报告路径>"]}'
+```
+
+脚本保存在可选 `state.confirmation_waits` 数组：原 decision / requirement、由原始证据哈希确定的 source_key、evidence_hashes、actor / at / revision；旧台账无此字段仍可读。只接受未满足且前置依赖已满足的 confirmation，不解析自然语言原因。非 user 条件生成 technical_decision，目标为原条件，blocks 沿用原裁决（允许为空，不扩大范围）；原确认暂不派发，直到对应 source_key 的诊断以结构化恢复条件实际满足并 close。空 blocks 的 architect 自有确认可由其登记等待、看到诊断，但不因此取得其他任务或闭环权限。仅显式 owner=user 的条件保留用户待办；依赖未完成不转成用户条件。
+
+诊断不能以 clarification 空条件直接解封；负责人必须登记 task / confirmation 恢复条件及证据。原条件 confirmed 后等待失效，历史仍保留。无关任务完成、计划版本变化及 `--recheck` 都不能绕过未闭环诊断。已闭环的匹配诊断允许重新核对原条件；再次缺证用新的原始交付登记新等待。原始等待文件不可覆盖；机械 signal 复用并核验其已存哈希。
+
+派发卡回收 CONFIRM_CONDITION / WAIT_EVIDENCE 自动调用上述操作；`next` 对旧版已结束等待卡按原始 result.md（报告缺失时保留原 state.json 等待回执）机械补登记，不改旧卡结果或猜测 user 所有权。`pre_yield` 只读时指出待登记操作，不将旧技术等待伪装成 WAIT_USER；不使用卡片的全局进度计数决定重检。
+
 ## 用户离开状态
 
 “用户离开状态”是本任务内可撤销的临时推进委托，复用上一节的workaround权限边界。用户明确说“进入用户离开状态”即按这套已定义规则授权；如另附可改范围、代价、时限或禁区，以本次用户原话为准。编排者简短复述有效边界，用`set_user_mode`直接登记，不为启用/解除该模式再要求架构审批。只是讨论该功能、用户沉默或暂时未回复均不构成启用。无记录的旧任务默认present，不自动迁移为away；不同任务不互相继承状态。
@@ -90,3 +108,12 @@ plan_update 从同一 decision 下有效的用户 confirmation 读取授权：�
 恢复条件满足后用close一次闭环；内部检查条件并记录applied_at/closed_at，兼容旧的分别登记applied/closed。closed后仍重新检查整体任务门禁；其他裁决、缺第三方、预算或版本失效不会被本裁决清除。条件有依赖时，建议只提示依赖已满足的恢复任务。
 
 纯澄清可用resolve.clarification=true，requirements=[]、user_evidence=[]，一次决定并关闭。仅architect所有、非budget_exhausted信号可用，且报告以来plan_version和subjects均未变化；需要后续修改/验证/确认时禁止使用。旧裁决没有报告版本记录时仍走显式恢复条件，不回填推断。澄清不替代实现、审阅、用户批准或其他门禁。
+
+
+## 被新范围裁决替代的历史决定
+
+只有技术负责人可执行 `supersede_decision`，参数为 id、replacement、reason、evidence、context。它用于旧恢复路径已被用户授权的新范围和正式计划停用后收口历史提示，不用于跳过仍有效的修复、测试、审阅或预算门禁。
+
+前提：原决定尚未有效关闭；全部 blocks 已 retired，且没有活跃任务依赖它们；不同的替代决定已经 resolve，含完整有效的用户范围授权和裁决证据，且已据其正式 plan_update。原 summary、requirements、证据、用户确认与 attempts 均保留，新操作只追加替代关系、原因、证据哈希、作者上下文及登记时间，状态为 superseded。它不是 closed 或通过，不自动满足原条件、确认预算或返还消耗；新路径仍须完成自己的真实门禁。
+
+status 不再为 superseded 决定生成旧预算/恢复提示。原任务仍保留原 blocker，不能以替代为由重启旧路径；后续不能用旧决定改计划、确认条件或重钉版本。若要重新开展该范围，须明确规划新的恢复路径。旧计划/原证据仍可审计。

@@ -156,7 +156,7 @@ def metrics(store, report, at):
                           'status': events[-1]['value']['state'] if events else d['status'],
                           'registration_to_handling_seconds': seconds(d.get('reported_at'), d.get('handling', {}).get('started_at')),
                           'handling_to_resolution_seconds': seconds(d.get('handling', {}).get('started_at'), d.get('resolved_at')),
-                          'observed_blocked_seconds': sum(x['seconds'] for x in spans if x['state'] != 'closed' and x['seconds'] is not None) if spans else None,
+                          'observed_blocked_seconds': sum(x['seconds'] for x in spans if x['state'] not in {'closed','superseded'} and x['seconds'] is not None) if spans else None,
                           'work_seconds': seconds(d.get('timing',{}).get('started_at'),d.get('timing',{}).get('ended_at')),
                           'call': d.get('handling',{}).get('call'), 'call_id': d.get('call_id'),
                           'timeline': spans})

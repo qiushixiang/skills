@@ -72,9 +72,15 @@ run-dir 原样保存 request.json（实际参数、stdin）、stdout、stderr、
 python3 <技能目录>/scripts/agent_cli.py collect --run-dir <本轮记录目录>
 ```
 
+负责人已登记 decision_start 且会话仍为 pending 时，派发卡沿用该开始记录与原时间，不重复登记；配置必须一致且不能已有其他活跃派发卡。已有真实会话不走此分支。
+
+续接证据在当前任务台账的 records 内按真实适配器 request.json 定位，兼容旧 records/<名称> 与新 records/dispatch/<卡>/run 两种布局；仍须 collect 可用且原生会话 ID 精确匹配，不搜索其他任务，也不凭 UUID 字符串放行。
+
 collect 只读，不重派。检查 CLI 退出码、有效 JSON、非空原文、实际会话 ID、显式权限拒绝和 CLI 错误；续接 ID 必须一致。Codex 还要求 turn.completed，Claude 同时要求 subtype=success 和 is_error=false。原始输出中未提供的权限/模型信息不能据此推定合规。技术正确性仍由角色交付和独立审阅证明。
 
 没有 exit.json 返回 CLI_INCOMPLETE；可能还在运行，也可能 supervisor 已中断，须查宿主句柄和原始输出，不能认定任务仍活跃或直接重派。中断后不自动强杀可能正在写入的工作。run-dir 已存在就拒绝启动，防止覆盖证据。包装器 run 退出 0 表示 usable，2 表示检查失败；失败不自动等于 INVALID，须按[有效投入分类](protocol-budget.md#技术预算记账与续作)判断。
+
+统一派发卡回收CLI时直接引用原始 `run/receipt.json`、request/stdout/stderr/exit记录；`receipt.txt` 仅用于原生子代理路线。CLI快速完成而未轮询登记回执时仍可正常finish，不补造原生回执、不因回收失败重派已完成工作。run 目录只有 exit.json 而缺 request.json 不是真实运行记录，next 按中断收口；不得手写 run/exit.json、receipt 等运行文件来“作废”派发卡，作废按 next 的中断登记处理。
 
 传输可用后，派发责任人引用 stdout 原始交付，补真实会话与实际调用记录，按协议代交 finish/resolve，技术结论不得自行改写。最后取消本轮计时并重读 status/pre_yield。
 

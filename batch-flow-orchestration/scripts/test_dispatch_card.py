@@ -265,13 +265,102 @@ class CardTests(unittest.TestCase):
         self.assertIn('不派发执行者', prompt); self.assertNotIn('--as-lead', prompt)
         (d / 'receipt.txt').write_text('agentId: lead-1'); (d / 'result.md').write_text('结果：WAIT_EVIDENCE\n')
         self.card('finish', '--store', str(self.store), '--card', out['card'], '--revision', self.rev(), '--conversation', 'lead-1')
-        self.assertIn('--recheck', self.card(*mk, ok=False)['error'])
+        self.assertIn('没有可派发动作', self.card(*mk, ok=False)['error'])
         s = json.loads(self.store.read_text())
         gate = flow.pre_yield(s, 'orchestrator', None, self.store.parent)
-        self.assertNotIn('c1', [a['target'] for a in gate['actions']])
-        self.assertIn('c1', [a['target'] for a in gate['user_actions']])
-        self.assertIn('c1', [a['target'] for a in flow.pre_yield(s)['actions']])
-        self.card(*mk, '--recheck')
+        self.assertNotIn('c1', [a['target'] for a in gate['actions'] if a['kind'] == 'CONFIRM_CONDITION'])
+        self.assertEqual(gate['user_actions'], [])
+        self.assertIn('REGISTER_DECISION', [a['kind'] for a in flow.pre_yield(s)['actions']])
+        self.assertEqual(len(s['state']['confirmation_waits']), 1)
+        self.card(*mk, '--recheck', ok=False)
+        out = self.next()
+        self.assertEqual(out['do'], 'call')
+        diagnostic = json.loads((self.store.parent / 'records' / 'dispatch' / out['card'] / 'card.json').read_text())
+        self.assertEqual(diagnostic['kind'], 'DECIDE')
+        self.assertEqual(diagnostic['role'], 'architect')
+
+    def interrupted_confirmation_collection(self):
+        """Crash after the formal write and before finished card state is saved."""
+        import dispatch_card as dc
+        self.confirmation_fixture(delegate=True)
+        out = self.card('make', '--store', str(self.store), '--kind', 'CONFIRM_CONDITION', '--target', 'c1',
+                        '--runtime', str(self.runtime))
+        directory = self.store.parent / 'records' / 'dispatch' / out['card']
+        (directory / 'receipt.txt').write_text('agentId: lead-recovery')
+        (directory / 'result.md').write_text('结果：WAIT_EVIDENCE\nwaiting for board evidence\n')
+        revision_before = int(self.rev())
+        with unittest.mock.patch.object(dc, 'save_state', side_effect=OSError('simulated card state crash')):
+            with self.assertRaisesRegex(OSError, 'simulated card state crash'):
+                dc.finish_card(self.store, directory, revision_before, 'lead-recovery')
+        ledger = json.loads(self.store.read_text())
+        self.assertEqual(ledger['revision'], revision_before + 1)
+        self.assertEqual(len(ledger['state']['confirmation_waits']), 1)
+        self.assertFalse(dc.state(directory).get('finished'))
+        return out['card'], directory, revision_before
+
+    def test_finish_reuses_wait_after_crash_before_card_state_save(self):
+        card, directory, stale_revision = self.interrupted_confirmation_collection()
+        original_ledger = self.store.read_bytes()
+        out = self.card('finish', '--store', str(self.store), '--card', card, '--revision', str(stale_revision),
+                        '--conversation', 'lead-recovery')
+        self.assertEqual(out['revision'], stale_revision + 1)
+        self.assertEqual(self.store.read_bytes(), original_ledger)
+        self.assertTrue(json.loads((directory / 'state.json').read_text())['finished'])
+
+    def test_next_recovers_wait_after_crash_before_card_state_save(self):
+        card, directory, _ = self.interrupted_confirmation_collection()
+        self.agent('s1', 'lead-recovery', card, '结果：WAIT_EVIDENCE\nwaiting for board evidence\n')
+        out = self.next()
+        self.assertEqual(out['do'], 'call')
+        self.assertEqual(out['collected'][0]['card'], card)
+        self.assertTrue(json.loads((directory / 'state.json').read_text())['finished'])
+        ledger = json.loads(self.store.read_text())
+        self.assertEqual(len(ledger['state']['confirmation_waits']), 1)
+        operations = [op for h in ledger['history'] for op in h['operations']]
+        self.assertEqual(sum(op['type'] == 'decision_progress' and op['data'].get('status') == 'waiting' for op in operations), 1)
+        diagnostic = json.loads((self.store.parent / 'records' / 'dispatch' / out['card'] / 'card.json').read_text())
+        self.assertEqual(diagnostic['kind'], 'DECIDE')
+
+    def test_interrupted_wait_cannot_reuse_overwritten_evidence(self):
+        card, directory, _ = self.interrupted_confirmation_collection()
+        original_ledger = self.store.read_bytes()
+        (directory / 'result.md').write_text('结果：WAIT_EVIDENCE\noverwritten original evidence\n')
+        out = self.card('finish', '--store', str(self.store), '--card', card, '--revision', self.rev(),
+                        '--conversation', 'lead-recovery', ok=False)
+        self.assertIn('原始等待证据已改变', out['error'])
+        self.assertEqual(self.store.read_bytes(), original_ledger)
+        import dispatch_card as dc
+        self.assertFalse(dc.state(directory).get('finished'))
+
+    def test_next_migrates_legacy_wait_and_diagnoses_empty_blocks(self):
+        self.confirmation_fixture(delegate=True)
+        s = json.loads(self.store.read_text())
+        s['decisions']['D1']['blocks'] = []
+        self.store.write_text(json.dumps(s))
+        mk = ['make', '--store', str(self.store), '--kind', 'CONFIRM_CONDITION', '--target', 'c1', '--runtime', str(self.runtime)]
+        out = self.card(*mk); d = self.store.parent / 'records' / 'dispatch' / out['card']
+        result = d / 'result.md'; result.write_text('结果：WAIT_EVIDENCE\n依赖尚未提供\n')
+        original_state = dict(finished='2026-01-01T00:00:00+00:00', result='WAIT_EVIDENCE',
+                              progress_marker=flow.progress_marker(s))
+        (d / 'state.json').write_text(json.dumps(original_state))
+        # Legacy markers cannot be made retryable by unrelated progress or --recheck.
+        s['plan_version'] += 1; self.store.write_text(json.dumps(s))
+        self.card(*mk, '--recheck', ok=False)
+        gate = flow.pre_yield(s, root=self.store.parent)
+        self.assertEqual(gate['user_actions'], [])
+        self.assertIn('REGISTER_CONFIRMATION_WAIT', [a['kind'] for a in gate['actions']])
+        out = self.next()
+        self.assertEqual(out['do'], 'call')
+        card = json.loads((self.store.parent / 'records' / 'dispatch' / out['card'] / 'card.json').read_text())
+        self.assertEqual(card['kind'], 'DECIDE')
+        s = json.loads(self.store.read_text())
+        wait = s['state']['confirmation_waits'][0]
+        self.assertEqual(wait['evidence_hashes'], {str(result): flow.hashlib.sha256(result.read_bytes()).hexdigest()})
+        diagnostic = s['decisions'][card['target']]
+        self.assertEqual(diagnostic['blocks'], [])
+        self.assertEqual(diagnostic['owner'], 'architect')
+        self.assertEqual(json.loads((d / 'state.json').read_text()), original_state)
+        self.assertEqual(len([h for h in s['history'] if any(o['type'] == 'decision_progress' and o['data'].get('status') == 'waiting' for o in h['operations'])]), 1)
 
     def test_confirmation_waits_while_owned_work_runs(self):
         self.build(lambda p: p['roles']['architect'].update(tool='claude', model='opus', effort='default'))
@@ -357,6 +446,130 @@ class CardTests(unittest.TestCase):
         s['plan']['roles']['reviewer'].update(effort='default', model='gpt-5'); self.store.write_text(json.dumps(s))
         err = self.card('make', '--store', str(self.store), '--kind', 'REVIEW', '--target', 'regular', '--runtime', str(self.runtime), ok=False)
         self.assertIn('模型', err['error'])
+
+
+    def test_structured_goals_reach_native_card_and_stale_card_cannot_start(self):
+        def goals(p):
+            from test_goal_contract import contract
+            p['goal_contract'] = contract('project outcome')
+            for tid, task in p['tasks'].items(): task['goal_contract'] = contract(tid)
+        self.build(goals)
+        card = self.card('make', '--store', str(self.store), '--kind', 'EXECUTE', '--target', 'execute', '--runtime', str(self.runtime))
+        text = Path(card['prompt_file']).read_text()
+        card_data = json.loads((Path(card['prompt_file']).parent / 'card.json').read_text())
+        payload = json.loads(Path(card_data['payload_file']).read_text())
+        self.assertEqual(payload['target'], 'execute')
+        self.assertIn('goal_context', payload)
+        self.assertNotIn('## 原始载荷', text)
+        self.assertEqual(text.count('test action'), 1)
+        self.assertIn('project outcome excluded work', text)
+        self.assertIn('execute observable result', text)
+        s = json.loads(self.store.read_text()); s['plan_version'] += 1
+        s['plan']['tasks']['execute']['goal_contract']['goal'] = 'updated authorized goal'
+        self.store.write_text(json.dumps(s))
+        err = self.card('start', '--store', str(self.store), '--card', card['card'], '--revision', str(s['revision']), ok=False)
+        self.assertIn('目标或计划版本', err['error'])
+        self.assertFalse(json.loads(self.store.read_text())['state']['attempts'])
+
+
+    def completed_cli_card(self, receipt=True, code=0):
+        self.build(lambda p: p['roles']['executor'].update(tool='codex', model='gpt-6.1-sol', effort='medium'))
+        profile = self.runtime / 'codex-profile.json'
+        profile.write_text(json.dumps(dict(format='batch-flow-cli/v1', backend='codex', binary='/bin/codex', version='fixture')))
+        spec_path = self.runtime / 'spec.json'; spec = json.loads(spec_path.read_text())
+        spec['profiles'].append(str(profile)); spec_path.write_text(json.dumps(spec))
+        card = self.card('make', '--store', str(self.store), '--kind', 'EXECUTE', '--target', 'execute', '--runtime', str(self.runtime))
+        revision = json.loads(self.store.read_text())['revision']
+        self.card('start', '--store', str(self.store), '--card', card['card'], '--revision', str(revision))
+        directory = Path(card['prompt_file']).parent; run = directory / 'run'; run.mkdir()
+        cid = '10000000-0000-4000-8000-000000000001'
+        (run / 'request.json').write_text(json.dumps(dict(backend='codex', conversation=None, task='execute', started_at=flow.now())))
+        if receipt: (run / 'receipt.json').write_text(json.dumps(dict(event='CLI_STARTED', pid=12345, task='execute')))
+        events = [dict(type='thread.started', thread_id=cid), dict(type='item.completed', item=dict(type='agent_message', text='结果：VERIFIED\n验证证据：fixture')), dict(type='turn.completed')]
+        (run / 'stdout').write_text('\n'.join(json.dumps(e) for e in events))
+        (run / 'stderr').write_text('')
+        (run / 'exit.json').write_text(json.dumps(dict(returncode=code, ended_at=flow.now())))
+        return card, directory, run, cid
+
+    def test_next_collects_fast_cli_completion_using_original_json_receipt(self):
+        card, directory, run, cid = self.completed_cli_card()
+        self.assertFalse((directory / 'receipt.txt').exists())
+        report = self.next()
+        self.assertEqual(report['collected'][0]['card'], card['card'])
+        self.assertFalse(report.get('problems'))
+        attempt = self.attempt('execute')
+        self.assertEqual((attempt['result'], attempt['call']['conversation_id']), ('VERIFIED', cid))
+        self.assertIn(str(run / 'receipt.json'), attempt['evidence'])
+        self.assertIn(str(run / 'request.json'), attempt['evidence'])
+        self.assertNotIn(str(directory / 'receipt.txt'), attempt['evidence'])
+        self.assertFalse((directory / 'receipt.txt').exists())
+        self.next()
+        attempts = [a for a in json.loads(self.store.read_text())['state']['attempts'] if a['task']=='execute']
+        self.assertEqual(len(attempts), 1)
+
+    def test_cli_without_original_launch_receipt_cannot_finish(self):
+        card, directory, run, cid = self.completed_cli_card(receipt=False)
+        revision = json.loads(self.store.read_text())['revision']
+        error = self.card('finish', '--store', str(self.store), '--card', card['card'], '--revision', str(revision), ok=False)
+        self.assertIn('run/receipt.json', error['error'])
+        self.assertIsNone(self.attempt('execute')['result'])
+        self.assertFalse((directory / 'receipt.txt').exists())
+
+    def test_exit_without_cli_request_is_closed_not_reported_every_round(self):
+        card, directory, run, cid = self.completed_cli_card()
+        (run / 'request.json').unlink()
+        report = self.next()
+        self.assertFalse(report.get('problems'))
+        self.assertEqual([x['card'] for x in report['interrupted']], [card['card']])
+        st = json.loads((directory / 'state.json').read_text())
+        self.assertTrue(st['finished'])
+        first = next(a for a in json.loads(self.store.read_text())['state']['attempts'] if a['id'] == st['attempt'])
+        self.assertEqual(first['result'], 'INVALID')
+        self.assertFalse(self.next().get('problems'))
+
+    def test_failed_cli_does_not_accept_response_as_success(self):
+        card, directory, run, cid = self.completed_cli_card(code=1)
+        revision = json.loads(self.store.read_text())['revision']
+        error = self.card('finish', '--store', str(self.store), '--card', card['card'], '--revision', str(revision), ok=False)
+        self.assertIn('不可用', error['error'])
+        self.assertIsNone(self.attempt('execute')['result'])
+
+
+    def test_resume_finds_verified_legacy_run_within_bound_ledger(self):
+        import dispatch_card
+        import shutil
+        card, directory, run, cid = self.completed_cli_card()
+        legacy = self.store.parent / 'records' / 'legacy_architect_run_01'
+        shutil.move(str(run), str(legacy))
+        before = self.store.read_bytes()
+        self.assertEqual(dispatch_card.prior_run(self.store, cid), legacy)
+        self.assertEqual(self.store.read_bytes(), before)
+        # A native ID alone is insufficient: failed completion may not be resumed.
+        (legacy / 'exit.json').write_text(json.dumps(dict(returncode=1, ended_at=flow.now())))
+        with self.assertRaises(dispatch_card.CardError): dispatch_card.prior_run(self.store, cid)
+        # An unrelated task base must not supply a proof for this ledger.
+        outside = self.workspace / 'other-task' / 'records' / 'successful_run'
+        outside.parent.mkdir(parents=True); shutil.move(str(legacy), str(outside))
+        (outside / 'exit.json').write_text(json.dumps(dict(returncode=0, ended_at=flow.now())))
+        with self.assertRaises(dispatch_card.CardError): dispatch_card.prior_run(self.store, cid)
+
+
+    def test_decision_card_reuses_pending_registration_without_starting_twice(self):
+        s = json.loads(self.store.read_text())
+        proof = str(self.task / '.batch-flow' / 'proof.txt')
+        request = dict(request_id='pending-decision', expected_revision=s['revision'], actor='architect', operations=[
+            dict(type='signal', data=dict(id='D1',signal='scope_blocked',reason='diagnose',blocks=['done'],evidence=[proof])),
+            dict(type='decision_start', data=dict(id='D1',call=dict(s['plan']['roles']['architect'],conversation_id='pending:D1')))])
+        s,_ = flow.apply_request(s,request,self.store.parent); self.store.write_text(json.dumps(s))
+        before = self.store.read_bytes(); old_start = s['decisions']['D1']['handling']['started_at']
+        card = self.card('make','--store',str(self.store),'--kind','DECIDE','--target','D1','--runtime',str(self.runtime))
+        self.card('start','--store',str(self.store),'--card',card['card'],'--revision',str(s['revision']))
+        self.assertEqual(self.store.read_bytes(), before)
+        state = json.loads((Path(card['prompt_file']).parent / 'state.json').read_text())
+        self.assertTrue(state['reused_pending_handling']); self.assertEqual(state['started'],old_start)
+        duplicate = self.card('make','--store',str(self.store),'--kind','DECIDE','--target','D1','--runtime',str(self.runtime))
+        error = self.card('start','--store',str(self.store),'--card',duplicate['card'],'--revision',str(s['revision']),ok=False)
+        self.assertIn('active dispatch card',error['error'])
 
 
 if __name__ == '__main__':

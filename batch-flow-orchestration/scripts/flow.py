@@ -31,7 +31,7 @@ OP_ROLES = {
     'decision_progress': {'orchestrator', 'architect'}, 'history': {'orchestrator'},
     'change_subject': {'executor', 'architect'}, 'feedback': ROLES,
     'observe': {'orchestrator', 'architect'}, 'decision_start': {'architect'},
-    'repin_requirement': {'architect'},
+    'repin_requirement': {'architect'}, 'supersede_decision': {'architect'},
     'classify_attempt': {'architect'}, 'resume_attempt': {'architect'},
     'set_models': {'orchestrator'},
     'set_user_mode': {'orchestrator'},
@@ -158,7 +158,13 @@ def review_budget_coverage(p, excluded=(), historical_spend=None):
 def active_review_budget_coverage(s, plan=None):
     plan=s['plan'] if plan is None else plan
     done={bid for bid,b in s['plan']['batches'].items() if b.get('retired') or success(s,b['completion_task'])}
-    excluded={tid for tid,t in plan['tasks'].items() if t==s['plan']['tasks'].get(tid) and set(t['scope'])<=done}
+    def unchanged_task(tid, task):
+        old = s['plan']['tasks'].get(tid)
+        # First-time scope annotation on an already completed task is not new delivery work.
+        # Any other instruction/config change or later contract revision still gets full checking.
+        return task == old or (old is not None and 'goal_contract' not in old and
+                               {k:v for k,v in task.items() if k != 'goal_contract'} == old)
+    excluded={tid for tid,t in plan['tasks'].items() if unchanged_task(tid,t) and set(t['scope'])<=done}
     spent={}
     for a in s['state']['attempts']:
         if a['task'] not in excluded or s['plan']['tasks'][a['task']]['kind'] not in {'review','third_party','verify'}:
@@ -170,8 +176,10 @@ def active_review_budget_coverage(s, plan=None):
 
 
 def validate_plan(p, enforce_review_budget=True):
-    obj(p, ['name', 'roles', 'batches', 'subjects', 'budgets', 'tasks', 'decision_points'], ['feedback_minutes', 'context_groups'])
+    obj(p, ['name', 'roles', 'batches', 'subjects', 'budgets', 'tasks', 'decision_points'], ['feedback_minutes', 'context_groups', 'goal_contract'])
     string(p['name'], 'plan.name')
+    if 'goal_contract' in p:
+        validate_goal_contract(p['goal_contract'], 'plan.goal_contract')
     require(isinstance(p['roles'], dict), 'plan.roles: expected object')
     require(isinstance(p.get('feedback_minutes', {}), dict), 'feedback_minutes: expected object')
     require('architect' in p['roles'] and set(p['roles']) <= ROLES, 'plan.roles: provide technical lead and supported active roles')
@@ -194,7 +202,7 @@ def validate_plan(p, enforce_review_budget=True):
             boolean(b['retired'], 'retired')
     for tid, t in p['tasks'].items():
         string(tid, 'task id')
-        obj(t, ['kind', 'role', 'scope', 'subjects', 'depends_on', 'consumes', 'instruction'], ['session_policy', 'retry_limit', 'can_close', 'retired', 'requires_authorization', 'decision_only', 'repair_tasks', 'phase', 'handoff', 'environment_retry_limit', 'continuation_limit', 'dispatch_owner'])
+        obj(t, ['kind', 'role', 'scope', 'subjects', 'depends_on', 'consumes', 'instruction'], ['session_policy', 'retry_limit', 'can_close', 'retired', 'requires_authorization', 'decision_only', 'repair_tasks', 'phase', 'handoff', 'environment_retry_limit', 'continuation_limit', 'dispatch_owner', 'goal_contract'])
         require(t['kind'] in KINDS, f'{tid}: unsupported kind')
         require(t['role'] in ROLES, f'{tid}: unsupported role')
         if 'handoff' in t:
@@ -209,6 +217,10 @@ def validate_plan(p, enforce_review_budget=True):
             require(h['backup_budget'] != h['lead_budget'] and not {h['backup_budget'],h['lead_budget']} & set(t['consumes']), 'handoff budgets must be distinct from primary budgets')
             require(p['budgets'][h['backup_budget']]['limit'] == 1, 'backup executor has exactly one technical round')
         string(t['instruction'], f'{tid}.instruction')
+        if 'goal_contract' in t:
+            validate_goal_contract(t['goal_contract'], f'{tid}.goal_contract')
+        require('goal_contract' not in p or t.get('retired') or 'goal_contract' in t,
+                f'{tid}: missing goal_contract under structured project goals')
         require(t.get('dispatch_owner', 'orchestrator') in {'orchestrator', 'architect'}, f'{tid}: invalid dispatch owner')
         require(t.get('dispatch_owner', 'orchestrator') != 'architect' or t['role'] != 'orchestrator', f'{tid}: local task result needs a non-orchestrator responsible role')
         if 'phase' in t: string(t['phase'], f'{tid}.phase')
@@ -611,6 +623,17 @@ def closure_tasks(s, d):
     # Recovery work is allowed while its dependent implementation remains blocked.
     return {r['target'] for r in (d['resolution'] or {}).get('requirements', []) if r['kind'] == 'task'}
 
+def source_recovered(s, key):
+    return any(d.get('source_key') == key and decision_closed(s, d) for d in s['decisions'].values())
+
+
+def confirmation_wait_pending(s, wait):
+    dec = s['decisions'][wait['decision']]
+    req = next(r for r in dec['resolution']['requirements'] if r['id'] == wait['requirement'])
+    return (dec['status'] != 'superseded' and req['owner'] != 'user'
+            and not requirement_ok(s, req) and not source_recovered(s, wait['source_key']))
+
+
 def issues(s):
     out = []
     for tid, t in s['plan']['tasks'].items():
@@ -619,6 +642,12 @@ def issues(s):
         a = latest(s, tid)
         if a and a.get('result') == 'ARCH_DECISION_REQUIRED' and not awaiting_resumption(s,a) and not any(d.get('source_key') == f'arch:{a["id"]}' and decision_closed(s,d) for d in s['decisions'].values()):
             out.append({'key': f'arch:{a["id"]}', 'signal': 'technical_decision', 'blocks': [tid], 'reason': f'{tid}: reviewer requested architecture decision'})
+        if a and a.get('result') == 'WAIT_EVIDENCE' and not awaiting_resumption(s, a):
+            key = 'evidence:' + a['id']
+            if not source_recovered(s, key):
+                out.append(dict(key=key, signal='technical_decision', blocks=[tid], target=tid,
+                                reason=f'{tid}: WAIT_EVIDENCE requires diagnosis; exhausted budgets: ' + str([b for b in performer(s, tid)[3] if used(s, b) >= s['plan']['budgets'][b]['limit']]), evidence=a['evidence']))
+                continue  # One diagnosis owns this wait, including its budget consequences.
         if a and a.get('result') and not success(s, tid) and not blockers(s, tid):
             if awaiting_resumption(s, a) and (not resumption(s, a) or continuing_charged_round(s, a)):
                 continue
@@ -627,6 +656,12 @@ def issues(s):
             exhausted = [b for b in performer(s,tid)[3] if used(s, b) >= s['plan']['budgets'][b]['limit']]
             if needs and exhausted:
                 out.append({'key': f'budget:{tid}:{a["id"]}', 'signal': 'budget_exhausted', 'blocks': [tid], 'reason': f'{tid}: exhausted {exhausted}; unresolved or stale result'})
+    for wait in s['state'].get('confirmation_waits', []):
+        if confirmation_wait_pending(s, wait):
+            dec = s['decisions'][wait['decision']]
+            out.append(dict(key=wait['source_key'], signal='technical_decision', blocks=list(dec['blocks']),
+                            target=wait['requirement'], decision=dec['id'], evidence=wait['evidence_hashes'],
+                            reason=wait['requirement'] + ': WAIT_EVIDENCE requires diagnosis'))
     return out
 
 def repairs_pending(s):
@@ -640,6 +675,47 @@ def repairs_pending(s):
             if not repair or int(repair['id'][1:]) < int(a['id'][1:]) or not success(s,target):
                 result.setdefault(target, []).append(a['id'])
     return result
+
+
+def validate_goal_contract(contract, label):
+    obj(contract, ['goal', 'acceptance', 'non_goals'])
+    string(contract['goal'], label + '.goal')
+    strings(contract['acceptance'], label + '.acceptance', nonempty=True)
+    strings(contract['non_goals'], label + '.non_goals')
+
+
+def goal_context(s, item):
+    """Copy current authorized scope; never infer acceptance from old findings."""
+    plan = s['plan']; tasks = plan['tasks']; target = item['target']
+    decision = s['decisions'].get(item.get('decision')) or s['decisions'].get(target)
+    tids = {target} if target in tasks else set()
+    if decision:
+        tids.update(decision['blocks'])
+        tids.update(r['target'] for r in (decision.get('resolution') or {}).get('requirements', [])
+                    if r['kind'] == 'task')
+    # Only direct delivery objects are relevant; prerequisite chains are scheduling context.
+    for tid in list(tids):
+        task = tasks[tid]
+        if task['kind'] in {'review', 'third_party', 'verify', 'acceptance', 'confirmation'}:
+            tids.update(dep for dep in task['depends_on'] + task.get('repair_tasks', [])
+                        if tasks[dep]['kind'] in {'design', 'execute', 'verify'})
+    rows = []
+    for tid in sorted(tids):
+        task = tasks[tid]
+        row = dict(task=tid, kind=task['kind'])
+        if 'goal_contract' in task:
+            row['contract'] = copy.deepcopy(task['goal_contract'])
+        else:
+            # Legacy stores remain readable; do not pretend prose was structured/validated.
+            row['instruction'] = task['instruction']
+        design = s.get('design') or {}
+        if tid in design.get('sections', {}):
+            row['design'] = dict(path=design['path'], version=design['version'],
+                                 section=design['sections'][tid])
+        rows.append(row)
+    return dict(target=target, plan_version=s['plan_version'], project=copy.deepcopy(plan.get('goal_contract')),
+                tasks=rows, legacy=not bool(plan.get('goal_contract')),
+                missing=[r['task'] for r in rows if 'contract' not in r])
 
 
 def action(kind, target, role, instruction, **extra):
@@ -666,12 +742,12 @@ def status(s, at=None):
             actions.append(action('REPORT_PROGRESS',recorded['task'],task['role'],'达到反馈阈值：补记进度/阻塞与下一步；不自动停止或增加预算',attempt=recorded['id']))
     for issue in issues(s):
         if not any(d.get('source_key') == issue['key'] and not decision_closed(s, d) for d in s['decisions'].values()):
-            actions.append(action('REGISTER_DECISION', issue['blocks'][0], 'orchestrator',
+            actions.append(action('REGISTER_DECISION', issue.get('target') or issue['blocks'][0], 'orchestrator',
                 issue['reason'] + '。只做机械登记：signal --from-issue ' + issue['key'] + '（数据由脚本按本问题生成，不自拟）。'
                 '登记后 status 会出现 DECIDE，由技术负责人诊断，按其派发方式交出；编排者不自行诊断、修复或代做 DECIDE，'
-                '预算耗尽也不直接请用户批预算（追加与否由技术负责人裁决后才问用户）。', issue=issue))
+                '预算耗尽也不直接请用户批预算（追加与否由技术负责人裁决后才问用户）。', issue=issue, decision=issue.get('decision')))
     for d in s['decisions'].values():
-        if decision_closed(s, d):
+        if decision_closed(s, d) or d['status'] == 'superseded':
             continue
         if not d['resolution']:
             owner = decision_owner(d)
@@ -685,6 +761,8 @@ def status(s, at=None):
             if any(not requirement_ok(s, next(x for x in rr if x['id'] == dep)) for dep in r['depends_on']):
                 continue
             if r['kind'] == 'confirmation':
+                if any(w['requirement'] == r['id'] and confirmation_wait_pending(s, w) for w in s['state'].get('confirmation_waits', [])):
+                    continue
                 actions.append(action('CONFIRM_CONDITION', r['id'], r['owner'], r['instruction'], decision=d['id']))
         if not pending:
             actions.append(action('CLOSE_DECISION', d['id'], 'orchestrator', '恢复条件齐全，用 close 一次检查并闭环；之后重新检查整体门禁'))
@@ -779,6 +857,7 @@ def status(s, at=None):
         role=item['role'];config=item.get('call_config',s['plan']['roles'].get(role,{}))
         item['principal']=config.get('principal','backup_executor' if item.get('executor_stage') == 'backup' else role)
         tid=item['target'];task=s['plan']['tasks'].get(tid)
+        item['goal_context'] = goal_context(s, item)
         # role names identify the performer, not permission for the coordinator
         # to do the work. Keep the payload separate from dispatch instructions.
         if role == 'user' or item['kind'] in {'REQUEST_AUTHORIZATION','ASSIGN_MODELS'}:
@@ -826,6 +905,7 @@ def status(s, at=None):
                 ['kind','target','role','principal','instruction','call_config','context_hint',
                  'subjects','remaining','executor_stage','retry_of','continuation_of','blocks','decision','review_budget_blockers'] if key in item}
             item['subagent_payload'].setdefault('call_config',copy.deepcopy(config))
+            item['subagent_payload']['goal_context'] = copy.deepcopy(item['goal_context'])
             item.pop('instruction')
             item['orchestrator_todo']=guidance + '只将 subagent_payload 交给指定角色；其中的 instruction 不是主会话 TODO。禁止直接执行 git add/commit/merge、产品构建或测试。'
         else:
@@ -838,6 +918,7 @@ def status(s, at=None):
 
 
 def decision_state(s, d):
+    if d['status'] == 'superseded': return 'superseded'
     if decision_closed(s, d): return 'closed'
     recovered = bool(d['resolution']) and all(requirement_ok(s,r) for r in d['resolution']['requirements'])
     if d['status'] == 'applied': return 'applied' if recovered else 'recovery_invalidated'
@@ -853,30 +934,45 @@ def progress_marker(s):
                 confirmations=sorted(s['state']['confirmations']), plan_version=s['plan_version'])
 
 
-def waiting_conditions(s, root):
-    """CONFIRM_CONDITION targets whose latest dispatch card came back WAIT_EVIDENCE with no ledger progress since.
-
-    Dispatching the same check again cannot change the answer, so these are waiting, not work.
-    Only Claude-host dispatch cards record the marker; other hosts are unaffected."""
-    base=Path(root)/'records'/'dispatch'; latest_card={}
-    if not base.is_dir(): return {}
-    for path in base.glob('*/card.json'):
+def legacy_confirmation_waits(s, root):
+    latest_card = {}
+    for path in (Path(root)/'records'/'dispatch').glob('*/card.json'):
         try:
-            card=json.loads(path.read_text()); st=json.loads((path.parent/'state.json').read_text())
-        except (OSError,ValueError):
+            card = json.loads(path.read_text()); st = json.loads((path.parent/'state.json').read_text())
+        except (OSError, ValueError):
             continue
-        if card.get('kind')!='CONFIRM_CONDITION' or not st.get('finished'): continue
-        prev=latest_card.get(card.get('target'))
-        if prev is None or st['finished']>prev[1]['finished']: latest_card[card.get('target')]=(card,st)
-    marker=progress_marker(s)
-    return {target:card['id'] for target,(card,st) in latest_card.items()
-            if st.get('result')=='WAIT_EVIDENCE' and st.get('progress_marker')==marker}
+        if card.get('kind') != 'CONFIRM_CONDITION' or not st.get('finished'):
+            continue
+        target = card.get('target')
+        if target not in latest_card or st['finished'] > latest_card[target][1]['finished']:
+            latest_card[target] = (card, st, path.parent/'result.md')
+    rows = []
+    for target, (card, st, path) in latest_card.items():
+        if st.get('result') != 'WAIT_EVIDENCE': continue
+        if not path.is_file(): path = path.parent/'state.json'
+        if any(w['requirement'] == target for w in s['state'].get('confirmation_waits', [])): continue
+        for dec in s['decisions'].values():
+            if dec['status'] == 'superseded': continue
+            req = next((r for r in (dec.get('resolution') or {}).get('requirements', []) if r['id'] == target and r['kind'] == 'confirmation'), None)
+            if req and not requirement_ok(s, req) and all(requirement_ok(s, next(r for r in dec['resolution']['requirements'] if r['id'] == dep)) for dep in req['depends_on']):
+                rows.append(dict(decision=dec['id'], requirement=target, owner=req['owner'], path=str(path), card=card['id']))
+    return rows
+
+
+def waiting_conditions(s, root=None):
+    return {w['requirement']: w['source_key'] for w in s['state'].get('confirmation_waits', []) if confirmation_wait_pending(s, w)}
 
 
 def pre_yield(s, owner='orchestrator', boundary_audit=None, root=None):
     """Advisory stop-hook result. Never starts work or changes the ledger."""
     report=status(s)
-    waiting=waiting_conditions(s,root) if root is not None else {}
+    legacy = legacy_confirmation_waits(s, root) if root is not None else []
+    waiting = {w['requirement']: w['card'] for w in legacy}
+    for w in legacy:
+        if w['owner'] != 'user':
+            report['actions'].append(action('REGISTER_CONFIRMATION_WAIT', w['requirement'], 'orchestrator',
+                '通过 decision_progress status=waiting 登记原始确认等待，再按 status 派负责人诊断', decision=w['decision'],
+                register_data=dict(id=w['decision'], status='waiting', requirement=w['requirement'], evidence=[w['path']])))
     owned={tid for tid,t in s['plan']['tasks'].items() if owner=='orchestrator' or t.get('dispatch_owner','orchestrator')==owner}
     if owner != 'orchestrator':
         owned.difference_update(a['task'] for a in s['state']['attempts'] if not a.get('result') and tracking.accounting_kind(s,a)!='withdrawn' and a.get('dispatch_owner','orchestrator') != owner)
@@ -887,7 +983,13 @@ def pre_yield(s, owner='orchestrator', boundary_audit=None, root=None):
         if owner=='orchestrator': return True
         if a['target'] in owned: return True
         decision=s['decisions'].get(a['target']) or s['decisions'].get(a.get('decision'))
-        return bool(decision and decision['blocks'] and set(decision['blocks']) <= owned)
+        if decision and decision['blocks']: return set(decision['blocks']) <= owned
+        # Empty blocks confer no task authority. Only the explicit architect-owned
+        # confirmation and its diagnosis are visible to the local lead.
+        origins = [w for w in s['state'].get('confirmation_waits', []) if decision and w['source_key'] == decision.get('source_key')]
+        origins += [dict(decision=a.get('decision'), requirement=a['target'])] if a.get('decision') else []
+        return any(r['id'] == w['requirement'] and r.get('owner') == 'architect'
+                   for w in origins for r in (s['decisions'].get(w['decision'], {}).get('resolution') or {}).get('requirements', []))
     busy=any(report['tasks'].get(tid)=='RUNNING' for tid in owned)
     # A confirmation only checks existing evidence. While owned work is still running, checking now
     # cannot change the answer and may race the running writer, so it waits instead of forcing CONTINUE.
@@ -916,8 +1018,6 @@ def pre_yield(s, owner='orchestrator', boundary_audit=None, root=None):
         except (OSError,ValueError,KeyError,TypeError,OverflowError):
             problems.append(dict(task=tid,attempt=a['id'],reason='timer receipt unavailable; verify actual task and timer state'))
     user=[a for a in report['actions'] if (a['role']=='user' or a['kind'] in {'REQUEST_AUTHORIZATION','ASSIGN_MODELS'}) and relevant(a)]
-    user+=[dict(kind='WAITING_CONDITION',target=target,card=card,role='user',
-                instruction='上次确认卡返回 WAIT_EVIDENCE 且台账无进展；不重复派发，等待依赖任务完成或用户补证') for target,card in waiting.items()]
     local_complete=owner=='architect' and all(report['tasks'][tid] in {'SATISFIED','RETIRED','INACTIVE'} for tid in owned)
     disposition='CONTINUE' if work or problems else 'WAIT_HOST' if running else 'WAIT_USER' if user else 'COMPLETE' if (report['complete'] or local_complete) else 'STALLED'
     audit_report=boundary_audit or {'status':'not_configured'}
@@ -939,7 +1039,7 @@ def validate_store(s):
     if 'design' in s:
         link=s['design'];obj(link,['path','version','plan_version','sections','sha256'],['section_hashes'])
         require(link['plan_version']==s['plan_version'], 'design link plan version mismatch')
-    obj(s['state'], ['attempts', 'authorized_batches', 'authorization_evidence', 'confirmations', 'feedback'], ['plan_changes', 'tracking', 'attempt_accounting', 'resumptions', 'user_mode', 'design_corrections'])
+    obj(s['state'], ['attempts', 'authorized_batches', 'authorization_evidence', 'confirmations', 'feedback'], ['plan_changes', 'tracking', 'attempt_accounting', 'resumptions', 'user_mode', 'design_corrections', 'confirmation_waits'])
     if 'user_mode' in s['state']:
         mode=s['state']['user_mode']
         obj(mode,['mode','authorization','user_evidence','actor','at'])
@@ -977,6 +1077,32 @@ def validate_store(s):
     require(isinstance(s['decisions'], dict), 'decisions must be object')
     for d in s['decisions'].values():
         require(set(d['blocks']) <= s['plan']['tasks'].keys(), 'decision blocks unknown task')
+        if d['status'] == 'superseded':
+            supersession = d.get('supersession', {})
+            require(supersession.get('replacement') in s['decisions'] and supersession['replacement'] != d['id'],
+                    'superseded decision requires a different recorded replacement')
+            require(d['blocks'] and all(s['plan']['tasks'][tid].get('retired') for tid in d['blocks']),
+                    'cannot reactivate superseded scope; plan a new explicit recovery path')
+
+    waits = s['state'].get('confirmation_waits', [])
+    require(isinstance(waits, list), 'confirmation_waits must be an array')
+    keys = set()
+    for wait in waits:
+        obj(wait, ['decision', 'requirement', 'source_key', 'evidence_hashes', 'actor', 'at', 'revision'])
+        string(wait['decision'], 'wait decision'); string(wait['requirement'], 'wait requirement'); string(wait['source_key'], 'wait source key')
+        dec = s['decisions'].get(wait['decision'])
+        require(dec and dec.get('resolution'), 'wait requires a resolved decision')
+        require(any(r['id'] == wait['requirement'] and r['kind'] == 'confirmation' for r in dec['resolution']['requirements']), 'wait requires a confirmation requirement')
+        require(wait['actor'] in {'orchestrator', 'architect'}, 'invalid wait actor')
+        timestamp(wait['at']); integer(wait['revision'], 'wait revision', 1)
+        require(isinstance(wait['evidence_hashes'], dict) and bool(wait['evidence_hashes']), 'wait evidence hashes required')
+        require(all(isinstance(p, str) and isinstance(h, str) and re.fullmatch(r'[0-9a-f]{64}', h) for p,h in wait['evidence_hashes'].items()), 'invalid wait evidence hashes')
+        require(wait['source_key'] == confirmation_wait_key(wait['decision'], wait['requirement'], wait['evidence_hashes']), 'invalid wait source key')
+        require(wait['source_key'] not in keys, 'duplicate confirmation wait'); keys.add(wait['source_key'])
+
+
+def confirmation_wait_key(decision, requirement, hashes):
+    return 'confirmation:' + digest(dict(decision=decision, requirement=requirement, evidence=hashes))
 
 
 def check_requirements(s, rr):
@@ -1128,6 +1254,7 @@ def operate(s, op, actor, root, at):
         require(not shared or shared!=d['plan']['roles'].get('reviewer',{}).get('principal') or 'context' in d, 'combined technical lead must record plan author context')
         dec = s['decisions'].get(d['decision_id'])
         require(dec is not None, 'plan update requires recorded decision')
+        require(dec['status'] != 'superseded', 'superseded decision cannot authorize a plan update')
         for key in ['tasks', 'budgets', 'subjects', 'batches', 'decision_points']:
             require(s['plan'][key].keys() <= d['plan'][key].keys(), f'cannot delete historical {key}; retire instead')
         for tid, task in s['plan']['tasks'].items():
@@ -1136,6 +1263,8 @@ def operate(s, op, actor, root, at):
                 require(d['plan']['tasks'][tid].get('dispatch_owner','orchestrator') == running.get('dispatch_owner','orchestrator'), 'running task owner cannot change before recovery')
             if task.get('handoff') and any(a.get('executor_stage') in {'backup','lead'} for a in attempts(s,tid)):
                 require(d['plan']['tasks'][tid].get('handoff') == task['handoff'] and d['plan']['tasks'][tid]['consumes'] == task['consumes'], 'cannot reset an activated executor handoff policy')
+        require('goal_contract' not in s['plan'] or 'goal_contract' in d['plan'],
+                'cannot drop structured project goals; revise the contract explicitly')
         changes=budget_change_set(s['plan'],d['plan'])
         approval_sources=budget_authorization_sources(s,dec,changes) if any(changes.values()) else []
         require(not any(changes.values()) or approval_sources, 'changing budget limits requires referenced user decision with valid evidence and matching budget scope; register decision_progress confirmed with budget_approval, or bind_budget_approval for an existing user confirmation using the same original evidence; do not rewrite resolution.user_evidence')
@@ -1344,7 +1473,7 @@ def operate(s, op, actor, root, at):
         boolean(clarification, 'clarification')
         if clarification:
             require(d['requirements'] == [] and not d['user_evidence'], 'clarification cannot contain recovery work or user approval')
-            require(decision_owner(dec) == 'architect' and dec['signal'] != 'budget_exhausted', 'this decision requires explicit recovery conditions')
+            require(decision_owner(dec) == 'architect' and dec['signal'] != 'budget_exhausted' and not dec.get('source_key', '').startswith(('evidence:', 'confirmation:')), 'this decision requires explicit recovery conditions')
             require(dec.get('reported_plan_version') == s['plan_version'] and dec.get('reported_subjects') == s['plan']['subjects'], 'plan or subjects changed; record explicit recovery conditions')
         else:
             check_requirements(s, d['requirements'])
@@ -1368,6 +1497,29 @@ def operate(s, op, actor, root, at):
         dec['resolved_at'] = at
         if clarification:
             dec.update(status='closed', applied_at=at, closed_at=at)
+    elif kind == 'supersede_decision':
+        obj(d, ['id', 'replacement', 'reason', 'evidence', 'context'])
+        check_arch_context(s, d['context']); string(d['reason'], 'supersession reason')
+        old = s['decisions'].get(d['id']); new = s['decisions'].get(d['replacement'])
+        require(old and old.get('resolution') and old['status'] != 'superseded' and not decision_closed(s, old),
+                'supersession requires an unresolved effective decision')
+        require(new and new is not old and new.get('resolution') and new['status'] != 'superseded',
+                'replacement must be a different resolved decision')
+        require(old['blocks'] and all(s['plan']['tasks'][tid].get('retired') for tid in old['blocks']),
+                'only a fully retired blocked scope can be superseded; active recovery gates remain mandatory')
+        require(not any(not task.get('retired') and set(task['depends_on']) & set(old['blocks'])
+                        for task in s['plan']['tasks'].values()), 'live tasks still depend on the old blocked scope')
+        require(intact_evidence(new['resolution'].get('user_evidence', {})),
+                'replacement requires intact original user scope authorization')
+        require(intact_evidence(new['resolution'].get('evidence_hashes', {})),
+                'replacement resolution evidence is missing or changed')
+        require(any(c.get('decision_id') == d['replacement'] and c.get('plan_version', 0) > old.get('reported_plan_version', 0)
+                    for c in s['state'].get('plan_changes', [])),
+                'replacement must have an effective subsequent plan update')
+        hashes = evidence(d['evidence'], root)
+        old['supersession'] = dict(replacement=d['replacement'], reason=d['reason'], evidence_hashes=hashes,
+                                   context=copy.deepcopy(d['context']), actor=actor, at=at, revision=s['revision']+1)
+        old['status'] = 'superseded'
     elif kind == 'repin_requirement':
         obj(d, ['id', 'requirement', 'versions', 'evidence'], ['context', 'reason'])
         string(d['id'], 'decision id'); string(d['requirement'], 'requirement id')
@@ -1376,6 +1528,7 @@ def operate(s, op, actor, root, at):
         if 'reason' in d: string(d['reason'], 'repin reason')
         dec = s['decisions'].get(d['id'])
         require(dec and dec.get('resolution'), 'repin requires a resolved decision')
+        require(dec['status'] != 'superseded', 'superseded decision cannot be repinned')
         req = next((r for r in dec['resolution']['requirements'] if r['id'] == d['requirement']), None)
         require(req and req['kind'] == 'task', 'repin requires an existing task requirement')
         require(isinstance(d['versions'], dict) and d['versions'] == current_subjects(s, req['target']),
@@ -1392,11 +1545,25 @@ def operate(s, op, actor, root, at):
     elif kind == 'decision_progress':
         obj(d, ['id', 'status', 'evidence'], ['requirement','budget_approval'])
         dec = s['decisions'].get(d['id']); require(dec and dec['resolution'], 'decision has no resolution')
-        if actor=='architect': require(locally_owned(s,dec['blocks']), 'architect may close only locally delegated decisions')
+        require(dec['status'] != 'superseded', 'superseded decision cannot confirm or close recovery conditions')
+        if actor=='architect':
+            local_wait = d['status'] == 'waiting' and not dec['blocks'] and any(r['id'] == d.get('requirement') and r.get('owner') == 'architect' for r in dec['resolution']['requirements'])
+            require(locally_owned(s,dec['blocks']) or local_wait, 'architect may close only locally delegated decisions')
         hashes = evidence(d['evidence'], root)
-        if d['status'] in {'confirmed','bind_budget_approval'}:
+        if d['status'] in {'waiting','confirmed','bind_budget_approval'}:
             req = next((r for r in dec['resolution']['requirements'] if r['id'] == d.get('requirement')), None)
             require(req and req['kind'] == 'confirmation', 'unknown confirmation requirement')
+            if d['status'] == 'waiting':
+                require('budget_approval' not in d, 'waiting cannot register budget approval')
+                require(not requirement_ok(s, req), 'confirmation already satisfied')
+                require(all(requirement_ok(s, next(r for r in dec['resolution']['requirements'] if r['id'] == dep)) for dep in req['depends_on']), 'confirmation dependencies not satisfied')
+                waits = s['state'].setdefault('confirmation_waits', [])
+                key = confirmation_wait_key(d['id'], req['id'], hashes)
+                require(not any(w['requirement'] == req['id'] and confirmation_wait_pending(s, w) for w in waits), 'unresolved confirmation diagnosis; do not repeat check')
+                require(not any(w['source_key'] == key for w in waits), 'unchanged wait evidence already registered')
+                waits.append(dict(decision=d['id'], requirement=req['id'], source_key=key,
+                                  evidence_hashes=hashes, actor=actor, at=at, revision=s['revision']+1))
+                return s
             previous=s['state']['confirmations'].get(req['id'])
             if 'budget_approval' in d:
                 require(req.get('owner')=='user','budget approval requires a user confirmation')
@@ -1536,8 +1703,10 @@ def issue_signal(s, key, root):
     issue = next((i for i in issues(s) if i['key'] == key), None)
     require(issue is not None, 'no current issue with key ' + key + '; reread status')
     numbers = [int(m.group(1)) for d in s['decisions'] for m in [re.fullmatch(r'DEC-(\d+)', d)] if m]
-    latest_attempt = latest(s, issue['blocks'][0])
-    evidence = list((latest_attempt or {}).get('evidence', {})) or [save_record(root, {'issue': issue})]
+    latest_attempt = latest(s, issue['blocks'][0]) if issue['blocks'] else None
+    hashes = issue.get('evidence') or (latest_attempt or {}).get('evidence', {})
+    require(not hashes or intact_evidence(hashes), 'issue evidence is missing or changed; preserve original evidence')
+    evidence = list(hashes) or [save_record(root, {'issue': issue})]
     return dict(id='DEC-%02d' % (max(numbers, default=0) + 1), signal=issue['signal'], source_key=key,
                 blocks=list(issue['blocks']), reason=issue['reason'], evidence=evidence)
 
@@ -1659,7 +1828,7 @@ def attach_host_capabilities(result, store):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command',nargs='?',default='status',choices=['status','capabilities','pre_yield','apply','validate','render','observe','metrics','start','finish','signal','resolve','repin_requirement','classify_attempt','resume_attempt','set_models','set_user_mode','register_dispatch','close','record','snapshot','authorize','change_subject','feedback','decision_progress','decision_start','init','plan_update','design_refresh'])
+    parser.add_argument('command',nargs='?',default='status',choices=['status','capabilities','pre_yield','apply','validate','render','observe','metrics','start','finish','signal','resolve','repin_requirement','supersede_decision','classify_attempt','resume_attempt','set_models','set_user_mode','register_dispatch','close','record','snapshot','authorize','change_subject','feedback','decision_progress','decision_start','init','plan_update','design_refresh'])
     parser.add_argument('--store',type=Path)
     parser.add_argument('--request',type=Path)
     parser.add_argument('--revision', type=int)

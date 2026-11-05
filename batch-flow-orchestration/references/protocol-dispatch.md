@@ -34,9 +34,10 @@ actor只能是五类角色；用户决定由编排者附原始来源登记。仅
 | decision_start | 技术负责人 | id, call；登记待决事项开始诊断，不改变决定内容；仅修复旧无效 Codex 逻辑会话时可附 replacement_reason、evidence，保留 handling_history，见 contexts.md |
 | resolve | 技术负责人 | id, summary, requirements, evidence, user_evidence；(context, timing, call_id, clarification) |
 | repin_requirement | 技术负责人 | id, requirement, versions, evidence；(context, reason，二者至少一项)；仅重钉已有 task 恢复条件到目标当前完整版本映射 |
+| supersede_decision | 技术负责人 | id, replacement, reason, evidence, context；仅处理用户授权且正式停用全部旧范围的历史裁决，不代表通过 |
 | classify_attempt | 技术负责人 | attempt, kind, work_performed, reason, evidence；(source_attempt, decision_id, context)；追加可审计记账分类，不改写原尝试 |
 | resume_attempt | 技术负责人 | attempt, reason, evidence；(context)；依据实际恢复证据有限批准最新environment/decision_pause尝试续作 |
-| decision_progress | 编排者或负责该局部范围的技术负责人 | id, status, evidence；(requirement) |
+| decision_progress | 编排者或负责该局部范围的技术负责人 | id, status, evidence；(requirement)；waiting 见[等待诊断](protocol-decisions.md#wait_evidence-诊断与重检) |
 | feedback | 任一角色 | attempt, summary, evidence |
 | observe | 编排者或局部技术负责人 | 空对象；仅观察并记录状态变化，亦可用observe命令 |
 | history | 编排者，仅模拟 | task, call, result, evidence, source；(started_at, ended_at, closes, replacement_reason) |
@@ -51,7 +52,7 @@ call 包含 tool/model/effort/conversation_id；handoff任务按status的call_co
 
 所有 evidence 是非空路径列表，绝对路径或相对 store 所在目录。写入时解析为绝对路径并计算SHA256；结果参与放行前检查文件仍存在且内容未变。原始报告使用不可变路径，派生视图不要充作自身证据。
 
-result 允许 VERIFIED/RELEASE/FIX_REQUIRED/WAIT_EVIDENCE/ARCH_DECISION_REQUIRED/FAILED/INVALID。完成结果不可覆盖，改正通过新尝试及关联证据表达。预算在 start 时预占，INVALID重试不增加技术轮次，但原始调用仍留在 attempts 中。
+result 允许 VERIFIED/RELEASE/FIX_REQUIRED/WAIT_EVIDENCE/ARCH_DECISION_REQUIRED/FAILED/INVALID。完成结果不可覆盖，改正通过新尝试及关联证据表达。WAIT_EVIDENCE 的登记、诊断与重检门禁见[等待诊断](protocol-decisions.md#wait_evidence-诊断与重检)。预算在 start 时预占，INVALID重试不增加技术轮次，但原始调用仍留在 attempts 中。
 
 ## 快捷命令
 

@@ -58,7 +58,7 @@ EXECUTOR_DELIVERY = """结果：VERIFIED | WAIT_EVIDENCE | FAILED | ARCH_DECISIO
 限制：<已知限制与残余风险>"""
 REVIEW_DELIVERY = """结果：RELEASE | FIX_REQUIRED | WAIT_EVIDENCE | ARCH_DECISION_REQUIRED
 固定版本：<被审对象及版本>
-复跑与证据：<flow.py record 生成的记录路径及对应验收项>
+复跑与证据：<原始记录路径、命令、工作目录、退出码及对应验收项>
 问题与关闭条件：<逐项；无则写“无”>
 下一责任人：<角色>"""
 LEAD_DELIVERY = """结果：<VERIFIED | WAIT_EVIDENCE | FAILED | ARCH_DECISION_REQUIRED；非任务动作写处理状态>
@@ -216,7 +216,12 @@ def find_action(s, kind, target):
 def prior_run(store, conversation):
     """Locate the successful adapter run that proves a CLI conversation, for --resume-from."""
     import agent_cli
-    for run in sorted(cards_root(store).glob('*/run')):
+    records = Path(store).resolve().parent / 'records'
+    # Pre-card invocations also saved native CLI records directly under records/<name>.
+    # Locate adapter request metadata, then verify its actual completion/session below.
+    runs = {request.parent for request in records.rglob('request.json')
+            if within(request.parent, records)}
+    for run in sorted(runs):
         try:
             report = agent_cli.collect(run)
         except (OSError, ValueError, KeyError):
@@ -226,6 +231,42 @@ def prior_run(store, conversation):
     raise CardError('续接会话 %s 没有本台账内成功的 run-dir；请技术负责人决定新建或补证' % conversation)
 
 
+def render_goal_context(context):
+    lines = ['', '## 当前目标与验收边界']
+    seen = set()
+    def items(label, values):
+        values = [v for v in values if v not in seen]
+        if values:
+            lines.append(label)
+            for value in values:
+                lines.append('- ' + value); seen.add(value)
+    target = context.get('target')
+    primary = [r for r in context['tasks'] if r['task'] == target]
+    related = [r for r in context['tasks'] if r['task'] != target]
+    for row in primary + related:
+        if row in related:
+            lines.append('直接覆盖：' + row['task'])
+        if 'contract' in row:
+            value = row['contract']
+            if row in primary or not primary:
+                lines.append('目标：' + value['goal'])
+            items('验收：', value['acceptance'])
+            items('范围外：', value['non_goals'])
+        elif row in primary:
+            lines.append('旧节点未结构化；目标与验收见下方工作指令。')
+        else:
+            lines.append('覆盖对象原始指令：' + row['instruction'])
+    if context.get('project'):
+        value = context['project']
+        lines.append('项目目标：' + value['goal'])
+        items('项目约束：', value['acceptance'] + value['non_goals'])
+    elif context.get('legacy'):
+        lines.append('旧计划目标未结构化；未自动提取或补造验收标准。')
+    if not context['tasks']:
+        lines.append('无绑定节点；按本动作指令处理，缺验收依据时先澄清。')
+    return lines
+
+
 def render_prompt(card, payload, s, store, task_base, workspace):
     role = card['role']; kind = card['kind']; target = card['target']
     docs = list(ROLE_DOCS[role])
@@ -233,25 +274,25 @@ def render_prompt(card, payload, s, store, task_base, workspace):
         docs.append(LEAD_FLOW[kind])
     design = s.get('design') or {}
     section = (design.get('sections') or {}).get(target)
-    lines = ['# batch-flow 派发卡 ' + card['id'], '',
-             '身份与职责：' + role + ('（局部技术负责人，承接移交动作）' if card['mode'] == 'delegate_to_lead' else ''),
-             '任务：%s %s；台账 %s（revision %s）；任务目录 %s' % (kind, target, store, card['revision'], task_base),
-             '实际调用：%s，模型 %s，effort %s；%s' % (card['tool'], card['model'], card['effort'],
-                                               '续接会话 ' + card['resume'] if card.get('resume') else '新建会话'),
-             '源码工作目录：' + str(workspace),
-             '写权限：' + ('仅本卡工作内容所需的源码/测试/设计文件；不改 flow.json、不改技能、不提交 Git（除非工作内容明确要求）'
-                        if card['access'] == 'write' else '只读：不修改任何文件；可运行验证命令（经 flow.py record）复核'),
-             '', '## 固定输入']
+    lines = ['# %s · %s' % (role, target),
+             '动作：%s；计划 %s。' % (kind, s['plan_version'])]
+    lines += render_goal_context(flow.goal_context(s, payload))
+    lines += ['', '## 执行', payload.get('instruction', '').strip()]
+    lines += ['', '## 输入与约束', '工作目录：' + str(workspace), '台账：' + str(store)]
+    if task_base != workspace:
+        lines.append('任务目录：' + str(task_base))
+    lines.append('权限：' + ('按本节点允许范围修改；不直接改台账或技能。提交须本节点明确授权。'
+                              if card['access'] == 'write' else '只读待审产物；可复跑验证。'))
     if design.get('path'):
-        lines.append('- 设计书：%s 版本 %s%s' % (design['path'], design.get('version'), '，章节「%s」' % section if section else ''))
-    for key, label in [('subjects', '对象版本'), ('remaining', '剩余预算'), ('blocks', '受阻任务'), ('decision', '关联决策'),
-                       ('retry_of', '重试来源'), ('continuation_of', '续作来源'), ('review_budget_blockers', '预算缺口')]:
+        lines.append('设计：%s%s（%s）' % (design['path'], ' §' + section if section else '', design.get('version')))
+    for key, label in [('subjects', '固定版本'), ('remaining', '剩余预算'), ('blocks', '受阻任务'),
+                       ('decision', '关联决策'), ('retry_of', '重试来源'), ('continuation_of', '续作来源'),
+                       ('review_budget_blockers', '预算缺口')]:
         if payload.get(key) not in (None, [], {}):
-            lines.append('- %s：%s' % (label, json.dumps(payload[key], ensure_ascii=False)))
-    if payload.get('context_hint'):
-        lines.append('- 上下文：' + json.dumps(payload['context_hint'], ensure_ascii=False))
-    lines += ['', '## 角色入口（先读）'] + ['- ' + str(SKILL / d) for d in docs]
-    lines += ['', '## 工作内容（台账原文，不得改写或缩减）', '', payload.get('instruction', '').strip()]
+            lines.append(label + '：' + json.dumps(payload[key], ensure_ascii=False))
+    lines += ['必读：'] + ['- ' + str(SKILL / d) for d in docs]
+    if role in {'reviewer', 'third_party', 'architect'}:
+        lines.append('先判断发现是否违反当前目标；阻断须给验收项、支持场景、实际证据、影响与最小关闭条件。范围外建议不阻断。')
     if card['mode'] == 'delegate_to_lead' and is_agent_tool(card['tool']) and payload.get('role') not in (None, 'architect') \
             and lead_dispatchable(s, kind, target):
         inner = shlex.join([sys.executable, str(SCRIPTS / 'dispatch_card.py'), 'make', '--store', str(store), '--kind', kind,
@@ -271,10 +312,19 @@ def render_prompt(card, payload, s, store, task_base, workspace):
         lines += ['', '本动作由局部技术负责人处理：按职责实际处理，或经固定入口 ' + str(SCRIPTS / 'agent_cli.py') +
                   ' 派发并回收；需要登记的台账操作写成 --data 参数文件放在 ' + card['dir'] + ' 下，并在交付中列出。']
     delivery = EXECUTOR_DELIVERY if role == 'executor' else REVIEW_DELIVERY if role in {'reviewer', 'third_party'} else LEAD_DELIVERY
-    lines += ['', '## 交付（最终回复只给以下结构，首行必须是“结果：<值>”）', '', '```text', delivery, '```',
-              '', '不登记台账、不修改 flow.json；原始证据用 flow.py record 生成：',
-              shlex.join([sys.executable, str(SCRIPTS / 'flow.py'), '--store', str(store), 'record', '--cwd', str(workspace), '--', '<验证程序>', '<参数>']),
-              '', '## 原始载荷', '', '```json', json.dumps(payload, ensure_ascii=False, indent=2), '```', '']
+    lines += ['', '## 交付（最终回复只给以下结构，首行必须是“结果：<值>”）', '', '```text', delivery, '```']
+    if role in {'reviewer', 'third_party'} and card['access'] == 'read':
+        lines += ['', '只读审阅：直接复跑可在本环境执行的代表性验证；报告命令、工作目录、退出码和关键输出。',
+                  '可写 records 时用 flow.py record；只读时由宿主保存工具原始输出，不因无法自行写记录而重复运行或判验证未完成。']
+        if card['tool'] in CLI_TOOLS:
+            lines.append('本卡 CLI 原始输出：' + str(Path(card.get('dir', '<派发卡目录>')) / 'run' / 'stdout') + '（宿主保存，回收时引用）。')
+        else:
+            lines.append('原生子代理的工具原始回执由派发责任人原样保存；不能用最终报告摘要代替运行记录。')
+        lines.append('测试本身若因夹具/构建目录不可写而未运行，仍报环境缺项；读取代码或 record 落盘失败都不冒充测试通过。')
+    else:
+        lines += ['', '不登记台账、不修改 flow.json；原始证据用 flow.py record 生成：',
+                  shlex.join([sys.executable, str(SCRIPTS / 'flow.py'), '--store', str(store), 'record', '--cwd', str(workspace), '--', '<验证程序>', '<参数>'])]
+    lines += ['', '派发卡：' + card['id'], '']
     return '\n'.join(lines)
 
 
@@ -285,13 +335,12 @@ def make(args):
     workspace = Path(args.workspace or (spec or {}).get('workspace') or '').resolve() if (args.workspace or spec) else None
     need(workspace is not None and workspace.is_dir(), 'source workspace unknown: pass --workspace or run inside the launcher')
     task_base = Path((spec or {}).get('task_base') or store.parent.parent).resolve()
+    if args.kind == 'CONFIRM_CONDITION':
+        need(not any(w['requirement'] == args.target and w['owner'] != 'user' for w in flow.legacy_confirmation_waits(s, store.parent)),
+             '旧确认卡等待尚未登记；先运行 next 经正式操作登记并诊断，--recheck 不绕过恢复条件')
     a = find_action(s, args.kind, args.target)
     payload = a['subagent_payload']; mode = a['orchestrator_action']['mode']
     as_lead = bool(getattr(args, 'as_lead', False))
-    if args.kind == 'CONFIRM_CONDITION' and not getattr(args, 'recheck', False):
-        waiting = flow.waiting_conditions(s, store.parent).get(args.target)
-        need(not waiting, '上次确认卡 %s 返回 WAIT_EVIDENCE，之后台账没有进展（无新结果/确认/计划）；不重复派发。'
-                          '等依赖任务完成或用户补证；确需复核时加 --recheck' % waiting)
     if as_lead:
         # The technical lead subagent dispatches the payload role itself (nested Agent, depth 2).
         need(mode == 'delegate_to_lead', '--as-lead 只用于移交技术负责人的动作（mode=delegate_to_lead）')
@@ -337,6 +386,7 @@ def make(args):
     directory = cards_root(store) / card_id
     directory.mkdir(parents=True)
     card = dict(format=FORMAT, id=card_id, dir=str(directory), store=str(store), revision=s['revision'], kind=args.kind,
+                goal_context_hash=flow.digest(flow.goal_context(s, payload)), decision=payload.get('decision'),
                 target=args.target, mode=mode, role=role, tool=tool, model=model, effort=effort,
                 actor='architect' if as_lead else 'orchestrator', lead=as_lead, launch=(spec or {}).get('launch_id'),
                 subjects=flow.current_subjects(s, args.target) if args.target in s['plan']['tasks'] else None,
@@ -344,6 +394,9 @@ def make(args):
                 ledger_start='start' if args.target in s['plan']['tasks'] and args.kind in TASK_KINDS and mode == 'dispatch'
                 else 'decision_start' if args.kind == 'DECIDE' and mode == 'dispatch' else None,
                 retry_of=payload.get('retry_of'), continuation_of=payload.get('continuation_of'), replacement_reason=replacement)
+    payload_path = directory / 'payload.json'
+    write_new(payload_path, json.dumps(payload, ensure_ascii=False, indent=2) + '\n')
+    card['payload_file'] = str(payload_path)
     prompt_path = directory / 'prompt.md'
     write_new(prompt_path, render_prompt(card, payload, s, store, task_base, workspace))
     card['prompt_file'] = str(prompt_path); card['prompt_sha256'] = sha(prompt_path)
@@ -463,9 +516,19 @@ def show(card):
                 prompt_file=card['prompt_file'], state=state(card['dir']), steps=steps(card))
 
 
+def current_card_goals(card, s):
+    # Pre-feature cards are stale once structured boundaries are enabled.
+    if 'goal_context_hash' not in card:
+        return 'goal_contract' not in s['plan']
+    item = dict(target=card['target'])
+    if card.get('decision'): item['decision'] = card['decision']
+    return card['goal_context_hash'] == flow.digest(flow.goal_context(s, item))
+
+
 def start(args):
     directory = card_dir(args.store, args.card); card = load_json(directory / 'card.json'); st = state(directory)
     need(not st.get('attempt') and not st.get('started'), '本卡已登记开始；不要重复 start')
+    need(current_card_goals(card, load_json(args.store)), '任务目标或计划版本已变化；重新生成派发卡，不发送旧提示词')
     need(card['ledger_start'], '本动作没有 start 登记')
     call = dict(tool=card['tool'], model=card['model'], effort=card['effort'], conversation_id=card.get('resume') or 'pending:' + card['id'])
     if card['ledger_start'] == 'start':
@@ -478,9 +541,26 @@ def start(args):
         need(mine and mine[-1].get('result') is None, 'start 已写入但找不到运行中的 attempt；读取 status 核对')
         st.update(started=now(), attempt=mine[-1]['id'], revision=result['revision'], actor=card.get('actor', 'orchestrator'))
     else:
-        result = run_flow(args.store, 'decision_start', '--revision', str(args.revision), '--actor', 'architect',
-                          data=dict(id=card['target'], call=call))
-        st.update(started=now(), revision=result['revision'])
+        ledger = load_json(args.store)
+        handling = ledger['decisions'][card['target']].get('handling')
+        previous = (handling or {}).get('call', {})
+        if previous.get('conversation_id', '').startswith('pending:'):
+            need(ledger['revision'] == args.revision, 'revision conflict: reread status before adopting pending handling')
+            need(all(previous.get(k) == call[k] for k in ['tool','model','effort']),
+                 'pending decision handling uses different call configuration')
+            for other_path in cards_root(args.store).glob('*/card.json'):
+                if other_path.parent == directory: continue
+                other = load_json(other_path); other_state = state(other_path.parent)
+                need(other['target'] != card['target'] or not other_state.get('started') or other_state.get('finished'),
+                     'decision already has an active dispatch card; collect it instead of dispatching twice')
+            # The lead already registered its start, but has not bound an actual session yet.
+            # Reuse that registration; do not overwrite its time or issue a second decision_start.
+            result = dict(revision=ledger['revision'])
+            st.update(started=handling['started_at'], revision=result['revision'], reused_pending_handling=True)
+        else:
+            result = run_flow(args.store, 'decision_start', '--revision', str(args.revision), '--actor', 'architect',
+                              data=dict(id=card['target'], call=call))
+            st.update(started=now(), revision=result['revision'])
     save_state(directory, st)
     return dict(ok=True, card=card['id'], attempt=st.get('attempt'), revision=st['revision'], next=steps(card)[1:])
 
@@ -494,6 +574,33 @@ def finish(args):
     return finish_card(args.store, card_dir(args.store, args.card), args.revision, args.conversation)
 
 
+def register_confirmation_wait(store, card, result_path, rev):
+    ledger = load_json(store)
+    hashes = flow.evidence([str(result_path)], Path(store).resolve().parent)
+    for wait in ledger['state'].get('confirmation_waits', []):
+        if wait['decision'] != card['decision'] or wait['requirement'] != card['target']:
+            continue
+        original = wait['evidence_hashes']
+        need(all(original[p] == h for p, h in hashes.items() if p in original),
+             '原始等待证据已改变；保留原报告，不以覆盖文件绕过等待登记')
+        if original == hashes:
+            # The ledger write may have succeeded before saving card state. Reuse
+            # that exact registration without another mutation or history entry.
+            return dict(ok=True, revision=ledger['revision'])
+    return run_flow(store, 'decision_progress', '--revision', str(rev), '--actor', 'orchestrator',
+                    data=dict(id=card['decision'], requirement=card['target'], status='waiting', evidence=[str(result_path)]))
+
+
+def migrate_confirmation_waits(store):
+    # Old finished cards carried no formal wait. Import only original raw delivery,
+    # preserving requirement ownership; unrelated progress never makes it retryable.
+    s = load_json(store)
+    for row in flow.legacy_confirmation_waits(s, Path(store).parent):
+        card = load_json(Path(row['path']).parent / 'card.json')
+        card['decision'] = row['decision']
+        register_confirmation_wait(store, card, row['path'], revision(store))
+
+
 def finish_card(store, directory, revision, conversation_arg=None):
     directory = Path(directory); card = load_json(directory / 'card.json'); st = state(directory)
     need(not st.get('finished'), '本卡已回收')
@@ -505,10 +612,12 @@ def finish_card(store, directory, revision, conversation_arg=None):
         report = agent_cli.collect(directory / 'run')
         need(report.get('event') != 'CLI_INCOMPLETE', '后台运行尚未结束（无 exit.json）；等待完成通知，不要重派')
         need(report.get('usable'), 'CLI 调用不可用：%s；保留 %s 原始记录，按恢复流程分类，不自动重试' % (report.get('problems'), directory / 'run'))
+        receipt = directory / 'run' / 'receipt.json'
+        need(receipt.is_file(), 'CLI 缺少原始启动回执 run/receipt.json；核查真实调用，不生成替代回执或重派')
         if not result_path.exists():
             write_new(result_path, report.get('response') or '')
         conversation = report['conversation_id']
-        evidence += [str(directory / 'run' / name) for name in ['stdout', 'exit.json'] if (directory / 'run' / name).exists()]
+        evidence += [str(directory / 'run' / name) for name in ['request.json', 'stdout', 'stderr', 'exit.json'] if (directory / 'run' / name).exists()]
     else:
         need(result_path.is_file() and result_path.read_text().strip(), '先把子代理最终报告原文 Write 为 %s' % result_path)
         conversation = card.get('resume') or conversation_arg
@@ -521,16 +630,19 @@ def finish_card(store, directory, revision, conversation_arg=None):
     value = parse_result(text)
     out = dict(ok=True, card=card['id'], result=value, result_file=str(result_path), conversation_id=conversation)
     if card['ledger_start'] != 'start':
+        if card['kind'] == 'CONFIRM_CONDITION' and value == 'WAIT_EVIDENCE':
+            res = register_confirmation_wait(store, card, result_path, revision)
+            out['revision'] = res['revision']
         st.update(finished=now(), conversation_id=conversation, result=value,
                   progress_marker=flow.progress_marker(load_json(store))); save_state(directory, st)
-        out['note'] = '非任务动作：未写台账。按 result.md“需登记的操作”原文代交（actor 为原责任角色）。'
+        out['note'] = '确认等待已登记时由 status 路由诊断；其余操作按 result.md“需登记的操作”原文代交（actor 为原责任角色）。'
         return out
     need(st.get('attempt'), '本卡未登记 start')
     need(value in flow.RESULTS, '交付首行缺少合法“结果：<值>”（%s）；退回原角色补齐，不代填' % sorted(flow.RESULTS))
     s = load_json(store)
     attempt = next(a for a in s['state']['attempts'] if a['id'] == st['attempt'])
     actor = attempt.get('performer_role') or card['role']
-    data = dict(attempt=st['attempt'], result=value, evidence=[str(result_path), str(directory / 'receipt.txt')] + evidence,
+    data = dict(attempt=st['attempt'], result=value, evidence=[str(result_path), str(receipt)] + evidence,
                 call=dict(tool=card['tool'], model=card['model'], effort=card['effort'], conversation_id=conversation))
     res = run_flow(store, 'finish', '--revision', str(revision), '--actor', actor, data=data)
     st.update(finished=now(), conversation_id=conversation, result=value, revision=res['revision']); save_state(directory, st)
@@ -729,7 +841,12 @@ def reconcile(store, spec, started):
                 continue
             if card['route'] == 'cli':
                 pid = cli_pid(directory)
-                if (directory / 'run' / 'exit.json').exists():
+                if (directory / 'run' / 'exit.json').exists() and not (directory / 'run' / 'request.json').exists():
+                    # agent_cli writes request.json before launching; an exit.json without it is not a real CLI run record.
+                    out['interrupted'].append(dict(card=card['id'], result=interrupt(
+                        store, directory, card, '运行目录有 exit.json 但缺 agent_cli 启动前写入的 request.json：不是真实 CLI 运行记录，不采信',
+                        dict(run=str(directory / 'run'))), reason='no_cli_request'))
+                elif (directory / 'run' / 'exit.json').exists():
                     import agent_cli
                     report = agent_cli.collect(directory / 'run')
                     if report.get('usable'):
@@ -869,6 +986,7 @@ def next_step(args):
     spec = runtime_spec(store, args.runtime)
     need(spec is not None, 'next 只在编排启动器（Claude Code / AGY）会话中运行')
     runtime = spec['runtime']
+    migrate_confirmation_waits(store)
     report = reconcile(store, spec, launch_started(spec, runtime))
     try:
         report['registered'] = mechanical_registrations(store)
@@ -879,9 +997,13 @@ def next_step(args):
     supersede = []
     for card in report['pending']:
         if state(card['dir']).get('started'):
+            if not current_card_goals(card, s):
+                return dict(base, do='attention', card=card['id'],
+                            todo='已登记但尚未调用的派发卡目标已变化；由责任人保留原记录并处理交接，不发送旧提示词或重置预算')
             return dict(base, **emit(store, card, runtime))
         try:
             find_action(s, card['kind'], card['target'])
+            need(current_card_goals(card, s), '旧派发卡目标已变化')
             return dict(base, **emit(store, card, runtime))
         except CardError:
             supersede.append(card)  # made but never dispatched, and the ledger moved on
@@ -924,7 +1046,7 @@ def main():
     p = sub.add_parser('make'); p.add_argument('--store', required=True); p.add_argument('--kind', required=True)
     p.add_argument('--target', required=True); p.add_argument('--workspace'); p.add_argument('--runtime')
     p.add_argument('--as-lead', action='store_true', help='technical lead subagent dispatching the payload role of a delegated action')
-    p.add_argument('--recheck', action='store_true', help='dispatch a confirmation again although nothing progressed since its last WAIT_EVIDENCE')
+    p.add_argument('--recheck', action='store_true', help='compatibility flag; never bypasses unresolved evidence diagnosis')
     p = sub.add_parser('show'); p.add_argument('--store', required=True); p.add_argument('--card')
     p = sub.add_parser('start'); p.add_argument('--store', required=True); p.add_argument('--card', required=True)
     p.add_argument('--revision', type=int, required=True)
