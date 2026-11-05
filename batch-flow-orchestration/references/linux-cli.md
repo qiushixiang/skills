@@ -38,7 +38,7 @@ python3 <技能目录>/scripts/agent_cli.py run --profile <本CLI的profile.json
 
 AGY、Codex、Claude 三个后端续接均必填 `--resume-from <上一轮成功调用的run-dir>`：共用脚本核对其中原始 stdout/exit/request，要求 usable、backend、原生 UUID 和 cwd 匹配后才启动，回收时再检查实际 ID 一致。逻辑名称、仅有 UUID 但无成功原始记录、失败或未结束调用均不能作为续接依据；不得改用最近会话或自动回退新会话。有实际 UUID 但旧会话失效时，按上下文规则明确记录重建原因。历史 Codex 台账含逻辑名时 status 提示 fresh，不自动改写历史；已开始的 Codex 裁决登记修复见[上下文规则](contexts.md)。上述检查仅针对 CLI，不限制原生 Agent 工具的 agent ID 形状。
 
-Codex 始终使用明确的 read-only/workspace-write 沙箱，并传 --skip-git-repo-check 以支持用户指定的多仓项目根或非 Git 任务目录；该选项仅省略 Git 目录前检，不修改全局 trust、不关闭沙箱。不要为了绕过前检把 cwd 静默换到另一个仓库。
+Codex 始终使用明确的 read-only/workspace-write 沙箱，并传 --skip-git-repo-check 以支持用户指定的多仓项目根或非 Git 任务目录；该选项仅省略 Git 目录前检，不修改全局 trust、不关闭沙箱。不要为了绕过前检把 cwd 静默换到另一个仓库。 用户已明确授权的固定设备测试入口可另按下节配置窄范围自动放行规则；不因此改成全局无沙箱模式。
 
 额外授权目录可重复传 `--add-dir <最小目录绝对路径>`。AGY/Claude 可传 `--settings <本次已授权会话配置JSON>`，只加载为会话覆盖，不修改全局设置；不能以修复调用为名放宽权限。Codex 不接受此参数，采用明确沙箱参数。包装器不会自动授予构建命令权限；遇拒绝保留产物并按恢复流程处理，编排者不代做验证。
 
@@ -49,6 +49,18 @@ Codex 始终使用明确的 read-only/workspace-write 沙箱，并传 --skip-git
 | Claude Code | plan / acceptEdits，permission-prompts=none | --resume | session_id |
 
 AGY/Claude 的 plan 是工作模式，不是文件只读隔离；本入口不实现 OS 角色隔离，也不认证模型实际用量。包装器拒绝已知绕过权限的配置值，但不是通用权限配置审计器。现有用户/项目设置仍可生效，需要硬隔离时按宿主权限与 OS 边界配置。
+
+### 固定设备测试入口的自动放行
+
+仅在用户明确批准固定测试入口可在宿主自动运行时使用。主执行者、备选、负责人兜底和独立审阅者均沿任务指定模型，通过同一入口运行各自负责的必要验证；不以换角色规避权限或独立审阅。
+
+在该宿主实际加载的用户或可信项目配置层的 `rules/` 内设置 `.rules`，只对固定绝对入口路径及有限操作前缀配置 `prefix_rule(..., decision="allow")`。保留 CLI 的 read-only/workspace-write 沙箱；命中规则时整个测试入口及其子进程在沙箱外以普通用户运行，不对任意 shell、解释器、`flow.py` 或 `sudo` 配置广泛放行。入口自身调用 `flow.py record` 保存验证原始结果。规则需在新 CLI 启动时加载，并通过 `codex execpolicy check` 和实际同版本 CLI 验证；read/write 角色、首派及续接均须使用相同有效配置。
+
+`prefix_rule` 匹配 argv 前缀，不是完整参数等值校验，也不绑定脚本哈希。入口须拒绝额外参数、任意命令/路径/接口，固定下游映射；入口及其下游代码是否可修改、适用的信任范围与固定版本由用户授权和任务独立审阅约束。薄包装器加载任意可改工作区脚本不构成内容隔离。设备运行应有跨角色互斥、时限、失败恢复和不可覆盖原始记录；未实现批次必须非零退出，不能借用其他批次冒充通过。
+
+调用使用单条明确的入口命令；复杂 shell 包装可能按整个 shell 命令匹配，不能认为脚本内部某条已放行命令会使整个脚本自动出沙箱。CLI 必须由具备合法宿主执行能力的父进程启动；已经受外层 NoNewPrivs、capability 或系统调用限制的子进程，不能靠内层规则清除限制。发生拒绝时按环境恢复流程保留原始记录，不关闭全局沙箱或扩大 sudo 授权。
+
+官方规则与范围见 [Codex Rules](https://learn.chatgpt.com/docs/agent-configuration/rules)。项目的固定路径、操作参数和 sudo 端点放在项目自己的测试说明与规则文件，技能不写死工程路径。
 
 ## 3. 运行回执、计时与回收
 

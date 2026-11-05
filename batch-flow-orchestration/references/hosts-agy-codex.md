@@ -1,6 +1,6 @@
 # AGY 与 Codex 宿主：子代理工具与 CLI 调用
 
-**先区分主会话和角色进程**：Linux 上 AGY 担任编排者使用下节的受限启动器；AGY 原生角色用 define_subagent/invoke_subagent。另起 AGY、Codex、Claude CLI 角色进程时使用[统一派发入口](linux-cli.md)，不要求编排者逐轮手写 subprocess。Codex 原生 collaboration 工具仍按对应小节。
+**先区分主会话和角色进程**：Linux 上 AGY 担任编排者使用下节的受限启动器；AGY 原生角色用 define_subagent/invoke_subagent。另起 AGY、Codex、Claude CLI 角色进程时使用[统一派发入口](linux-cli.md)，不要求编排者逐轮手写 subprocess。Codex 原生 collaboration 工具仍按对应小节。 已明确授权固定设备测试入口的自动放行按 [Linux CLI 固定入口](linux-cli.md#固定设备测试入口的自动放行) 配置并实测，不为此全局关闭 Codex 沙箱。
 
 本文只写 AGY 与 Codex 的调用形态、权限与回收检查；通用派发、回收、汇报与计时规则见[协作指南](agent-collaboration.md)，Claude Code 见 [Claude Code 宿主](claude-code.md)。参数以本机 help 为准，CLI 升级后重新核对；提示经参数数组或标准输入传递，不拼进 shell，不添加绕过权限的参数。
 
