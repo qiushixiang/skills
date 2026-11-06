@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import shutil
@@ -18,9 +19,15 @@ SCRIPTS=Path(__file__).resolve().parent
 SKILL=SCRIPTS.parent
 AGENT='batch_flow_orchestrator'
 ENV_KEY='BATCH_FLOW_AGY_LAUNCH'
-# Hook payloads, decision values and the native tool schema are undocumented runtime behaviour; a new
-# version is accepted only after a live run confirms the gate still binds (see hosts-agy-codex.md).
-VERIFIED_VERSIONS={'1.4.12','1.5.0','1.5.1'}
+# Hook payloads, decision values and the native tool schema are undocumented runtime behaviour (see
+# hosts-agy-codex.md); they were verified live on 1.4.12-1.5.1.
+# Lowest version whose hooks/native-tool interfaces were verified live. Newer releases are assumed
+# backward compatible and accepted; the SessionStart binding watchdog still ends an unbound session.
+MIN_VERSION='1.4.12'
+def version_key(text):
+    parts=re.findall(r'\d+',text.strip().split('-')[0])
+    if not parts:raise ValueError('cannot parse AGY version: %r'%text)
+    return tuple(int(x) for x in parts)
 BIND_SECONDS=120
 NATIVE=['define_subagent','invoke_subagent','send_message','manage_subagents',
         'manage_task','command_status','schedule','ask_question','finish','wait']
@@ -324,9 +331,10 @@ def launch(args):
     binary=shutil.which(args.binary)
     if not binary:raise ValueError('AGY executable not found')
     result=subprocess.run([binary,'--version'],capture_output=True,text=True,check=True,timeout=15)
-    if result.stdout.strip() not in VERIFIED_VERSIONS:raise ValueError('launcher verified for AGY '+'/'.join(sorted(VERIFIED_VERSIONS))+'; review interfaces before upgrading')
+    version=result.stdout.strip().split()[0] if result.stdout.strip() else ''
+    if version_key(version)<version_key(MIN_VERSION):raise ValueError('AGY %s is older than the minimum supported %s (hook/tool interfaces unverified)'%(version,MIN_VERSION))
     if not args.model or not args.effort:raise ValueError('model and effort must not be empty')
-    spec=dict(launch_id=uuid.uuid4().hex,python=sys.executable,workspace=str(workspace),task_base=str(task_base),store=str(store),records=str(store.parent/'records'),profiles=[],model=args.model,effort=args.effort,terminal_sandbox=False)
+    spec=dict(launch_id=uuid.uuid4().hex,python=sys.executable,workspace=str(workspace),task_base=str(task_base),store=str(store),records=str(store.parent/'records'),profiles=[],model=args.model,effort=args.effort,terminal_sandbox=False,agy_version=version)
     runtime=store.parent/'.agy-launch'/spec['launch_id']
     spec['runtime']=str(runtime)
     argv=[binary,'--agent',AGENT,'--model',args.model,'--effort',args.effort,'--mode','accept-edits',
@@ -337,7 +345,7 @@ def launch(args):
     print('主模型：'+args.model+' / '+args.effort+'；台账：'+str(store),flush=True)
     print('当前任务 base：'+str(task_base),flush=True)
     if args.dry_run:
-        print(json.dumps(dict(event='AGY_LAUNCH_DRY_RUN',task_base=str(task_base),store=str(store),argv=argv,agent=agent_text(),runtime=str(runtime)),ensure_ascii=False,indent=2))
+        print(json.dumps(dict(event='AGY_LAUNCH_DRY_RUN',agy_version=version,task_base=str(task_base),store=str(store),argv=argv,agent=agent_text(),runtime=str(runtime)),ensure_ascii=False,indent=2))
         return 0
     store.parent.mkdir(parents=True,exist_ok=True)
     (workspace/'.agents').mkdir(parents=True,exist_ok=True)

@@ -89,12 +89,18 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(json.loads(proc.stdout)['spec']['workspace'], str(self.ws.resolve()))
 
-    def test_requires_task_and_verified_version(self):
+    def test_requires_task_and_minimum_version(self):
         proc = subprocess.run([sys.executable, str(LAUNCHER), '--workspace', str(self.ws), '--dry-run'],
                               capture_output=True, text=True, env=self.env)
         self.assertEqual(proc.returncode, 2); self.assertIn('--task-base', proc.stderr)
-        (self.bin / 'claude').write_text('#!/bin/sh\necho "9.9.9 (Claude Code)"\n')
-        proc = self.launch('--dry-run'); self.assertEqual(proc.returncode, 2); self.assertIn('verified', proc.stderr)
+        (self.bin / 'claude').write_text('#!/bin/sh\necho "2.1.300 (Claude Code)"\n')
+        proc = self.launch('--dry-run'); self.assertEqual(proc.returncode, 2); self.assertIn('older than the minimum', proc.stderr)
+
+    def test_newer_version_is_accepted(self):
+        for version in ['2.1.319', '2.10.0', '3.0.0']:
+            (self.bin / 'claude').write_text('#!/bin/sh\necho "%s (Claude Code)"\n' % version)
+            proc = self.launch('--dry-run'); self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(json.loads(proc.stdout)['spec']['claude_version'], version)
 
 
 if __name__ == '__main__':

@@ -12,6 +12,7 @@ import datetime
 import fcntl
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import shutil
@@ -27,7 +28,9 @@ ENV_KEY = 'BATCH_FLOW_CLAUDE_LAUNCH'
 # Verified in the 2.1.318 binary: the Agent tool is withheld once a caller's depth reaches this cap.
 DEPTH_KEY, SPAWN_DEPTH = 'CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH', '2'
 LEAD_TYPES, WORKER_TYPES = ['bf-architect'], ['bf-executor', 'bf-reviewer']
-VERIFIED_VERSIONS = {'2.1.318'}
+# Lowest version whose hook/agent/spawn-depth interfaces were verified. Newer releases are assumed
+# backward compatible and are accepted; a concrete break is handled when it is seen.
+MIN_VERSION = '2.1.318'
 ROLE_TOOLS = {
     'bf-executor': (['Read', 'Write', 'Edit', 'Bash', 'Grep', 'Glob'], 'executor'),
     'bf-architect': (['Read', 'Write', 'Edit', 'Bash', 'Grep', 'Glob', 'Agent'], 'architect（技术负责人）'),
@@ -157,6 +160,13 @@ def argv_for(spec, binary, runtime):
     return argv
 
 
+def version_key(text):
+    parts = re.findall(r'\d+', text.split('-')[0])
+    if not parts:
+        raise ValueError('cannot parse Claude Code version: %r' % text)
+    return tuple(int(x) for x in parts)
+
+
 def launch(args):
     if sys.platform != 'linux':
         raise ValueError('Linux only')
@@ -164,9 +174,10 @@ def launch(args):
     if not binary:
         raise ValueError('claude executable not found')
     version = subprocess.run([binary, '--version'], capture_output=True, text=True, check=True, timeout=15).stdout.split()[0]
-    if version not in VERIFIED_VERSIONS:
-        raise ValueError('launcher verified for Claude Code %s; review hook/agent interfaces before upgrading (found %s)' % (sorted(VERIFIED_VERSIONS), version))
+    if version_key(version) < version_key(MIN_VERSION):
+        raise ValueError('Claude Code %s is older than the minimum supported %s (hook/agent interfaces unverified)' % (version, MIN_VERSION))
     spec, runtime = build(args)
+    spec['claude_version'] = version
     argv = argv_for(spec, binary, runtime)
     if args.dry_run:
         print(json.dumps(dict(event='CLAUDE_LAUNCH_DRY_RUN', spec=spec, settings=settings(spec), argv=argv,

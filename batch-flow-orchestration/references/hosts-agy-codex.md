@@ -21,7 +21,7 @@ python3 <技能目录>/scripts/start_agy_orchestrator.py --workspace <源码项�
 
 `--workspace` 仍是源码项目及实际运行目录，`--task-base` 不改变它。默认正式台账为 `<任务base>/.batch-flow/flow.json`；`--store` 仅可覆盖为本任务内独立管理目录中的 flow.json，相对路径以任务 base 为基准，不能指向另一个任务。记录和运行回执随该台账存放。任务目录在源码项目外时，启动器显式传 --add-dir 挂载用户指定的任务目录。
 
-`--dry-run` 只显示所选任务、能力、启动参数和自定义 agent 内容，不安装 hooks、不调用模型。启动器接受已核查的 AGY 1.4.12/1.5.0；其他版本先维护接口核查，不静默降级。1.5.0 本次验证主会话 hooks 与 CLI 版本检查，不据此声称所有原生子代理接口均已重新验收。用户已明确指定本启动器默认主模型为 `gemini-3.8-flash-medium`、effort 为 `medium`，不填即可使用；显式参数可覆盖，启动时显示实际值。此默认只用于编排者启动，不自动覆盖计划中的其他角色配置。
+`--dry-run` 只显示所选任务、能力、启动参数和自定义 agent 内容，不安装 hooks、不调用模型。接口在 AGY 1.4.12～1.5.1 上实测验证；启动器只拒绝低于 1.4.12 的版本，更新版本默认向下兼容、直接放行，并把实际版本写入 spec 的 `agy_version`；若新版本使门禁失效（例如 120 秒内未见 SessionStart 绑定即结束会话），按实际问题处理。1.5.0 本次验证主会话 hooks 与 CLI 版本检查，不据此声称所有原生子代理接口均已重新验收。用户已明确指定本启动器默认主模型为 `gemini-3.8-flash-medium`、effort 为 `medium`，不填即可使用；显式参数可覆盖，启动时显示实际值。此默认只用于编排者启动，不自动覆盖计划中的其他角色配置。
 
 终端先显示能力清单，再用 `--agent batch_flow_orchestrator` 新建交互主会话。自定义主代理声明协调工具名单，但本机 1.4.12 的真实 init 回执仍返回包含编辑/MCP 的完整工具集，不能宣称工具已隐藏或裁剪。实际限制由独立的 PreToolUse 会话门禁执行：只允许原生协调工具、受限 view_file/write_to_file/run_command，其他工具（含编辑替换、源码搜索、MCP、权限扩张）均拒绝。SessionStart 将能力、固定脚本路径、台账及记录目录注入主会话，PreToolUse 在实际执行前拒绝不合法操作：
 
@@ -95,7 +95,7 @@ EnableWriteTools=true 提供创建/编辑文件及运行命令的工具，不是
 
 同模型默认继承时，上述不传 Model 的形式已在 Gemini 3.8 Flash Medium 主/子会话中核对实际 modelName。若本次工具明确提供 Model，且用户已指定 flash 或批准相应映射，可在单个 spec 中增加 `"Model":"flash"`；这不是对其他版本或当前默认映射的承诺，仍须核对真实子会话元数据。
 
-2026-11-05 AGY 1.5.1 真实临时目录验收（next 驱动，执行者 tool=agy-native、model=inherit）：next 依次给出 define_subagent 与 invoke_subagent（Role=卡 ID），门禁逐条放行并记下标签，next 据 children.jsonl 找到实际子会话 ID 登记；首次运行中途重启后，新启动的 next 把未交付的 A0001 登记 INVALID，重派 A0002（retry_of A0001），子代理写出 NATIVE_OK，编排者用 write_to_file 写 result.md，next 回收为 VERIFIED；主子会话 modelName 均为 gemini-3.8-flash-medium。同次发现：**首次在会话内确认信任工作区时，hooks.json 在 SessionStart 之后才加载，该会话完全没有门禁**（无 owner/decisions，编排者还读了技能脚本）。启动器因此在 120 秒内未见 SessionStart 绑定即结束会话并提示重启；工作区已信任后再启动即正常绑定。版本白名单只在这类真实验收通过后扩展，因为门禁依赖的 hook 载荷、决策值和原生工具字段都是未文档化的运行时行为，变化时会静默失效或误拒子代理。
+2026-11-05 AGY 1.5.1 真实临时目录验收（next 驱动，执行者 tool=agy-native、model=inherit）：next 依次给出 define_subagent 与 invoke_subagent（Role=卡 ID），门禁逐条放行并记下标签，next 据 children.jsonl 找到实际子会话 ID 登记；首次运行中途重启后，新启动的 next 把未交付的 A0001 登记 INVALID，重派 A0002（retry_of A0001），子代理写出 NATIVE_OK，编排者用 write_to_file 写 result.md，next 回收为 VERIFIED；主子会话 modelName 均为 gemini-3.8-flash-medium。同次发现：**首次在会话内确认信任工作区时，hooks.json 在 SessionStart 之后才加载，该会话完全没有门禁**（无 owner/decisions，编排者还读了技能脚本）。启动器因此在 120 秒内未见 SessionStart 绑定即结束会话并提示重启；工作区已信任后再启动即正常绑定。门禁依赖的 hook 载荷、决策值和原生工具字段都是未文档化的运行时行为，升级后若出现门禁失效或误拒子代理，按实际问题核查并处理。
 
 2026-11-04 的真实临时目录验收确认：主会话文件写入及任意 Python 命令被 PreToolUse 拒绝且无标记落盘；define_subagent/invoke_subagent 成功；执行者写入 EXECUTOR_OK 标记并运行打印命令返回 CHILD_COMMAND_OK；主子宿主记录均为 gemini-3.8-flash-medium。此结果只覆盖该版本、该模型及本次接入配置，不扩大后续任务授权。
 

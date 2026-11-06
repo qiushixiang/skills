@@ -182,6 +182,17 @@ class LauncherTests(unittest.TestCase):
         self.assertNotIn('现在运行 next', dry['argv'][-1])
         self.assertFalse((self.root/'.agents').exists())
 
+    def test_version_floor_and_newer_versions(self):
+        binary=self.root/'agy'
+        args=argparse.Namespace(workspace=str(self.root),task_base=str(self.root),store=None,model='user-model',effort='medium',binary=str(binary),dry_run=True)
+        binary.write_text('#!'+sys.executable+'\nprint("1.4.11")\n');binary.chmod(0o700)
+        with patch('builtins.print'),self.assertRaisesRegex(ValueError,'older than the minimum'):launcher.launch(args)
+        for version in ['1.5.2','1.10.0','2.0.0']:
+            binary.write_text('#!'+sys.executable+'\nprint("%s")\n'%version)
+            with patch('builtins.print') as output:self.assertEqual(launcher.launch(args),0)
+            self.assertEqual(json.loads(output.call_args_list[-1].args[0])['agy_version'],version)
+        self.assertFalse((self.root/'.agents').exists())
+
     def test_session_without_hooks_is_ended(self):
         binary=self.root/'agy'
         binary.write_text('#!'+sys.executable+'\nimport sys,time\nif "--version" in sys.argv:print("1.5.1");sys.exit(0)\n'
