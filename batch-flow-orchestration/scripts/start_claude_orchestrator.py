@@ -70,6 +70,8 @@ def capabilities(spec):
         'Claude Code batch-flow 编排者（受限启动，会话 %s）' % spec['session_id'],
         '任务目录：' + spec['task_base'], '台账：' + spec['store'], '源码工作目录：' + spec['workspace'], '技能目录：' + str(SKILL),
         '',
+        '启动及上下文压缩后，先用 Skill 工具加载 batch-flow-orchestration（不可用时 Read ' + str(SKILL / 'SKILL.md')
+        + '），再 Read ' + str(SKILL / 'references' / 'roles' / 'orchestrator.md') + '；只读这两份，其他文档按需。',
         '启动时先运行 ' + status + '，展示状态后结束本轮，等用户明确要求继续；不要自动运行 next。',
         '用户要求继续后，运行 ' + next_command(spec) + '，按输出的 do 字段办：',
         '- do=call：逐字照抄 tool 与 input 发起这一个调用（字段一个不改），返回后立即再运行 next。',
@@ -180,7 +182,7 @@ def launch(args):
         runtime.mkdir(parents=True, mode=0o700)
         (Path(spec['records']) / 'dispatch').mkdir(parents=True, exist_ok=True)
         import agent_cli
-        for backend in ['agy', 'codex', 'claude']:
+        for backend in agent_cli.REQUIRED:
             executable = shutil.which(backend)
             if not executable:
                 continue

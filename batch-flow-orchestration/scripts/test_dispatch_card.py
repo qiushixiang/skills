@@ -534,20 +534,25 @@ class CardTests(unittest.TestCase):
         self.assertFalse(json.loads(self.store.read_text())['state']['attempts'])
 
 
-    def completed_cli_card(self, receipt=True, code=0):
-        self.build(lambda p: p['roles']['executor'].update(tool='codex', model='gpt-6.1-sol', effort='medium'))
-        profile = self.runtime / 'codex-profile.json'
-        profile.write_text(json.dumps(dict(format='batch-flow-cli/v1', backend='codex', binary='/bin/codex', version='fixture')))
+    def completed_cli_card(self, receipt=True, code=0, backend='codex'):
+        model='deepseek/deepseek-flash' if backend=='opencode' else 'gpt-6.1-sol'
+        effort='default' if backend=='opencode' else 'medium'
+        self.build(lambda p: p['roles']['executor'].update(tool=backend, model=model, effort=effort))
+        profile = self.runtime / (backend+'-profile.json')
+        profile.write_text(json.dumps(dict(format='batch-flow-cli/v1', backend=backend, binary='/bin/'+backend, version='fixture')))
         spec_path = self.runtime / 'spec.json'; spec = json.loads(spec_path.read_text())
         spec['profiles'].append(str(profile)); spec_path.write_text(json.dumps(spec))
         card = self.card('make', '--store', str(self.store), '--kind', 'EXECUTE', '--target', 'execute', '--runtime', str(self.runtime))
         revision = json.loads(self.store.read_text())['revision']
         self.card('start', '--store', str(self.store), '--card', card['card'], '--revision', str(revision))
         directory = Path(card['prompt_file']).parent; run = directory / 'run'; run.mkdir()
-        cid = '10000000-0000-4000-8000-000000000001'
-        (run / 'request.json').write_text(json.dumps(dict(backend='codex', conversation=None, task='execute', started_at=flow.now())))
+        cid = 'ses_ActualFixture012345' if backend=='opencode' else '10000000-0000-4000-8000-000000000001'
+        (run / 'request.json').write_text(json.dumps(dict(backend=backend, conversation=None, task='execute', cwd=str(self.workspace),started_at=flow.now())))
         if receipt: (run / 'receipt.json').write_text(json.dumps(dict(event='CLI_STARTED', pid=12345, task='execute')))
         events = [dict(type='thread.started', thread_id=cid), dict(type='item.completed', item=dict(type='agent_message', text='结果：VERIFIED\n验证证据：fixture')), dict(type='turn.completed')]
+        if backend=='opencode':
+            events=[dict(type='text',sessionID=cid,part=dict(messageID='msg_final',text='结果：VERIFIED\n验证证据：fixture')),
+                    dict(type='step_finish',sessionID=cid,part=dict(messageID='msg_final',reason='stop'))]
         (run / 'stdout').write_text('\n'.join(json.dumps(e) for e in events))
         (run / 'stderr').write_text('')
         (run / 'exit.json').write_text(json.dumps(dict(returncode=code, ended_at=flow.now())))
@@ -568,6 +573,20 @@ class CardTests(unittest.TestCase):
         self.next()
         attempts = [a for a in json.loads(self.store.read_text())['state']['attempts'] if a['task']=='execute']
         self.assertEqual(len(attempts), 1)
+
+    def test_opencode_card_collects_native_session_and_can_find_resume_evidence(self):
+        import dispatch_card as dc
+        card,directory,run,cid=self.completed_cli_card(backend='opencode')
+        recorded=json.loads((directory/'card.json').read_text())
+        self.assertIn('--model deepseek/deepseek-flash',recorded['host_call']['input']['command'])
+        self.assertEqual(recorded['route'],'cli')
+        report=self.next()
+        self.assertEqual(report['collected'][0]['conversation_id'],cid)
+        attempt=self.attempt('execute')
+        self.assertEqual(attempt['result'],'VERIFIED')
+        self.assertEqual(attempt['call']['conversation_id'],cid)
+        self.assertEqual(dc.prior_run(self.store,cid),run)
+        self.assertFalse((directory/'receipt.txt').exists())
 
     def test_cli_without_original_launch_receipt_cannot_finish(self):
         card, directory, run, cid = self.completed_cli_card(receipt=False)

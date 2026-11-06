@@ -82,5 +82,14 @@ class CapabilityTests(unittest.TestCase):
         self.assertEqual(result['next']['actions'][0]['cli_adapter']['profile'],str(self.profile))
         self.assertNotIn('profile',original['actions'][0]['cli_adapter'])
 
+    def test_opencode_profile_is_recovered_from_the_bound_launcher(self):
+        self.profile.write_text(json.dumps(dict(format='batch-flow-cli/v1',backend='opencode',
+                                               binary='/fixture/opencode',version='opencode v2.2.5')))
+        before={p.name:p.read_bytes() for p in self.runtime.iterdir()}
+        result=flow.host_capabilities(self.store,self.env)
+        self.assertEqual(result['status'],'bound')
+        self.assertEqual(result['profiles']['opencode']['binary'],'/fixture/opencode')
+        self.assertEqual(before,{p.name:p.read_bytes() for p in self.runtime.iterdir()})
+
 
 if __name__=='__main__':unittest.main(verbosity=2)

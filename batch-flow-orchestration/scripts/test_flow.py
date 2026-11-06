@@ -7,6 +7,7 @@ import tempfile
 import subprocess
 import sys
 import unittest
+from unittest import mock
 import flow
 
 
@@ -53,6 +54,39 @@ class FlowTests(unittest.TestCase):
     def test_full_release(self):
         for t in ['execute','regular','third','done']:self.pass_task(t)
         self.assertTrue(flow.status(self.s)['complete'])
+    def test_status_cache_preserves_report_and_reduces_evidence_reads(self):
+        for t in ['execute','regular','third','done']:self.pass_task(t)
+        at=flow.now()
+        with mock.patch.object(flow.hashlib,'sha256',wraps=flow.hashlib.sha256) as hashes:
+            original=flow.status.__wrapped__(self.s,at)
+            uncached_reads=hashes.call_count
+        with mock.patch.object(flow.hashlib,'sha256',wraps=flow.hashlib.sha256) as hashes:
+            cached=flow.status(self.s,at)
+            self.assertLess(hashes.call_count,uncached_reads)
+        self.assertEqual(cached,original)
+        self.assertIsNone(flow._status_cache.get())
+
+    def test_status_cache_does_not_survive_evidence_or_state_changes(self):
+        for t in ['execute','regular','third','done']:self.pass_task(t)
+        self.assertTrue(flow.status(self.s)['complete'])
+        # Evidence can change without a ledger revision bump.
+        self.e.write_text('changed evidence')
+        self.assertFalse(flow.status(self.s)['complete'])
+        self.e.write_text('proof')
+        self.assertTrue(flow.status(self.s)['complete'])
+        flow.latest(self.s,'execute')['result']='FAILED'
+        self.assertFalse(flow.status(self.s)['complete'])
+
+    def test_status_cache_keeps_recursion_paths_separate_and_clears_on_error(self):
+        self.pass_task('execute')
+        @flow.status_query
+        def check(s):
+            self.assertTrue(flow.success(s,'execute'))
+            self.assertFalse(flow.success(s,'execute',{'execute'}))
+            self.assertTrue(flow.success(s,'execute',seen=set()))
+            raise RuntimeError('query failed')
+        with self.assertRaisesRegex(RuntimeError,'query failed'):check(self.s)
+        self.assertIsNone(flow._status_cache.get())
     def test_start_before_dependencies_rejected(self):
         with self.assertRaises(flow.FlowError):self.start('done')
     def test_exhausted_budget_prompts_decision(self):
@@ -85,7 +119,7 @@ class FlowTests(unittest.TestCase):
         action=next(a for a in flow.status(self.s)['actions'] if a['kind']=='DECIDE')
         self.assertEqual(action['orchestrator_action']['mode'],'delegate_to_lead')
     def test_native_agent_does_not_receive_cli_adapter(self):
-        for tool,backend in [('codex-cli','codex'),('claude-cli','claude'),('claude-agent',None),('collaboration',None)]:
+        for tool,backend in [('codex-cli','codex'),('claude-cli','claude'),('opencode','opencode'),('opencode-cli','opencode'),('claude-agent',None),('collaboration',None)]:
             self.s['plan']['roles']['executor']['tool']=tool
             action=next(a for a in flow.status(self.s)['actions'] if a['target']=='execute')
             if backend:
@@ -117,7 +151,7 @@ class FlowTests(unittest.TestCase):
         self.signal()
         self.s['plan']['roles']['architect']['tool']='codex'
         call=dict(self.s['plan']['roles']['architect'],conversation_id='dec05_arch_ctx')
-        with self.assertRaisesRegex(flow.FlowError,'native UUID'):
+        with self.assertRaisesRegex(flow.FlowError,'native session ID'):
             self.apply('architect','decision_start',dict(id='D1',call=call))
     def test_technical_instructions_are_payload_not_coordinator_todo(self):
         instruction='git commit -m reviewed; run ./build.sh'
@@ -1471,6 +1505,112 @@ class FlowTests(unittest.TestCase):
         self.assertIn('revision conflict', result['error'])
         self.assertEqual(before, self.s)
         self.assertFalse((self.root / '.batch-flow' / 'records').exists())
+
+    def test_finish_json_note_and_cli_note_use_the_same_evidence_format(self):
+        aid=self.start('execute')
+        data=dict(attempt=aid,result='VERIFIED',evidence=[str(self.e)],note='AC result and limitations')
+        original=copy.deepcopy(self.s)
+        proc,result=self.cli('finish','--revision',str(self.s['revision']),'--actor','executor',
+                             '--data','-',input=json.dumps(data))
+        self.assertEqual(proc.returncode,0,result)
+        def notes():
+            return [json.loads(Path(p).read_text()) for p in flow.latest(self.s,'execute')['evidence'] if p!=str(self.e)]
+        json_notes=notes()
+        self.s=original
+        note=data.pop('note')
+        proc,result=self.cli('finish','--revision',str(self.s['revision']),'--actor','executor',
+                             '--data','-','--note',note,input=json.dumps(data))
+        self.assertEqual(proc.returncode,0,result)
+        self.assertEqual(notes(),json_notes)
+        self.assertEqual(json_notes,[{'note':note}])
+
+    def test_note_apply_replay_preserves_raw_request_and_creates_one_record(self):
+        aid=self.start('execute')
+        data=dict(attempt=aid,result='VERIFIED',evidence=[str(self.e)],note='delivery details')
+        request=dict(request_id='stable-note',expected_revision=self.s['revision'],actor='executor',
+                     operations=[dict(type='finish',data=data)])
+        original=copy.deepcopy(request)
+        self.s,changed=flow.apply_request(self.s,request,self.root)
+        self.assertTrue(changed)
+        history=self.s['history'][-1]
+        self.assertEqual(history['submitted_operations'],request['operations'])
+        self.assertNotIn('note',history['operations'][0]['data'])
+        self.assertEqual(history['request_hash'],flow.digest(request))
+        self.assertEqual(request,original)
+        records=set((self.root/'records').glob('*.json'))
+        self.s,changed=flow.apply_request(self.s,request,self.root)
+        self.assertFalse(changed)
+        self.assertEqual(set((self.root/'records').glob('*.json')),records)
+
+    def test_shared_note_normalization_cleans_failed_multi_operation_transaction(self):
+        aid=self.start('execute');before=copy.deepcopy(self.s)
+        request=dict(request_id='bad-batch',expected_revision=self.s['revision'],actor='executor',operations=[
+            dict(type='finish',data=dict(attempt=aid,result='VERIFIED',evidence=[str(self.e)],note='first note')),
+            dict(type='finish',data=dict(attempt=aid,result='VERIFIED',evidence=[str(self.e)],note='second note'))])
+        with self.assertRaisesRegex(flow.FlowError,'already finished'):
+            flow.apply_request(self.s,request,self.root)
+        self.assertEqual(self.s,before)
+        self.assertEqual(list((self.root/'records').glob('*.json')),[])
+
+    def test_note_does_not_bypass_field_role_result_or_user_evidence_checks(self):
+        aid=self.start('execute');before=copy.deepcopy(self.s)
+        data=dict(attempt=aid,result='VERIFIED',evidence=[str(self.e)],note='explanation')
+        for actor,extra in [('reviewer',{}),('executor',{'unexpected':True}),
+                            ('executor',{'result':'RELEASE'}),('executor',{'note':42}),
+                            ('executor',{'note':' '}),('executor',{'evidence':'invalid'})]:
+            with self.subTest(actor=actor,extra=extra),self.assertRaises(flow.FlowError):
+                self.apply(actor,'finish',dict(data,**extra))
+            self.assertEqual(self.s,before)
+        with self.assertRaises(flow.FlowError):
+            self.apply('orchestrator','set_models',dict(roles={},backups={},reason='test',note='not authorization'))
+        self.assertEqual(list((self.root/'records').glob('*.json')),[])
+
+    def test_cli_rejects_duplicate_note_and_accepts_json_start_call(self):
+        data=dict(task='execute',call=dict(self.s['plan']['roles']['executor'],conversation_id='json-call'))
+        proc,result=self.cli('start','--revision',str(self.s['revision']),'--actor','orchestrator',
+                             '--data','-',input=json.dumps(data))
+        self.assertEqual(proc.returncode,0,result)
+        self.assertEqual(flow.latest(self.s,'execute')['call'],data['call'])
+        before=copy.deepcopy(self.s)
+        finish=dict(attempt=flow.latest(self.s,'execute')['id'],result='VERIFIED',evidence=[str(self.e)],note='in JSON')
+        proc,result=self.cli('finish','--revision',str(self.s['revision']),'--actor','executor',
+                             '--data','-','--note','in CLI',input=json.dumps(finish))
+        self.assertEqual(proc.returncode,2)
+        self.assertIn('duplicate parameter: note',result['error'])
+        self.assertEqual(self.s,before)
+
+    def test_schema_matches_every_operation_and_does_not_require_store(self):
+        self.assertEqual(set(flow.OP_FIELDS),set(flow.OP_ROLES))
+        store=self.root/'absent'/'flow.json'
+        proc=subprocess.run([sys.executable,flow.__file__,'--store',str(store),'schema'],capture_output=True,text=True)
+        self.assertEqual(proc.returncode,0,proc.stderr)
+        schemas=json.loads(proc.stdout)['operations']
+        self.assertEqual(schemas,{kind:flow.operation_schema(kind) for kind in flow.OP_ROLES})
+        self.assertIn('note',schemas['finish']['optional'])
+        self.assertNotIn('note',schemas['set_models']['optional'])
+        self.assertFalse(store.parent.exists())
+
+    def test_call_inputs_reject_mixing_or_unused_flags_and_work_for_finish(self):
+        call=dict(self.s['plan']['roles']['executor'],conversation_id='actual-executor')
+        before=copy.deepcopy(self.s)
+        data=dict(task='execute',call=call)
+        proc,result=self.cli('start','--revision',str(self.s['revision']),'--actor','orchestrator',
+                             '--data','-','--tool',call['tool'],input=json.dumps(data))
+        self.assertEqual(proc.returncode,2)
+        self.assertIn('duplicate parameter: call',result['error'])
+        self.assertEqual(self.s,before)
+        proc,result=self.cli('signal','--revision',str(self.s['revision']),'--actor','executor',
+                             '--tool',call['tool'],'--note','must not be silently ignored')
+        self.assertEqual(proc.returncode,2)
+        self.assertIn('does not accept call flags',result['error'])
+        self.assertEqual(self.s,before)
+        self.apply('orchestrator','start',dict(task='execute',call=call))
+        proc,result=self.cli('finish','--revision',str(self.s['revision']),'--actor','executor',
+                             '--attempt',flow.latest(self.s,'execute')['id'],'--result','VERIFIED',
+                             '--evidence',str(self.e),'--tool',call['tool'],'--model',call['model'],
+                             '--effort',call['effort'],'--conversation',call['conversation_id'])
+        self.assertEqual(proc.returncode,0,result)
+        self.assertEqual(flow.latest(self.s,'execute')['call'],call)
 
     def test_cli_shortcut_still_rejects_wrong_actor(self):
         aid = self.start('execute')

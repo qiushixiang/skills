@@ -122,11 +122,18 @@ def main():
             argv+=['--audit-log',str(args.audit_log),'--conversation',args.conversation]
             for root in args.audit_management_root:argv+=['--audit-management-root',str(root)]
         run=subprocess.run(argv,capture_output=True,text=True,timeout=10)
-        report=json.loads(run.stdout)
-        if not isinstance(report,dict) or 'can_yield' not in report: raise ValueError('invalid pre_yield result')
+        try:
+            report=json.loads(run.stdout)
+        except ValueError as exc:
+            raise ValueError(f'invalid pre_yield JSON (exit {run.returncode}); stderr: {run.stderr[:1000]}') from exc
+        if not isinstance(report,dict) or type(report.get('can_yield')) is not bool or run.returncode not in {0,1}:
+            error=report.get('error','invalid pre_yield result') if isinstance(report,dict) else 'invalid pre_yield result'
+            raise ValueError(f'pre_yield exit {run.returncode}: {str(error)[:1000]}; stderr: {run.stderr[:1000]}')
     except (OSError,ValueError,subprocess.TimeoutExpired) as exc:
-        print(json.dumps(response(args.host,bool(args.audit_log and args.role=='orchestrator'),'Role audit could not complete; inspect hook error and do not claim audit passed.')))
-        sys.stderr.write(f'[batch-flow-hook] pre_yield unavailable: {exc}\n')
+        detail=f'pre_yield timed out after {exc.timeout}s while evaluating workflow state and audit' if isinstance(exc,subprocess.TimeoutExpired) else str(exc)
+        message=f'Workflow pre_yield unavailable: {detail}. Role audit completion is unconfirmed; do not claim audit passed.'
+        print(json.dumps(response(args.host,bool(args.audit_log and args.role=='orchestrator'),message),ensure_ascii=False))
+        sys.stderr.write(f'[batch-flow-hook] {message}\n')
         return
     if report.get('disposition')=='ROLE_BOUNDARY_BLOCKED':
         audit=report['boundary_audit']

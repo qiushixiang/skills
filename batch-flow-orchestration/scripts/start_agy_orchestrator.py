@@ -212,7 +212,7 @@ def hook(event_name,runtime,event,environ=None):
         paths='\n技能目录：'+str(SKILL)+'\n当前任务 base：'+spec.get('task_base',str(Path(spec['store']).parent.parent))+'\n台账：'+spec['store']+'\n记录目录：'+spec['records']+'\n子会话实际宿主元数据：'+str(Path(runtime)/'children.jsonl')+'\n核查过的 CLI profiles：'+json.dumps(spec['profiles'])+'\n管理命令示例：'+example+'\n仅协调本任务，不自动搜索或切换其他任务。命令须使用这里的绝对 Python 路径及 shlex.join 等价规范引用，显式指定 --store；禁止 record 和 snapshot。'
         paths+='\n能力可随时重新查询：'+shlex.join([spec['python'],str(SCRIPTS/'flow.py'),'capabilities','--store',spec['store']])+'。status/pre_yield 的 host_capabilities 和派发动作 cli_adapter.profile 也会重新提供路径；上下文压缩后先查询，不猜测 profile，不把遗忘路径当成无权限或要求用户换模型。'
         if spec.get('terminal_sandbox') is False:
-            paths+='\n本编排会话的终端沙箱已关闭，命令仍必须通过固定脚本门禁，不传 BypassSandbox。首次 start/decision_start 前对拟用 profile 运行 agent_cli.py check --profile <路径> --model <配置模型> --effort <配置值> --cwd <工作目录>，续接另给 --conversation <实际UUID> --resume-from <上轮成功run-dir>，保存真实输出；失败先处理环境，不登记技术尝试。effort=default 表示不覆盖CLI配置，不发送字符串default、不改成medium。逻辑会话名不可用于Codex续接，旧handling登记修复按contexts.md。check 不调用模型，也不证明认证或网络已就绪。不得直接运行 agy/codex/claude 或读取其认证配置。代理进程沿各自原有权限和沙箱执行。'
+            paths+='\n本编排会话的终端沙箱已关闭，命令仍必须通过固定脚本门禁，不传 BypassSandbox。首次 start/decision_start 前对拟用 profile 运行 agent_cli.py check --profile <路径> --model <配置模型> --effort <配置值> --cwd <工作目录>，续接另给 --conversation <实际原生会话ID> --resume-from <上轮成功run-dir>，保存真实输出；失败先处理环境，不登记技术尝试。effort=default 表示不覆盖CLI配置，不发送字符串default、不改成medium。逻辑会话名不可用于Codex续接，旧handling登记修复按contexts.md。check 不调用模型，也不证明认证或网络已就绪。不得直接运行 agy/codex/claude/opencode 或读取其认证配置。代理进程沿各自原有权限和沙箱执行。'
         return {'injectSteps':[{'systemMessage':{'systemMessage':capabilities()+loop_text(spec)+paths}}]}
     if not owner_path.exists():
         return {'decision':'deny','reason':'launcher SessionStart binding is missing'} if event_name=='PreToolUse' else {}
@@ -348,7 +348,7 @@ def launch(args):
         Path(spec['records']).mkdir(exist_ok=True)
         # Profiles are launcher-owned; the main session cannot edit them.
         import agent_cli
-        for backend in ['agy','codex','claude']:
+        for backend in agent_cli.REQUIRED:
             executable=binary if backend=='agy' else shutil.which(backend)
             if executable:
                 profile=runtime/(backend+'-profile.json')

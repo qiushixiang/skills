@@ -31,7 +31,8 @@ import flow  # noqa: E402
 
 FORMAT = 'batch-flow-dispatch-card/v1'
 TASK_KINDS = {'DESIGN', 'EXECUTE', 'VERIFY', 'REVIEW', 'THIRD_PARTY_REVIEW', 'COMMIT', 'RELEASE', 'CONFIRM', 'REPAIR'}
-CLI_TOOLS = {'agy': 'agy', 'agy-cli': 'agy', 'codex': 'codex', 'codex-cli': 'codex', 'claude-cli': 'claude'}
+CLI_TOOLS = {'agy': 'agy', 'agy-cli': 'agy', 'codex': 'codex', 'codex-cli': 'codex', 'claude-cli': 'claude',
+             'opencode': 'opencode', 'opencode-cli': 'opencode'}
 AGENT_MODELS = {'haiku', 'sonnet', 'opus', 'fable'}
 AGENT_EFFORTS = {'low', 'medium', 'high', 'xhigh', 'max'}
 # Inside a Claude Code host bare `claude` means a subagent; claude-cli is a nested `claude -p` whose auth
@@ -64,6 +65,7 @@ REVIEW_DELIVERY = """结果：RELEASE | FIX_REQUIRED | WAIT_EVIDENCE | ARCH_DECI
 LEAD_DELIVERY = """结果：<VERIFIED | WAIT_EVIDENCE | FAILED | ARCH_DECISION_REQUIRED；非任务动作写处理状态>
 结论与依据：<裁决/计划/核验结论及原始证据路径>
 需登记的操作：<flow.py 操作类型、actor、--data 参数文件路径；由派发责任人原样代交>
+（登记参数格式可用 flow.py schema --operation <操作类型> 查询。）
 下一责任人：<角色>"""
 
 
@@ -454,7 +456,7 @@ def make(args):
     elif tool in CLI_TOOLS:
         backend = CLI_TOOLS[tool]
         profiles = [p for p in (spec or {}).get('profiles', []) if load_json(p).get('backend') == backend]
-        need(len(profiles) == 1, '没有启动器核查过的 %s profile；在启动器会话中生成派发卡' % backend)
+        need(len(profiles) == 1, '没有唯一的启动器核查过的 %s profile；重启启动器，或请用户授权的会话外维护者按 references/linux-cli.md“已启动会话新增 CLI”补登记。编排者不自行改写 profile/spec，重复 next 不会修复此缺项' % backend)
         argv = [sys.executable, str(SCRIPTS / 'agent_cli.py'), 'run', '--profile', profiles[0], '--task', args.target,
                 '--cwd', str(workspace), '--model', model, '--effort', effort, '--prompt-file', str(prompt_path),
                 '--run-dir', str(directory / 'run'), '--access', card['access']]
@@ -469,7 +471,7 @@ def make(args):
             card['host_call'] = dict(tool='Bash', input=dict(command=shlex.join(argv), run_in_background=not as_lead,
                                                               description='%s %s via %s' % (args.kind, args.target, backend)))
     else:
-        raise CardError('调用工具 %r 不可派发（支持 claude / claude-agent[:类型]（Claude 宿主子代理）、agy、codex、claude-cli（外部进程））' % tool)
+        raise CardError('调用工具 %r 不可派发（支持 claude / claude-agent[:类型]（Claude 宿主子代理）、agy、codex、claude-cli、opencode / opencode-cli（外部进程））' % tool)
     write_new(directory / 'card.json', json.dumps(card, ensure_ascii=False, indent=2))
     return card
 

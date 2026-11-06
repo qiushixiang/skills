@@ -5,9 +5,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
+import contextlib
+import io
 
 import flow
 import role_audit
+import stop_hook_pre_yield
 from test_flow import plan
 
 SCRIPT=Path(__file__).with_name('stop_hook_pre_yield.py')
@@ -53,6 +57,31 @@ class HookTests(unittest.TestCase):
         self.assertEqual(codex['decision'],'block')
         self.assertEqual(self.run_hook('agy',{'conversationId':'other'}),{'decision':'stop'})
         self.assertEqual(self.run_hook('codex',{'session_id':'other'}),{})
+
+    def test_pre_yield_failures_report_concrete_cause_and_keep_audit_blocked(self):
+        argv=['hook','--host','claude','--store',str(self.store),'--role','orchestrator',
+              '--conversation','owner-1','--audit-log',str(self.root/'audit.jsonl')]
+        cases=[
+            (subprocess.TimeoutExpired(['flow.py'],10),'timed out after 10s'),
+            (subprocess.CompletedProcess([],2,'{"ok":false,"error":"invalid store"}','trace detail'),'invalid store'),
+            (subprocess.CompletedProcess([],1,'not json','child crashed'),'child crashed'),
+            (subprocess.CompletedProcess([],0,'{"can_yield":"yes"}',''),'invalid pre_yield result'),
+        ]
+        for outcome,expected in cases:
+            with self.subTest(expected=expected):
+                output=io.StringIO();errors=io.StringIO()
+                with mock.patch.object(sys,'argv',argv), \
+                     mock.patch.object(stop_hook_pre_yield,'read_event',return_value=({'session_id':'owner-1','stop_hook_active':True},None)), \
+                     mock.patch.object(stop_hook_pre_yield.subprocess,'run') as run, \
+                     contextlib.redirect_stdout(output),contextlib.redirect_stderr(errors):
+                    if isinstance(outcome,Exception):run.side_effect=outcome
+                    else:run.return_value=outcome
+                    stop_hook_pre_yield.main()
+                report=json.loads(output.getvalue())
+                self.assertEqual(report['decision'],'block')
+                self.assertIn(expected,report['reason'])
+                self.assertIn(expected,errors.getvalue())
+                self.assertIn('unconfirmed',report['reason'])
     def test_claude_host_and_loop_guard(self):
         self.assertEqual(self.run_hook('claude',{'session_id':'other'}),{})
         first=self.run_hook('claude',{'session_id':'owner-1','stop_hook_active':False})

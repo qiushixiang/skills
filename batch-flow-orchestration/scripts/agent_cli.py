@@ -4,6 +4,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 from pathlib import Path
 import stat
 import shutil
@@ -16,11 +17,13 @@ REQUIRED = {
     'agy': ['--mode', '--model', '--effort', '--output-format', '--conversation', '--settings'],
     'codex': ['--sandbox', '--model', '--config', '--json', '--add-dir', '--skip-git-repo-check'],
     'claude': ['--permission-mode', '--permission-prompts', '--disallowedTools', '--model', '--effort', '--resume', '--output-format'],
+    'opencode': ['--model', '--format', '--session', '--agent', '--standalone'],
 }
 EFFORTS = {
     'agy': {'low', 'medium', 'high', 'xhigh', 'max'},
     'codex': {'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'},
     'claude': {'low', 'medium', 'high', 'xhigh', 'max'},
+    'opencode': set(),  # No verified effort override; retain the selected model's defaults.
 }
 
 
@@ -37,6 +40,12 @@ def uuid_session(value):
         return isinstance(value, str) and str(uuid.UUID(value)) == value
     except (ValueError, AttributeError):
         return False
+
+
+def native_session(backend, value):
+    if backend == 'opencode':
+        return isinstance(value, str) and re.fullmatch(r'ses_[A-Za-z0-9]+', value) is not None
+    return uuid_session(value)
 
 
 TOKEN_FILE_ENV = 'BATCH_FLOW_CLAUDE_TOKEN_FILE'
@@ -91,7 +100,9 @@ def probe(backend, output, binary=None):
         raise ValueError('CLI executable not found')
     binary = str(Path(binary).resolve())
     cli_version = version(binary)
-    prefix = [binary, 'exec'] if backend == 'codex' else [binary]
+    prefix = [binary, 'exec'] if backend == 'codex' else [binary, 'run'] if backend == 'opencode' else [binary]
+    if backend == 'opencode' and re.match(r'^opencode v2\.', cli_version) is None:
+        raise ValueError('OpenCode adapter requires the verified V2 CLI contract; inspect this version before adapting')
     help_result = subprocess.run(prefix + ['--help'], capture_output=True, text=True, timeout=15, check=True)
     help_text = help_result.stdout + help_result.stderr
     if any(flag not in help_text for flag in REQUIRED[backend]):
@@ -113,6 +124,13 @@ def probe(backend, output, binary=None):
 def build_command(profile, args, prompt):
     binary = profile['binary']; backend = profile['backend']
     effort = effort_override(backend, args.effort)
+    if backend == 'opencode':
+        # A private, foreground server receives this invocation's config and
+        # credentials. Never attach to an unrelated background service.
+        argv = [binary, 'run', '--standalone', '--format', 'json', '--agent', 'build', '--model', args.model]
+        if args.conversation:
+            argv += ['--session', args.conversation]
+        return argv + ['--', prompt], None
     if backend == 'agy':
         # Read roles must rerun builds/tests: plan mode only plans writing commands (verified
         # 1.5.0), so read access is accept-edits plus a session deny on every file write/edit.
@@ -171,6 +189,8 @@ def validate_call(profile, args):
     if not args.model.strip() or not args.effort.strip():
         raise ValueError('model/effort must be explicit and non-empty')
     effort_override(backend, args.effort)
+    if backend == 'opencode' and re.fullmatch(r'[^/\s#]+/[^\s#]+', args.model) is None:
+        raise ValueError('OpenCode model must be an explicit provider/model ID, without an unverified variant; use opencode models')
     if backend == 'codex' and args.model == 'gpt-6.1-sol' and args.effort in {'none', 'minimal'}:
         raise ValueError('gpt-6.1-sol does not support none/minimal effort')
     args.cwd = str(Path(args.cwd).resolve(strict=True))
@@ -183,8 +203,8 @@ def validate_call(profile, args):
     if args.conversation:
         if not args.conversation.strip() or args.conversation.startswith('pending:'):
             raise ValueError('resume requires an actual conversation ID')
-        if not uuid_session(args.conversation):
-            raise ValueError(backend+' resume requires a native UUID, not a logical context name; record a fresh context with replacement reason')
+        if not native_session(backend, args.conversation):
+            raise ValueError(backend+' resume requires a native session ID, not a logical context name; record a fresh context with replacement reason')
         if not source:
             raise ValueError(backend+' resume requires --resume-from <previous successful adapter run directory>')
         if source:
@@ -238,6 +258,39 @@ def settings_json(path):
     return json.dumps(settings, ensure_ascii=False)
 
 
+def opencode_environment(args):
+    """V2 invocation-local overlay; never rewrite global/project configuration."""
+    config = json.loads(os.environ.get('OPENCODE_CONFIG_CONTENT') or '{}')
+    if not isinstance(config, dict):
+        raise ValueError('OPENCODE_CONFIG_CONTENT must be a JSON object')
+    def merge(target, source):
+        for key, value in source.items():
+            if key in target and isinstance(target[key], dict) and isinstance(value, dict):
+                merge(target[key], value)
+            elif key in target and isinstance(target[key], list) and isinstance(value, list):
+                target[key] += value
+            else:
+                target[key] = value
+    if args.settings:
+        merge(config, json.loads(settings_json(args.settings)))
+    # Agent rules are last in V2 permission evaluation. Do not use --auto or
+    # replace existing shell/policy rules, including explicit denials.
+    agents = config.setdefault('agents', {})
+    if not isinstance(agents, dict):
+        raise ValueError('OpenCode agents must be an object')
+    build = agents.setdefault('build', {})
+    if not isinstance(build, dict):
+        raise ValueError('OpenCode agents.build must be an object')
+    permissions = build.setdefault('permissions', [])
+    if not isinstance(permissions, list):
+        raise ValueError('OpenCode V2 agents.build.permissions must be an array')
+    for directory in args.add_dir:
+        permissions.append(dict(action='external_directory', resource=directory.rstrip('/')+'/*', effect='allow'))
+    if args.access == 'read':
+        permissions.append(dict(action='edit', resource='*', effect='deny'))
+    return dict(os.environ, OPENCODE_CONFIG_CONTENT=json.dumps(config, ensure_ascii=False))
+
+
 def inspect_result(backend, stdout, stderr, returncode, expected=None):
     problems = []; cid = None; response = None
     try:
@@ -254,6 +307,36 @@ def inspect_result(backend, stdout, stderr, returncode, expected=None):
                 problems.append('missing turn.completed')
             if any(e.get('type') in {'error', 'turn.failed'} for e in events):
                 problems.append('CLI error event')
+        elif backend == 'opencode':
+            events = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+            if not events or not all(isinstance(event, dict) for event in events):
+                raise ValueError('expected event objects')
+            ids = {e['sessionID'] for e in events if e.get('sessionID')}
+            if len(ids) != 1:
+                problems.append('missing or mixed OpenCode session IDs')
+            else:
+                cid = ids.pop()
+            finishes = [e.get('part') for e in events if e.get('type') == 'step_finish']
+            if not finishes or not isinstance(finishes[-1], dict) or finishes[-1].get('reason') != 'stop':
+                problems.append('missing final OpenCode step_finish stop')
+            final = finishes[-1] if finishes and isinstance(finishes[-1], dict) else {}
+            message_id = final.get('messageID')
+            if not isinstance(message_id, str) or not message_id:
+                problems.append('missing final OpenCode message ID')
+            messages = [e['part'].get('text') for e in events if e.get('type') == 'text' and isinstance(e.get('part'), dict)
+                        and e['part'].get('messageID') == message_id]
+            response = '\n'.join(text for text in messages if isinstance(text, str))
+            for event in events:
+                if event.get('type') == 'error':
+                    problems.append('OpenCode error event')
+                part = event.get('part')
+                state = part.get('state') if isinstance(part, dict) else None
+                if isinstance(part, dict) and part.get('sessionID') not in {None, cid}:
+                    problems.append('OpenCode part session ID mismatch')
+                if isinstance(state, dict) and (state.get('status') == 'denied' or
+                        (state.get('status') == 'error' and any(token in str(state.get('error', '')).lower()
+                         for token in ['permission denied', 'permission_denied', 'auto-denied', 'permission was rejected']))):
+                    problems.append('OpenCode permission denial reported')
         else:
             result = json.loads(stdout)
             if not isinstance(result, dict):
@@ -272,8 +355,8 @@ def inspect_result(backend, stdout, stderr, returncode, expected=None):
         problems.append('nonzero CLI exit')
     if not isinstance(cid, str) or not cid.strip() or cid.startswith('pending:'):
         problems.append('missing actual conversation ID')
-    elif not uuid_session(cid):
-        problems.append('CLI did not return a native session UUID')
+    elif not native_session(backend, cid):
+        problems.append('CLI did not return a native session ID')
     if expected and cid != expected:
         problems.append('resume conversation ID mismatch')
     if not isinstance(response, str) or not response.strip():
@@ -296,6 +379,7 @@ def run(profile_path, args):
         raise ValueError('empty prompt')
     argv, input_text = build_command(profile, args, prompt)
     auth = claude_auth() if profile['backend'] == 'claude' else None  # Fail before creating the run dir.
+    opencode_env = opencode_environment(args) if profile['backend'] == 'opencode' else None
     output = Path(args.run_dir).resolve()
     output.mkdir(mode=0o700)  # Exclusive: never overwrite or rerun a previous call.
     request = dict(task=args.task, backend=profile['backend'], version=profile['version'],
@@ -304,6 +388,11 @@ def run(profile_path, args):
     request.update(effort_override=effort_override(profile['backend'], args.effort),
                    resume_from=getattr(args, 'resume_from', None))
     env, fds, token = None, (), None
+    if profile['backend'] == 'opencode':
+        env = opencode_env
+        # Record policy intent and settings source, not inherited config or credentials.
+        request['session_policy'] = dict(agent='build', deny_edit=args.access == 'read',
+                                       add_dir=args.add_dir, settings_file=args.settings, standalone=True)
     if auth:
         source, token_path = auth
         request['auth'] = dict(source=source, token_file=str(token_path) if token_path else None)
@@ -371,7 +460,7 @@ def main():
     launch.add_argument('--conversation')
     launch.add_argument('--resume-from', help='previous successful adapter run proving the actual session ID; required for every backend resume')
     launch.add_argument('--add-dir', action='append', default=[])
-    launch.add_argument('--settings', help='AGY/Claude session settings JSON file; authorized policy only')
+    launch.add_argument('--settings', help='AGY/Claude/OpenCode session settings JSON file; authorized policy only')
     finish = commands.add_parser('collect')
     finish.add_argument('--run-dir', required=True)
     args = parser.parse_args()

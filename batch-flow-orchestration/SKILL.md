@@ -1,6 +1,6 @@
 ---
 name: batch-flow-orchestration
-description: 仅在用户明确要求使用本技能（batch-flow / 分批编排 / 任务分流编排）时加载；普通开发、审阅或问答任务不要自动启用。按风险与未决问题决定直派闭环或分批推进；技术负责人负责方案与独立复核，编排者协调跨批，脚本维护版本、证据和恢复门禁。
+description: 以下任一情形加载：用户要求使用本技能（batch-flow / 分批编排 / 任务分流编排）；本会话是 batch-flow 编排者或角色会话（经 start-claude-orchestrator / start_agy_orchestrator 启动、启动提示自称 batch-flow 编排者，或收到 .batch-flow/records/dispatch 派发卡）；要读取、推进或登记某任务的 .batch-flow/flow.json 台账（状态、派发、裁决、确认、计划更新）。与台账无关的普通开发、审阅或问答不加载。按风险与未决问题决定直派闭环或分批推进；技术负责人负责方案与独立复核，编排者协调跨批，脚本维护版本、证据和恢复门禁。
 ---
 
 # 任务分流与分批编排

@@ -24,12 +24,14 @@ class AdapterTests(unittest.TestCase):
 
     def test_commands_and_resume_permissions(self):
         for backend in cli.REQUIRED:
+            self.args.model='test/explicit-model' if backend=='opencode' else 'explicit-model'
+            self.args.effort='default' if backend=='opencode' else 'high'
             for access in ['read','write']:
                 for resume in [None,'actual-session']:
                     with self.subTest(backend=backend,access=access,resume=resume):
                         self.args.access=access;self.args.conversation=resume
                         argv,stdin=cli.build_command(dict(backend=backend,binary='/bin/'+backend),self.args,self.prompt.read_text())
-                        self.assertIn('explicit-model',argv)
+                        self.assertIn(self.args.model,argv)
                         for flag in ['--continue','--last','--dangerously-skip-permissions']:
                             self.assertNotIn(flag,argv)
                         if backend=='codex':
@@ -47,7 +49,7 @@ class AdapterTests(unittest.TestCase):
                                 self.assertIn('write_file(*)',deny)
                             else:
                                 self.assertNotIn('--settings',argv)
-                        else:
+                        elif backend=='claude':
                             self.assertEqual(stdin,self.prompt.read_text())
                             self.assertIn('default' if access=='read' else 'acceptEdits',argv)
                             self.assertNotIn('plan',argv)
@@ -55,6 +57,15 @@ class AdapterTests(unittest.TestCase):
                                 self.assertEqual(argv[argv.index('--disallowedTools')+1],'Edit Write NotebookEdit')
                             else:
                                 self.assertNotIn('--disallowedTools',argv)
+                        else:
+                            self.assertIsNone(stdin)
+                            self.assertEqual(argv[-2:],['--',self.prompt.read_text()])
+                            self.assertIn('--standalone',argv)
+                            self.assertNotIn('--auto',argv)
+                            self.assertEqual('--session' in argv,bool(resume))
+                            policy=json.loads(cli.opencode_environment(self.args)['OPENCODE_CONFIG_CONTENT'])
+                            edits=policy['agents']['build']['permissions']
+                            self.assertEqual(dict(action='edit',resource='*',effect='deny') in edits,access=='read')
 
     def test_failed_and_empty_success_envelopes(self):
         for backend,good in [('agy',dict(conversation_id='01a1a540-b6eb-7ab0-aa1c-92f0cb428e69',status='SUCCESS',response='done')),
@@ -90,13 +101,16 @@ class AdapterTests(unittest.TestCase):
     def test_fake_cli_lifecycle_raw_evidence_no_rerun_and_version_drift(self):
         for backend in cli.REQUIRED:
             with self.subTest(backend=backend):
+                self.args.model='test/explicit-model' if backend=='opencode' else 'explicit-model'
+                self.args.effort='default' if backend=='opencode' else 'high'
                 binary=self.root/backend
                 binary.write_text('#!'+sys.executable+'\n'+'''
 import json,sys
+name=__file__.split('/')[-1]
 if '--version' in sys.argv:
- print('fake-1');sys.exit(0)
+ print('opencode v2.fake' if name=='opencode' else 'fake-1');sys.exit(0)
 if '--help' in sys.argv:
- print('--mode --model --effort --output-format --conversation --settings --sandbox --config --json --add-dir --skip-git-repo-check --permission-mode --permission-prompts --disallowedTools --resume SESSION_ID');sys.exit(0)
+ print('--mode --model --effort --output-format --conversation --settings --sandbox --config --json --add-dir --skip-git-repo-check --permission-mode --permission-prompts --disallowedTools --resume SESSION_ID --format --session --agent --standalone');sys.exit(0)
 name=__file__.split('/')[-1]
 if name=='codex':
  for e in [{'type':'thread.started','thread_id':'01a1a540-b6eb-7ab0-aa1c-92f0cb428e69'},{'type':'item.completed','item':{'type':'agent_message','text':sys.stdin.read()}},{'type':'turn.completed'}]:print(json.dumps(e))
@@ -104,6 +118,10 @@ elif name=='claude':
  flag='--resume' if '--resume' in sys.argv else '--session-id'
  cid=sys.argv[sys.argv.index(flag)+1]
  print(json.dumps({'session_id':cid,'subtype':'success','is_error':False,'result':sys.stdin.read()}))
+elif name=='opencode':
+ cid=sys.argv[sys.argv.index('--session')+1] if '--session' in sys.argv else 'ses_TestNative0123456789'
+ for e in [{'type':'text','sessionID':cid,'part':{'messageID':'msg_done','text':sys.argv[-1]}},
+           {'type':'step_finish','sessionID':cid,'part':{'messageID':'msg_done','reason':'stop'}}]:print(json.dumps(e))
 else:
  print(json.dumps({'conversation_id':'01a1a540-b6eb-7ab0-aa1c-92f0cb428e69','status':'SUCCESS','response':sys.argv[-1]}))
 ''')
@@ -112,10 +130,12 @@ else:
                 self.args.conversation=None
                 self.args.resume_from=None
                 self.args.run_dir=str(self.root/(backend+'-run'))
-                with patch('builtins.print'):self.assertEqual(cli.run(profile,self.args),0)
+                env_override={'OPENCODE_CONFIG_CONTENT':'{"providers":{"private":{"options":{"apiKey":"DO_NOT_RECORD"}}}}'} if backend=='opencode' else {}
+                with patch.dict(os.environ,env_override),patch('builtins.print'):self.assertEqual(cli.run(profile,self.args),0)
                 report=cli.collect(self.args.run_dir)
                 self.assertEqual(report['response'],self.prompt.read_text())
                 self.assertTrue((Path(self.args.run_dir)/'receipt.json').exists())
+                self.assertNotIn('DO_NOT_RECORD',(Path(self.args.run_dir)/'request.json').read_text())
                 before=(Path(self.args.run_dir)/'stdout').read_bytes()
                 with self.assertRaises(FileExistsError):cli.run(profile,self.args)
                 self.assertEqual(before,(Path(self.args.run_dir)/'stdout').read_bytes())
@@ -171,6 +191,8 @@ print(json.dumps({'session_id':cid,'subtype':'success','is_error':False,'result'
 
     def test_all_backends_reject_unproven_resume_and_invalid_result_ids(self):
         for backend in cli.REQUIRED:
+            self.args.model='test/model' if backend=='opencode' else 'explicit-model'
+            self.args.effort='default'
             for cid in ['logical-context','01a1a540-b6eb-7ab0-aa1c-92f0cb428e69']:
                 self.args.conversation=cid;self.args.resume_from=None
                 with self.subTest(backend=backend,cid=cid),self.assertRaises(ValueError):
@@ -219,6 +241,57 @@ print(json.dumps({'session_id':cid,'subtype':'success','is_error':False,'result'
                 self.assertEqual(cli.main(),0)
         with patch.object(cli,'version',return_value='v2'),self.assertRaisesRegex(ValueError,'version changed'):
             cli.check_profile(profile)
+
+    def test_opencode_requires_native_id_final_message_and_completion(self):
+        cid='ses_ActualNative012345';msg='msg_final'
+        events=[dict(type='text',sessionID=cid,part=dict(messageID='msg_earlier',text='Working...')),
+                dict(type='text',sessionID=cid,part=dict(messageID=msg,text='结果：VERIFIED')),
+                dict(type='step_finish',sessionID=cid,part=dict(messageID=msg,reason='stop'))]
+        def inspect(items,code=0,expected=None):
+            return cli.inspect_result('opencode','\n'.join(json.dumps(e) for e in items),'',code,expected)
+        report=inspect(events)
+        self.assertTrue(report['usable'],report)
+        self.assertEqual(report['response'],'结果：VERIFIED')
+        self.assertFalse(inspect(events,expected='ses_AnotherSession')['usable'])
+        self.assertTrue(inspect(events[1:])['usable'])  # Earlier commentary is optional.
+        for invalid in [events[:-1],events+[dict(type='error',sessionID=cid)],
+                        events+[dict(type='text',sessionID='ses_Other',part=dict(text='wrong session'))],
+                        events[:-1]+[dict(type='step_finish',sessionID=cid,part=dict(messageID=msg,reason='tool-calls'))],
+                        [dict(e,sessionID='logical') for e in events],
+                        [dict(e,sessionID='01a1a540-b6eb-7ab0-aa1c-92f0cb428e69') for e in events]]:
+            self.assertFalse(inspect(invalid)['usable'],invalid)
+        denial=dict(type='tool_use',sessionID=cid,part=dict(state=dict(status='denied')))
+        self.assertFalse(inspect(events+[denial])['usable'])
+        # A handled build/test failure remains valid transport and can be reported FAILED.
+        handled=dict(type='tool_use',sessionID=cid,part=dict(state=dict(status='error',error='command exited 1')))
+        self.assertTrue(inspect(events+[handled])['usable'])
+        self.assertFalse(inspect(events,code=1)['usable'])
+
+    def test_opencode_overlay_preserves_policy_and_credentials_without_recording_them(self):
+        self.args.effort='default';self.args.model='deepseek/deepseek-flash'
+        extra=self.root/'extra';extra.mkdir();self.args.add_dir=[str(extra)]
+        settings=self.root/'settings.json'
+        settings.write_text(json.dumps(dict(agents=dict(build=dict(permissions=[
+            dict(action='shell',resource='git push *',effect='deny')])))))
+        self.args.settings=str(settings)
+        inherited=dict(providers=dict(secret=dict(options=dict(apiKey='DO_NOT_RECORD'))))
+        with patch.dict(os.environ,OPENCODE_CONFIG_CONTENT=json.dumps(inherited)):
+            env=cli.opencode_environment(self.args)
+        config=json.loads(env['OPENCODE_CONFIG_CONTENT'])
+        self.assertEqual(config['providers'],inherited['providers'])
+        rules=config['agents']['build']['permissions']
+        self.assertIn(dict(action='shell',resource='git push *',effect='deny'),rules)
+        self.assertIn(dict(action='external_directory',resource=str(extra)+'/*',effect='allow'),rules)
+        self.assertEqual(rules[-1],dict(action='edit',resource='*',effect='deny'))
+        self.assertEqual(json.loads(settings.read_text())['agents']['build']['permissions'],rules[:1])
+
+    def test_opencode_rejects_unsupported_effort_model_and_resume_before_spawn(self):
+        for model,effort,cid in [('deepseek/deepseek-flash','high',None),('deepseek-flash','default',None),
+                                 ('deepseek/deepseek-flash','default','logical'),
+                                 ('deepseek/deepseek-flash','default','ses_RealButUnproven')]:
+            self.args.model=model;self.args.effort=effort;self.args.conversation=cid
+            with self.subTest(model=model,effort=effort,cid=cid),self.assertRaises(ValueError):
+                cli.validate_call(dict(backend='opencode'),self.args)
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

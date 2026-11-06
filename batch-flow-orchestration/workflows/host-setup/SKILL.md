@@ -12,4 +12,6 @@ Claude Code 编排者的前置工具拦截（orchestrator_guard.py）、两种�
 
 stop hook 显式绑定 `python3 <技能目录>/scripts/stop_hook_pre_yield.py --host <agy、codex或claude> --store <本任务绝对flow.json> --role <orchestrator或architect> --conversation <负责会话真实ID>`。缺少会话绑定不会启用拦截；不扫描固定产品路径，不拦其他执行或审阅会话。局部负责人只检查承接范围；等待外部依赖时先交回全局编排，不能声称存在未登记的后台进程。
 
+Stop 调用完整 `pre_yield` 的超时为 10 秒。`Workflow pre_yield unavailable` 表示检查未完成，原因会直接附在 hook 的 reason 和 stderr 中（超时、子进程错误或无效返回），不能据此认定角色越权或审计通过；配置了编排者审计时仍阻断。状态计算只在单次只读查询内复用检查结果，后续查询重新核对台账与证据，不用延长超时或放行异常来掩盖慢查询。
+
 AGY [Stop 协议](https://www.antigravity.google/docs/hooks)继续用 `decision=continue`，Codex [Stop 协议](https://learn.chatgpt.com/docs/hooks?surface=cli)与 Claude Code Stop hook 继续用 `decision=block`。宿主在 hook 已拦截过一次后再次请求结束（`stop_hook_active=true`）且台账 revision 与处置均未变化时，脚本放行并在 stderr 说明，避免无进展的反复拦截；有新登记后恢复正常拦截。配置时用真实绑定的 READY 任务验证拦截，用其他会话、完成/等待及明确停止验证放行，再启用；不覆盖无关全局配置。用户停止、宿主终止、预算限制优先。自然语言暂停不能依赖某宿主未提供的 lastUserInput 字段；先解除本会话 hook 绑定或由宿主适配器明确传递停止状态。文件存在不代表已接入；不支持拦截时说明限制并主动检查。

@@ -31,7 +31,7 @@ def main():
     if agent_cli.run(profile, call) != 0:
         raise ValueError('fresh call failed; preserve raw evidence at '+str(root))
     first = agent_cli.collect(call.run_dir)
-    if not agent_cli.uuid_session(first['conversation_id']) or nonce not in first['response']:
+    if not agent_cli.native_session(args.backend, first['conversation_id']) or nonce not in first['response']:
         raise ValueError('fresh call did not return a native ID and expected marker')
     call.conversation = first['conversation_id']
     call.resume_from = call.run_dir
@@ -47,7 +47,7 @@ def main():
     report = dict(event='LIVE_ACCEPTANCE_PASSED', backend=args.backend, root=str(root), model=args.model,
                   effort=args.effort, conversation_id=first['conversation_id'],
                   same_session=True, retained_previous_marker=True,
-                  limit='Two real CLI calls with read access requested; not a product-task acceptance. AGY accept-edits with write_file deny / Claude default mode without edit tools is not OS read-only isolation.')
+                  limit='Two real CLI calls with read access requested; not a product-task acceptance. AGY/Claude/OpenCode edit-tool restrictions are not OS read-only isolation.')
     agent_cli.save(root/'report.json', report)
     print(json.dumps(report), flush=True)
 

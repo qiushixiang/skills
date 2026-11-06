@@ -16,6 +16,43 @@ import tempfile
 import importlib.util
 import uuid
 import shlex
+from contextvars import ContextVar
+from functools import wraps
+
+_status_cache = ContextVar('batch_flow_status_cache', default=None)
+
+
+def status_query(function):
+    """Reuse checks only within one read-only status evaluation."""
+    @wraps(function)
+    def wrapped(s, *args, **kwargs):
+        token = _status_cache.set((s, {}))
+        try:
+            return function(s, *args, **kwargs)
+        finally:
+            _status_cache.reset(token)
+    return wrapped
+
+
+def cached_status_check(function):
+    @wraps(function)
+    def wrapped(s, *args, **kwargs):
+        scope = _status_cache.get()
+        if scope is None or scope[0] is not s:
+            return function(s, *args, **kwargs)
+        # Preserve the recursion path: a cycle encountered on one path must
+        # not invalidate (or approve) a different path through the graph.
+        def frozen(arg):
+            return (
+            frozenset(arg) if isinstance(arg, set) else
+            ('object', id(arg)) if isinstance(arg, dict) else arg)
+        key = (function.__name__, tuple(map(frozen, args)),
+               tuple((name, frozen(value)) for name, value in sorted(kwargs.items())))
+        cache = scope[1]
+        if key not in cache:
+            cache[key] = function(s, *args, **kwargs)
+        return cache[key]
+    return wrapped
 
 _tracking_spec = importlib.util.spec_from_file_location("workflow_metrics", Path(__file__).with_name("workflow_metrics.py"))
 tracking = importlib.util.module_from_spec(_tracking_spec)
@@ -37,6 +74,49 @@ OP_ROLES = {
     'set_user_mode': {'orchestrator'},
     'register_dispatch': {'orchestrator', 'architect'},
 }
+
+# One field contract for operation JSON, CLI adapters and machine-readable help.
+OP_FIELDS = {
+    'init': ('plan simulation context task_mode', 'design'),
+    'observe': ('', ''),
+    'authorize': ('batches evidence', ''),
+    'set_user_mode': ('mode user_evidence', 'authorization'),
+    'register_dispatch': ('attempt handle evidence', 'timer_kind timer_handle timer_ticket timer_id owner_conversation_id due_at'),
+    'set_models': ('roles backups reason user_evidence', ''),
+    'plan_update': ('plan decision_id', 'context design'),
+    'design_refresh': ('version reason context', ''),
+    'change_subject': ('subject version evidence', ''),
+    'start': ('task call', 'retry_of replacement_reason closes ended_at started_at triggers call_id continuation_of'),
+    'history': ('task call result evidence source', 'retry_of replacement_reason closes ended_at started_at triggers call_id continuation_of'),
+    'classify_attempt': ('attempt kind work_performed reason evidence', 'decision_id context source_attempt'),
+    'resume_attempt': ('attempt reason evidence', 'context'),
+    'finish': ('attempt result evidence', 'closes ended_at call subject_versions timing cause call_id'),
+    'signal': ('id signal reason blocks evidence', 'decision_point source_key'),
+    'decision_start': ('id call', 'replacement_reason evidence'),
+    'resolve': ('id summary requirements evidence user_evidence', 'context timing call_id clarification'),
+    'supersede_decision': ('id replacement reason evidence context', ''),
+    'repin_requirement': ('id requirement versions evidence', 'context reason'),
+    'decision_progress': ('id status evidence', 'requirement budget_approval'),
+    'feedback': ('attempt summary evidence', ''),
+}
+
+
+def operation_schema(kind):
+    require(kind in OP_FIELDS, 'unknown operation: ' + str(kind))
+    required, optional = (part.split() for part in OP_FIELDS[kind])
+    notes = 'evidence' in required + optional
+    return dict(required=required, optional=optional + (['note'] if notes else []),
+                note_to_evidence=notes, roles=sorted(OP_ROLES[kind]))
+
+
+def validate_operation_data(kind, data):
+    schema = operation_schema(kind)
+    required = schema['required']
+    # A note is an evidence record in every input form, as --note always was.
+    if isinstance(data, dict) and 'note' in data and schema['note_to_evidence']:
+        string(data['note'], kind + '.note')
+        required = [field for field in required if field != 'evidence']
+    obj(data, required, schema['optional'] + (['evidence'] if schema['note_to_evidence'] else []), label=kind + '.data')
 
 class FlowError(ValueError):
     pass
@@ -292,7 +372,7 @@ def validate_context(c):
 def tool_family(tool):
     tool=str(tool or '')
     if tool in {'claude-agent','claude-code'} or tool.startswith('claude-agent:'): return 'claude-agent'
-    return {'agy-cli':'agy','codex-cli':'codex'}.get(tool,tool)
+    return {'agy-cli':'agy','codex-cli':'codex','opencode-cli':'opencode'}.get(tool,tool)
 
 
 def same_backend(config, prior_tool):
@@ -309,6 +389,9 @@ def same_backend(config, prior_tool):
 def cli_context_resumable(config, cid):
     if not cid or cid.startswith('pending:'):
         return False
+    if tool_family(config.get('tool')) == 'opencode':
+        from agent_cli import native_session
+        return native_session('opencode', cid)
     if config.get('tool') not in {'codex','codex-cli'}:
         return True
     try:
@@ -520,6 +603,7 @@ def unassigned_models(s):
     return {'roles': roles, 'backups': backups}
 
 
+@cached_status_check
 def success(s, tid, seen=None):
     seen = set() if seen is None else set(seen)
     if tid in seen:
@@ -542,6 +626,7 @@ def success(s, tid, seen=None):
                      for cid, ct in s['plan']['tasks'].items() if (ca := latest(s, cid)))
     return direct and all(success(s, dep, seen) for dep in t['depends_on'])
 
+@cached_status_check
 def requirement_ok(s, r):
     if r['kind'] == 'task':
         return success(s, r['target']) and all(s['plan']['subjects'].get(k) == v for k, v in r['versions'].items())
@@ -613,9 +698,11 @@ def budget_authorization_sources(s, decision, change):
             if not any(key in scope.get('tasks',{}).get(tid,{}) and scope['tasks'][tid][key]==value for _,scope in approvals):return []
     return [rid for rid,_ in approvals]
 
+@cached_status_check
 def decision_closed(s, d):
     return d['status'] == 'closed' and bool(d['resolution']) and all(requirement_ok(s, r) for r in d['resolution']['requirements'])
 
+@cached_status_check
 def blockers(s, tid):
     return [d['id'] for d in s['decisions'].values() if tid in d['blocks'] and not decision_closed(s, d)]
 
@@ -729,6 +816,7 @@ def decision_owner(decision):
         return 'architect'
     return decision['owner']
 
+@status_query
 def status(s, at=None):
     validate_store(s)
     current_time = timestamp(at or now()); actions = []; task_states = {}; repairs = repairs_pending(s)
@@ -877,7 +965,7 @@ def status(s, at=None):
             guidance=('移交局部技术负责人，由其按职责实际处理或派发并回收。' if delegated else '按指定角色、调用配置及上下文真实派发，回收原始交付后机械登记。') + '编排者不得自行实现、修复、验证、审阅或作技术裁决；不得仅切换 --actor 冒充责任人。角色不可用时报告缺项，不自行接管。'
         item['orchestrator_action']={'mode':mode,'instruction':guidance}
         backend={'agy':'agy','agy-cli':'agy','codex':'codex','codex-cli':'codex',
-                 'claude':'claude','claude-cli':'claude'}.get(config.get('tool'))
+                 'claude':'claude','claude-cli':'claude','opencode':'opencode','opencode-cli':'opencode'}.get(config.get('tool'))
         if backend and mode in {'dispatch','delegate_to_lead'}:
             item['cli_adapter']={'backend':backend,'tool':config.get('tool'),
                 'entrypoint':str(Path(__file__).resolve().parent / 'agent_cli.py'),
@@ -1129,8 +1217,9 @@ def check_requirements(s, rr):
 def operate(s, op, actor, root, at):
     obj(op, ['type', 'data']); kind = op['type']; d = op['data']
     require(kind in OP_ROLES and actor in OP_ROLES[kind], f'{actor} cannot perform {kind}')
+    validate_operation_data(kind, d)
     if kind == 'init':
-        obj(d, ['plan', 'simulation', 'context', 'task_mode'], ['design']); require(s is None, 'store already initialized')
+        require(s is None, 'store already initialized')
         validate_plan(d['plan'],enforce_review_budget=True); boolean(d['simulation'], 'simulation')
         validate_context(d['context'])
         require(not d['context']['conversation_id'].startswith('pending:'), 'initial author context must be an actual conversation')
@@ -1143,9 +1232,9 @@ def operate(s, op, actor, root, at):
         return result
     require(s is not None, 'initialize first')
     if kind == 'observe':
-        obj(d, [])
+        pass
     elif kind == 'authorize':
-        obj(d, ['batches', 'evidence']); strings(d['batches'], 'authorize batches')
+        strings(d['batches'], 'authorize batches')
         require(set(d['batches']) <= s['plan']['batches'].keys(), 'unknown authorization scope')
         if actor=='architect':
             affected={tid for tid,t in s['plan']['tasks'].items() if set(t['scope']) & set(d['batches']) and not t.get('retired')}
@@ -1158,14 +1247,12 @@ def operate(s, op, actor, root, at):
             s['state']['authorization_evidence'] = hashes
             s['state']['authorized_batches'] = list(d['batches'])
     elif kind == 'set_user_mode':
-        obj(d,['mode','user_evidence'],['authorization'])
         require(d['mode'] in {'present','away'}, 'user mode must be present or away')
         if d['mode']=='away': string(d.get('authorization'),'away authorization')
         else: require(not d.get('authorization'), 'present mode cannot grant away authorization')
         s['state']['user_mode']=dict(mode=d['mode'],authorization=d.get('authorization') if d['mode']=='away' else None,
             user_evidence=evidence(d['user_evidence'],root),actor=actor,at=at)
     elif kind == 'register_dispatch':
-        obj(d,['attempt','handle','evidence'],['timer_kind','timer_handle','timer_ticket','timer_id','owner_conversation_id','due_at'])
         a=next((x for x in s['state']['attempts'] if x['id']==d['attempt']),None)
         require(not a or tracking.accounting_kind(s,a)!='withdrawn','withdrawn start cannot be dispatched')
         require(a and not a.get('result'),'dispatch receipt requires a running attempt')
@@ -1196,7 +1283,6 @@ def operate(s, op, actor, root, at):
         if timer_kind=='script': require(str(ticket_path.resolve()) not in hashes,'use immutable host acknowledgement evidence, not the mutable timer ticket')
         a['dispatch']=dict(handle=d['handle'],evidence=hashes,at=at,**timer)
     elif kind == 'set_models':
-        obj(d, ['roles', 'backups', 'reason', 'user_evidence'])
         require(isinstance(d['roles'],dict) and isinstance(d['backups'],dict) and (d['roles'] or d['backups']), 'provide explicit role or backup model updates')
         string(d['reason'],'model update reason')
         user_hashes=evidence(d['user_evidence'],root)
@@ -1238,7 +1324,7 @@ def operate(s, op, actor, root, at):
             plan_version=s['plan_version'],decision_id=None,context=None,reason=d['reason'],
             user_evidence=user_hashes,before_hash=before_hash,after_hash=digest(s['plan'])))
     elif kind == 'plan_update':
-        obj(d, ['plan', 'decision_id'], ['context', 'design']); validate_plan(d['plan'],enforce_review_budget=False)
+        validate_plan(d['plan'],enforce_review_budget=False)
         coverage=active_review_budget_coverage(s,d['plan'])
         require(coverage['ok'],'review budget coverage: '+json.dumps(coverage['errors'],ensure_ascii=False))
         require('design' not in s or 'design' in d, 'linked plan update requires matching design link')
@@ -1279,7 +1365,6 @@ def operate(s, op, actor, root, at):
         if 'design' in d and s.get('task_mode') == 'local': s['task_mode']='batched'
         s['state'].setdefault('plan_changes', []).append({'plan_version':s['plan_version'],'decision_id':d['decision_id'],'context':copy.deepcopy(d.get('context')),'before_hash':before_hash,'after_hash':digest(s['plan']),'budget_authorization_sources':approval_sources})
     elif kind == 'design_refresh':
-        obj(d,['version','reason','context'])
         require('design' in s,'no linked design to refresh')
         string(d['reason'],'design correction reason');check_arch_context(s,d['context'])
         old=s['design']
@@ -1287,15 +1372,13 @@ def operate(s, op, actor, root, at):
         s['design']=link
         s['state'].setdefault('design_corrections',[]).append(dict(plan_version=s['plan_version'],before_hash=old['sha256'],after_hash=link['sha256'],reason=d['reason'],context=copy.deepcopy(d['context']),at=at))
     elif kind == 'change_subject':
-        obj(d, ['subject', 'version', 'evidence']); require(d['subject'] in s['plan']['subjects'], 'unknown subject')
+        require(d['subject'] in s['plan']['subjects'], 'unknown subject')
         string(d['version'], 'new version'); evidence(d['evidence'], root)
         old = s['plan']['subjects'][d['subject']]
         require(d['version'] != old, 'new version equals current')
         require(not any(a['subjects'].get(d['subject']) == d['version'] for a in s['state']['attempts']), 'cannot recycle historical subject version')
         s['plan']['subjects'][d['subject']] = d['version']
     elif kind in {'start', 'history'}:
-        required = ['task', 'call'] + (['result', 'evidence', 'source'] if kind == 'history' else [])
-        obj(d, required, ['retry_of', 'replacement_reason', 'closes', 'ended_at', 'started_at', 'triggers', 'call_id', 'continuation_of'])
         tid = d['task']; require(tid in s['plan']['tasks'], 'unknown task')
         t = s['plan']['tasks'][tid]; call = d['call']
         if kind == 'start':
@@ -1308,7 +1391,7 @@ def operate(s, op, actor, root, at):
         require(all(call[k] == config[k] for k in ['tool','model','effort']), 'call role/tool/model/effort mismatch')
         aa = attempts(s, tid); prev = latest(s, tid)
         if kind=='start':
-            require(call['conversation_id'].startswith('pending:') or cli_context_resumable(call,call['conversation_id']), 'Codex call requires pending or a native UUID, not a logical context name')
+            require(call['conversation_id'].startswith('pending:') or cli_context_resumable(call,call['conversation_id']), 'CLI call requires pending or a native session ID (Codex UUID / OpenCode ses_), not a logical context name')
             check_task_context(s,tid,call['conversation_id'])
         if kind == 'history':
             require(s['simulation'], 'history replay is simulation-only; production migration must be explicitly designed')
@@ -1372,7 +1455,6 @@ def operate(s, op, actor, root, at):
         if kind == 'history':
             finish(s, {'attempt': a['id'], 'result': d['result'], 'evidence': d['evidence'], 'closes': d.get('closes', []), 'ended_at': d.get('ended_at', at)}, responsible, root, at)
     elif kind == 'classify_attempt':
-        obj(d, ['attempt', 'kind', 'work_performed', 'reason', 'evidence'], ['decision_id', 'context', 'source_attempt'])
         a = next((x for x in s['state']['attempts'] if x['id'] == d['attempt']), None)
         require(a and (a.get('result') or d['kind']=='withdrawn'), 'classification requires a finished attempt')
         require(not any(r['attempt'] == a['id'] for r in s['state'].get('attempt_accounting', [])), 'attempt already classified')
@@ -1407,7 +1489,6 @@ def operate(s, op, actor, root, at):
         record.update(actor=actor, at=at, revision=s['revision']+1, evidence_hashes=evidence(d['evidence'],root))
         s['state'].setdefault('attempt_accounting', []).append(record)
     elif kind == 'resume_attempt':
-        obj(d, ['attempt', 'reason', 'evidence'], ['context'])
         a = next((x for x in s['state']['attempts'] if x['id'] == d['attempt']), None)
         require(a and a == latest(s,a['task']) and a.get('result') and awaiting_resumption(s,a), 'resume requires the latest environment failure or decision pause')
         require(not resumption(s,a), 'attempt already has a valid resumption permit')
@@ -1428,7 +1509,6 @@ def operate(s, op, actor, root, at):
     elif kind == 'finish':
         finish(s, d, actor, root, at)
     elif kind == 'signal':
-        obj(d, ['id', 'signal', 'reason', 'blocks', 'evidence'], ['decision_point', 'source_key'])
         require(d['id'] not in s['decisions'], 'duplicate decision id')
         string(d['id'], 'decision id'); string(d['signal'], 'signal'); string(d['reason'], 'reason')
         strings(d['blocks'], 'blocks'); require(set(d['blocks']) <= s['plan']['tasks'].keys(), 'unknown blocked task')
@@ -1441,13 +1521,12 @@ def operate(s, op, actor, root, at):
         owner=decision_owner(dict(d,owner=point['owner'] if point else 'architect'))
         s['decisions'][d['id']] = dict(d, owner=owner, reported_by=actor, status='pending', resolution=None, reported_at=at, reported_plan_version=s['plan_version'], reported_subjects=copy.deepcopy(s['plan']['subjects']), evidence_hashes=evidence(d['evidence'],root))
     elif kind == 'decision_start':
-        obj(d, ['id', 'call'], ['replacement_reason','evidence'])
         dec = s['decisions'].get(d['id'])
         require(dec and dec['status']=='pending', 'decision not pending')
         obj(d['call'], ['tool','model','effort','conversation_id'])
         for key,value in d['call'].items(): string(value, 'decision.call.'+key)
         require(all(d['call'][k] == s['plan']['roles']['architect'][k] for k in ['tool','model','effort']), 'decision call configuration mismatch')
-        require(d['call']['conversation_id'].startswith('pending:') or cli_context_resumable(d['call'],d['call']['conversation_id']), 'Codex decision context must be pending or a native UUID, not a logical name')
+        require(d['call']['conversation_id'].startswith('pending:') or cli_context_resumable(d['call'],d['call']['conversation_id']), 'CLI decision context must be pending or a native session ID (Codex UUID / OpenCode ses_), not a logical name')
         check_arch_context(s, {'conversation_id':d['call']['conversation_id'],'mode':'fresh','reason':'decision handling'})
         check_decision_group(s,d['id'],d['call']['conversation_id'])
         if dec.get('handling'):
@@ -1460,7 +1539,6 @@ def operate(s, op, actor, root, at):
             require(not {'replacement_reason','evidence'} & d.keys(), 'replacement fields require legacy handling')
         dec['handling'] = {'started_at':at, 'call':copy.deepcopy(d['call'])}
     elif kind == 'resolve':
-        obj(d, ['id', 'summary', 'requirements', 'evidence', 'user_evidence'], ['context','timing','call_id','clarification'])
         if 'context' in d:
             check_arch_context(s,d['context'])
             require(cli_context_resumable(s['plan']['roles']['architect'],d['context']['conversation_id']), 'decision result requires a real native context, not a logical name or pending ID')
@@ -1498,7 +1576,6 @@ def operate(s, op, actor, root, at):
         if clarification:
             dec.update(status='closed', applied_at=at, closed_at=at)
     elif kind == 'supersede_decision':
-        obj(d, ['id', 'replacement', 'reason', 'evidence', 'context'])
         check_arch_context(s, d['context']); string(d['reason'], 'supersession reason')
         old = s['decisions'].get(d['id']); new = s['decisions'].get(d['replacement'])
         require(old and old.get('resolution') and old['status'] != 'superseded' and not decision_closed(s, old),
@@ -1521,7 +1598,6 @@ def operate(s, op, actor, root, at):
                                    context=copy.deepcopy(d['context']), actor=actor, at=at, revision=s['revision']+1)
         old['status'] = 'superseded'
     elif kind == 'repin_requirement':
-        obj(d, ['id', 'requirement', 'versions', 'evidence'], ['context', 'reason'])
         string(d['id'], 'decision id'); string(d['requirement'], 'requirement id')
         require('context' in d or 'reason' in d, 'repin requires context or reason')
         if 'context' in d: check_arch_context(s, d['context'])
@@ -1543,7 +1619,6 @@ def operate(s, op, actor, root, at):
             if key in d: audit[key] = copy.deepcopy(d[key])
         dec.setdefault('requirement_repins', []).append(audit)
     elif kind == 'decision_progress':
-        obj(d, ['id', 'status', 'evidence'], ['requirement','budget_approval'])
         dec = s['decisions'].get(d['id']); require(dec and dec['resolution'], 'decision has no resolution')
         require(dec['status'] != 'superseded', 'superseded decision cannot confirm or close recovery conditions')
         if actor=='architect':
@@ -1587,7 +1662,7 @@ def operate(s, op, actor, root, at):
             dec['status'] = d['status']
             dec[d['status']+'_at'] = at
     elif kind == 'feedback':
-        obj(d, ['attempt', 'summary', 'evidence']); string(d['summary'], 'feedback summary')
+        string(d['summary'], 'feedback summary')
         require(any(a['id']==d['attempt'] for a in s['state']['attempts']), 'unknown feedback attempt')
         s['state']['feedback'][d['attempt']] = {'at': at,'summary':d['summary'],'evidence':evidence(d['evidence'],root)}
     return s
@@ -1601,7 +1676,8 @@ def checked_timing(timing, registered_start, registered_end, root):
 
 
 def finish(s, d, actor, root, at):
-    obj(d, ['attempt', 'result', 'evidence'], ['closes', 'ended_at', 'call', 'subject_versions', 'timing', 'cause', 'call_id'])
+    schema = operation_schema('finish')
+    obj(d, schema['required'], [key for key in schema['optional'] if key != 'note'])
     a = next((x for x in s['state']['attempts'] if x['id'] == d['attempt']), None)
     require(a is not None and a['result'] is None, 'attempt missing or already finished')
     require(tracking.accounting_kind(s,a)!='withdrawn','withdrawn start cannot be finished as a technical call')
@@ -1642,7 +1718,33 @@ def finish(s, d, actor, root, at):
     a.update(result=d['result'], ended_at=ended, evidence=evidence(d['evidence'], root), closes=closes)
 
 
+def normalize_operation(op, actor, root, created):
+    obj(op, ['type', 'data'])
+    kind = op['type']
+    require(kind in OP_ROLES and actor in OP_ROLES[kind], f'{actor} cannot perform {kind}')
+    validate_operation_data(kind, op['data'])
+    normalized = copy.deepcopy(op)
+    data = normalized['data']
+    if 'note' in data:
+        strings(data.get('evidence', []), kind + '.evidence')
+        record = save_record(root, {'note': data.pop('note')})
+        created.append(Path(record))
+        data.setdefault('evidence', []).append(record)
+    return normalized
+
+
 def apply_request(s, request, root):
+    created = []
+    try:
+        return _apply_request(s, request, root, created)
+    except Exception:
+        # Only remove annotation files created by this failed transaction.
+        for path in created:
+            path.unlink(missing_ok=True)
+        raise
+
+
+def _apply_request(s, request, root, created):
     obj(request, ['request_id', 'expected_revision', 'actor', 'operations'], ['at'])
     string(request['request_id'], 'request_id'); integer(request['expected_revision'], 'expected_revision')
     require(request['actor'] in ROLES, 'unknown actor')
@@ -1660,13 +1762,19 @@ def apply_request(s, request, root):
         require('at' not in request and not any('started_at' in op.get('data', {}) or 'ended_at' in op.get('data', {}) for op in request['operations']), 'backdated timestamps are simulation-only')
     draft = copy.deepcopy(s)
     if draft: tracking.observe(draft, status(draft, at), at)
+    normalized_operations = []
     for op in request['operations']:
-        draft = operate(draft, op, request['actor'], root, at)
+        normalized = normalize_operation(op, request['actor'], root, created)
+        normalized_operations.append(normalized)
+        draft = operate(draft, normalized, request['actor'], root, at)
         tracking.observe(draft, status(draft, at), at)
     validate_store(draft)
     require(draft['simulation'] or 'at' not in request, 'backdated timestamps are simulation-only')
     draft['revision'] += 1
-    draft['history'].append({'revision':draft['revision'], 'request_id':request['request_id'], 'request_hash':fingerprint, 'actor':request['actor'], 'at':at, 'operations':copy.deepcopy(request['operations']), 'previous_store_hash':digest(s) if s else None})
+    entry = {'revision':draft['revision'], 'request_id':request['request_id'], 'request_hash':fingerprint, 'actor':request['actor'], 'at':at, 'operations':normalized_operations, 'previous_store_hash':digest(s) if s else None}
+    if normalized_operations != request['operations']:
+        entry['submitted_operations'] = copy.deepcopy(request['operations'])
+    draft['history'].append(entry)
     return draft, True
 
 
@@ -1721,7 +1829,7 @@ def shortcut(args, root, s=None):
     if args.data:
         data = json.loads(sys.stdin.read() if args.data == '-' else Path(args.data[1:]).read_text() if args.data.startswith('@') else args.data)
         require(isinstance(data, dict), '--data must contain an operation parameter object')
-    for key in ['attempt', 'task', 'result', 'id', 'signal', 'reason', 'summary']:
+    for key in ['attempt', 'task', 'result', 'id', 'signal', 'reason', 'summary', 'note']:
         value = getattr(args, key)
         if value is not None:
             require(key not in data, 'duplicate parameter: ' + key)
@@ -1731,18 +1839,23 @@ def shortcut(args, root, s=None):
         data['blocks'] = args.blocks
     if args.evidence:
         data.setdefault('evidence', []).extend(args.evidence)
-    if args.note is not None:
-        data.setdefault('evidence', []).append(save_record(root, {'note': args.note}))
     if args.git_ref:
         require(args.repo is not None, '--git-ref requires --repo')
         repo = args.repo.resolve()
         commit = subprocess.run(['git', '-C', str(repo), 'rev-parse', '--verify', '--end-of-options', args.git_ref + '^{commit}'], capture_output=True, text=True)
         require(commit.returncode == 0, 'cannot resolve Git commit: ' + commit.stderr.strip())
         data.setdefault('evidence', []).append(save_record(root, {'repository': str(repo), 'commit': commit.stdout.strip()}))
-    if args.command == 'start':
-        require(all([args.tool, args.model, args.effort, args.conversation]), 'start requires actual --tool --model --effort --conversation')
-        require('call' not in data, 'use start flags for call, not --data.call')
-        data['call'] = dict(tool=args.tool, model=args.model, effort=args.effort, conversation_id=args.conversation)
+    schema = operation_schema('decision_progress' if args.command == 'close' else args.command)
+    call_flags = [getattr(args, field, None) for field in ('tool', 'model', 'effort')]
+    if 'call' in schema['required'] + schema['optional']:
+        call_flags.append(args.conversation)
+        if any(value is not None for value in call_flags):
+            require('call' not in data, 'duplicate parameter: call (JSON call and CLI call flags)')
+            require(all(call_flags), 'call flags require --tool --model --effort --conversation together')
+            data['call'] = dict(tool=args.tool, model=args.model, effort=args.effort, conversation_id=args.conversation)
+    else:
+        require(all(value is None for value in call_flags), args.command + ' does not accept call flags')
+        require(args.conversation is None or args.command == 'resolve', args.command + ' does not accept --conversation')
     command = args.command
     if command == 'resolve':
         data.setdefault('user_evidence', [])
@@ -1787,7 +1900,7 @@ def host_capabilities(store, environ=None):
             require(path.parent==runtime,'profile is outside the protected launch directory')
             if not path.is_file():continue
             profile=json.loads(path.read_text());backend=profile.get('backend')
-            require(profile.get('format')=='batch-flow-cli/v1' and backend in {'agy','codex','claude'},'invalid launcher CLI profile')
+            require(profile.get('format')=='batch-flow-cli/v1' and backend in {'agy','codex','claude','opencode'},'invalid launcher CLI profile')
             require(backend not in profiles,'ambiguous launcher backend profile')
             profiles[backend]=dict(path=str(path),version=profile['version'],binary=profile['binary'])
         return dict(status='bound',host=host,launch_id=launch_id,workspace=spec['workspace'],conversation_id=owner['conversation_id'],
@@ -1829,15 +1942,18 @@ def attach_host_capabilities(result, store):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command',nargs='?',default='status',choices=['status','capabilities','pre_yield','apply','validate','render','observe','metrics','start','finish','signal','resolve','repin_requirement','supersede_decision','classify_attempt','resume_attempt','set_models','set_user_mode','register_dispatch','close','record','snapshot','authorize','change_subject','feedback','decision_progress','decision_start','init','plan_update','design_refresh'])
+    commands = set(OP_FIELDS) | {'status','schema','capabilities','pre_yield','apply','validate','render','metrics','close','record','snapshot'}
+    parser.add_argument('command',nargs='?',default='status',choices=sorted(commands))
+    parser.add_argument('--operation', choices=sorted(OP_FIELDS), help='schema: show the shared operation data contract')
     parser.add_argument('--store',type=Path)
     parser.add_argument('--request',type=Path)
     parser.add_argument('--revision', type=int)
     parser.add_argument('--request-id')
     parser.add_argument('--actor', choices=sorted(ROLES))
     parser.add_argument('--data', help='operation parameters as JSON, @file, or - for stdin; no request envelope')
-    for flag in ['attempt', 'task', 'id', 'signal', 'reason', 'summary', 'note', 'tool', 'model', 'effort', 'conversation']:
+    for flag in ['attempt', 'task', 'id', 'signal', 'reason', 'summary', 'tool', 'model', 'effort', 'conversation']:
         parser.add_argument('--' + flag)
+    parser.add_argument('--note', help='same as data.note; save explanation as evidence for operations that accept evidence')
     parser.add_argument('--result', choices=sorted(RESULTS))
     parser.add_argument('--evidence', action='append', default=[])
     parser.add_argument('--blocks', nargs='*')
@@ -1857,6 +1973,15 @@ def main():
         split = argv.index('--'); child = argv[split+1:]; argv = argv[:split]
     args=parser.parse_args(argv);path=(args.store or locate()).resolve()
     try:
+        if args.command == 'schema':
+            require(not child, 'schema does not run child commands')
+            kinds = [args.operation] if args.operation else sorted(OP_FIELDS)
+            print(json.dumps({'ok':True, 'operations':{kind:operation_schema(kind) for kind in kinds},
+                              'inputs':['CLI options', '--data JSON/@file/stdin', 'apply operations[].data'],
+                              'note':'note and --note use the same normalization into evidence; duplicate values are rejected'},
+                             ensure_ascii=False, indent=2))
+            return 0
+        require(args.operation is None, '--operation is only for schema')
         if args.command=='capabilities':
             result=host_capabilities(path)
             print(json.dumps(result,ensure_ascii=False,indent=2))

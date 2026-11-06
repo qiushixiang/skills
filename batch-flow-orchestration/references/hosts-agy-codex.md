@@ -30,7 +30,7 @@ python3 <技能目录>/scripts/start_agy_orchestrator.py --workspace <源码项�
 - run_command 只允许绝对 Python 路径调用固定 dispatch_card.py next/show（绑定本次 store）及 flow.py/progress_timer.py/agent_cli.py，使用规范 shell 引用；不支持 shell 拼接、解释器任意代码、record/snapshot、参数缩写、复用终端或修改权限配置。flow.py 必须显式绑定本次 store。CLI 角色进程只能用启动器核查并保护的 profile；不传任意 settings，不扩大项目目录范围。
 - 原生任务管理只查 list/status，不允许 send_input 注入别的终端；进度 schedule 只允许最多 600 秒的一次性计时。
 
-**编排者终端不使用沙箱**：按用户选择，启动器不传 --sandbox，在本次 --settings 显式设 enableTerminalSandbox=false、toolPermission=request-review；不改全局配置，不设置 always-proceed 或全局 command(*)。自定义主 agent 不再强制 commandExecutionPolicy=sandbox。所有命令在宿主执行前仍经 PreToolUse 精确核对固定脚本、受保护 profile 和参数范围；任意 shell、直接运行 agy/codex/claude、业务构建及编辑仍拒绝。不传 BypassSandbox，也不把代理配置或认证目录加入主会话文件工具白名单。已有权限审批仍适用。
+**编排者终端不使用沙箱**：按用户选择，启动器不传 --sandbox，在本次 --settings 显式设 enableTerminalSandbox=false、toolPermission=request-review；不改全局配置，不设置 always-proceed 或全局 command(*)。自定义主 agent 不再强制 commandExecutionPolicy=sandbox。所有命令在宿主执行前仍经 PreToolUse 精确核对固定脚本、受保护 profile 和参数范围；任意 shell、直接运行 agy/codex/claude/opencode、业务构建及编辑仍拒绝。不传 BypassSandbox，也不把代理配置或认证目录加入主会话文件工具白名单。已有权限审批仍适用。
 
 首次派发所需 CLI 前，先执行 `python3 <固定路径>/agent_cli.py check --profile <已核查profile>`（使用注入的绝对 Python 路径），保存原始输出，成功后再登记 start/decision_start。check 只运行 --version，不调用模型；不能据此声称认证、网络或代理任务已经验证。宿主启动前 probe 成功不证明另一个沙箱中可见；ENOENT 也可能来自未挂载或解释器不可见，不能直接报告用户未安装 CLI。各 CLI 使用自身认证、会话存储和网络；代理自身权限审批和 Codex 的 read-only/workspace-write 沙箱保持原配置。取消外层终端沙箱也会影响 AGY 原生子代理继承的终端执行环境，不能宣称子代理保留此前外层沙箱。主会话限制依赖宿主加载并执行 hooks，不构成 OS 层的身份隔离。官方配置依据：[终端沙箱](https://antigravity.google/docs/sandbox/?tab=cli)。
 
@@ -55,7 +55,7 @@ Stop 同时连接 pre_yield 和[角色审计](role-audit.md)，明确用户停�
 **编排方式与 Claude Code 相同**：编排者[只运行 next](roles/orchestrator.md#派发只用-next两宿主相同)。本宿主两种调用形态，由角色 tool 决定：
 
 - `agy-native`：AGY 原生子代理。next 先给出固定的 define_subagent（本启动器每类角色一次），再给 invoke_subagent（Role 为卡 ID，Prompt 指向派发卡）。角色 model 写 `inherit` 或与编排者相同时不传 Model（继承主会话模型）；写其他值时原样作为 Model 传入，实际模型仍以 children.jsonl 的宿主元数据核对。原生接口没有 effort 参数，继承主会话。启动器在 decisions.jsonl 记下每次调用的 Role/Name，next 据此判断是否已派发；子代理交付到达后，编排者按 next 的 todo 用 write_to_file 把最终报告原文写到卡目录 result.md，下一次 next 回收登记。原生子代理不续接旧上下文。
-- agy/codex/claude-cli：`run_command` 运行卡中的 `agent_cli.py run`，next 以 `run/exit.json` 回收，进程仍在则等待（AGY 宿主内裸 claude 视为 claude-cli）。
+- agy/codex/claude-cli/opencode：`run_command` 运行卡中的 `agent_cli.py run`，next 以 `run/exit.json` 回收，进程仍在则等待（AGY 宿主内裸 claude 视为 claude-cli）。
 
 Claude 子代理类配置（claude-agent）在 AGY 下报错，不静默替换；反过来 Claude 宿主遇到 agy-native 时按 AGY CLI 派发。台账锁与 Claude 启动器共用，中断后直接重新启动。
 

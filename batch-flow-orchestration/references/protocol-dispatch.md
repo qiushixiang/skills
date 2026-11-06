@@ -60,6 +60,10 @@ result 允许 VERIFIED/RELEASE/FIX_REQUIRED/WAIT_EVIDENCE/ARCH_DECISION_REQUIRED
 
 以下<REV>来自刚核对的status，不自动取最新值或重试写入。--note仅存一次必要交付/技术意见，不能冒充命令输出。--evidence可重复，路径规则与apply相同。
 
+所有操作字段由脚本中的统一定义校验，可运行 `python3 <技能目录>/scripts/flow.py schema --operation finish` 查询单项，或 `schema` 查询全部操作，无需台账。CLI 快捷选项、`--data` 和 `apply operations[].data` 共用这一字段定义与归一化流程；`note` 是接受 `evidence` 的操作的可选说明字段，`--note` 是同一字段的快捷写法。两者均将文本保存为证据文件并追加到 `evidence`，不替代原始构建/测试证据或 `user_evidence` 授权。重复提供同一字段会拒绝；未知字段仍拒绝。
+
+例如 `finish --data @finish.data.json` 可直接接收 `{"attempt":"A0001","result":"VERIFIED","evidence":["<原始证据文件>"],"note":"AC结果与限制"}`。原提交参数与归一化参数均保留在台账历史中；同一 request_id 的同一请求重放不重复生成说明文件，失败事务清理本次新建的说明文件。
+
 ```text
 python3 <技能目录>/scripts/flow.py start --revision <REV> --task B01.E --tool <实际工具> --model <实际模型> --effort <实际effort> --conversation <会话ID>
 python3 <技能目录>/scripts/flow.py record --cwd <源码目录> -- <验证程序> <参数>
@@ -70,7 +74,7 @@ python3 <技能目录>/scripts/flow.py resolve --revision <REV> --id DEC-01 --su
 python3 <技能目录>/scripts/flow.py close --revision <REV> --id DEC-01 --evidence <恢复结果依据>
 ```
 
-resolve普通恢复、finish.subject_versions/call、init、plan_update、authorize、change_subject、feedback、decision_start、decision_progress等使用--data传本操作参数（JSON、@文件或-从stdin读），--actor指定实际职责。无需request_id/expected_revision/operations信封；仍须--revision和实际参数。--data与同名快捷参数不得重复；evidence可以追加。start的实际call通过必需的四个快捷参数提供，脚本不把计划模型冒充实际调用配置。
+resolve普通恢复、finish.subject_versions/call、init、plan_update、authorize、change_subject、feedback、decision_start、decision_progress等使用--data传本操作参数（JSON、@文件或-从stdin读），--actor指定实际职责。无需request_id/expected_revision/operations信封；仍须--revision和实际参数。--data与同名快捷参数不得重复；evidence可以追加。start 的实际 call 可由 JSON 提供，也可由 --tool/--model/--effort/--conversation 四个快捷参数完整提供，两种方式不能混用；脚本不把计划模型冒充实际调用配置。
 
 ```text
 python3 <技能目录>/scripts/flow.py resolve --revision <REV> --conversation <架构会话ID> --data -
@@ -81,7 +85,7 @@ python3 <技能目录>/scripts/flow.py change_subject --revision <REV> --actor e
 
 record、snapshot、`--repo/--git-ref` 的行为与证据路径规则见[证据记录与版本](engineering.md#证据记录与版本)。
 
-快捷命令复用apply，仍有职责/版本/CAS检查。revision冲突必须重新核查，不能盲升revision。apply保留原有请求幂等语义；--note/--git-ref每次生成新记录，快捷命令失败后不要假设原命令可原样幂等重发，应读取状态确认是否已生效。
+快捷命令复用apply，仍有职责/版本/CAS检查。revision冲突必须重新核查，不能盲升revision。apply保留原有请求幂等语义；带显式 request_id 的同一 note 请求可幂等重放。未指定 request_id 的快捷命令每次是新请求；--git-ref仍会生成新记录，失败后先读取状态确认是否已生效。
 
 ## 输出与限制
 
