@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Mechanical release and lead-originated questions on isolated ledgers."""
 import argparse
+import copy
 import json
 from pathlib import Path
 import unittest
@@ -67,6 +68,57 @@ class RoutingTests(unittest.TestCase):
         out=self.fixture.next()
         self.assertNotEqual(out['do'],'ask_user')
         self.assertIsNone(flow.latest(self.state(),'done'))
+
+    def test_same_orchestrator_session_releases_two_batches_atomically(self):
+        def mutate(p):
+            p['batches']['B2'] = dict(name='second batch', completion_task='done2')
+            p['subjects']['code2'] = 'v1'
+            p['tasks']['done2'] = dict(copy.deepcopy(p['tasks']['done']), scope=['B2'],
+                                      subjects=['code2'], depends_on=['done'])
+        self.fixture.build(mutate)
+        self.apply('orchestrator','authorize',dict(batches=['B','B2'],evidence=[self.proof]))
+        self.complete_dependencies()
+        out = self.fixture.next()
+        self.assertEqual(out['do'],'done',out)
+        self.assertEqual(out['registered'],['RELEASE done','RELEASE done2'])
+        s = self.state()
+        for tid in ['done','done2']:
+            attempts = flow.attempts(s,tid)
+            self.assertEqual(len(attempts),1)
+            self.assertEqual(attempts[0]['call']['conversation_id'],'s1')
+            self.assertEqual(attempts[0]['result'],'VERIFIED')
+            history = [h for h in s['history'] if any(op['type']=='start' and op['data']['task']==tid for op in h['operations'])]
+            self.assertEqual([op['type'] for op in history[0]['operations']],['start','finish'])
+        before = self.store.read_bytes()
+        self.assertEqual(self.fixture.next()['do'],'done')
+        self.assertEqual(self.store.read_bytes(),before)
+
+    def test_release_registration_failure_reports_script_error_without_user_choice(self):
+        self.complete_dependencies()
+        before = self.store.read_bytes()
+        with patch.object(dc,'run_flow',side_effect=dc.CardError('flow.py apply failed: registration rejected')):
+            out = dc.next_step(argparse.Namespace(store=str(self.store),runtime=str(self.fixture.runtime)))
+        self.assertEqual(out['do'],'report',out)
+        self.assertEqual(out['problems'][0]['category'],'mechanical_registration_failed')
+        self.assertIn('registration rejected',out['problems'][0]['registration'])
+        self.assertNotIn('items',out)
+        self.assertEqual(len(out['problems']),1)
+        self.assertIn('技能维护者',out['say'])
+        self.assertEqual(self.store.read_bytes(),before)
+
+    def test_non_mechanical_tasks_still_require_independent_context(self):
+        def mutate(p):
+            p['budgets']['extra_review'] = dict(limit=2)
+            p['tasks']['extra_review'] = dict(copy.deepcopy(p['tasks']['third']),
+                role='reviewer',kind='review',consumes=['extra_review'],session_policy='independent')
+            p['tasks']['extra_confirmation'] = dict(copy.deepcopy(p['tasks']['done']),kind='confirmation')
+        self.fixture.build(mutate)
+        self.complete_dependencies()
+        for tid, context in [('extra_review','regular-context'),('extra_confirmation','execute-context')]:
+            s = self.state()
+            role = s['plan']['tasks'][tid]['role']
+            with self.subTest(task=tid), self.assertRaisesRegex(flow.FlowError,'context'):
+                self.apply('orchestrator','start',dict(task=tid,call=dict(s['plan']['roles'][role],conversation_id=context)))
 
     def test_explicit_lead_user_condition_blocks_release_until_confirmed(self):
         self.complete_dependencies()

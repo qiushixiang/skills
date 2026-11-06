@@ -971,7 +971,7 @@ def register_coordinator_check(store, s, action):
 
 def complete_mechanical_release(store, s, action, spec):
     task = s['plan']['tasks'][action['target']]
-    need(task['kind'] == 'acceptance' and task['role'] == 'orchestrator', '不是编排者机械放行节点')
+    need(flow.mechanical_release(task), '不是编排者机械放行节点')
     need(all(flow.success(s, dep) for dep in task['depends_on']), '正式依赖未满足或证据已失效，不能机械放行')
     # Use existing formal conclusions. Do not interpret report prose, introduce
     # another technical review, or turn a milestone into a new user approval.
@@ -1112,7 +1112,12 @@ def next_step(args):
     try:
         report['registered'] = mechanical_registrations(store, spec)
     except (CardError, flow.FlowError) as error:
-        report['registered'] = []; report['problems'].append(dict(registration=str(error)))
+        report['registered'] = []
+        report['problems'].append(dict(category='mechanical_registration_failed', registration=str(error)))
+        # Do not reinterpret a script failure as an unresolved coordination or
+        # user decision, and do not issue a new dispatch after a failed transaction.
+        return dict({k:v for k,v in report.items() if v and k != 'pending'}, do='report',
+                    say='机械登记失败：把 problems 原样报告，由技能维护者修复；保留已有记录，不手工绕过、不新增用户放行请求。')
     base = {k: v for k, v in report.items() if v and k != 'pending'}
     s = load_json(store)
     supersede = []

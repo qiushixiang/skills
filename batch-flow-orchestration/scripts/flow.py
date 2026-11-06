@@ -505,6 +505,12 @@ def locally_owned(s, tasks):
     return bool(tasks) and all(s['plan']['tasks'][tid].get('dispatch_owner','orchestrator')=='architect' for tid in tasks)
 
 
+def mechanical_release(task):
+    """A formal orchestrator acceptance is bookkeeping, not a new agent context."""
+    return (task['kind'] == 'acceptance' and task['role'] == 'orchestrator'
+            and task.get('dispatch_owner', 'orchestrator') == 'orchestrator')
+
+
 def check_task_context(s, tid, cid, exclude=None):
     t=s['plan']['tasks'][tid]
     if cid.startswith('pending:'):
@@ -1426,9 +1432,9 @@ def operate(s, op, actor, root, at):
             require(offered.get('continuation_of') == continuation, 'use continuation_of proposed by status')
         if t.get('handoff') and stage != (prev.get('executor_stage','primary') if prev else 'primary'):
             require(not any(a['call']['conversation_id'] == call['conversation_id'] for a in s['state']['attempts']) or call['conversation_id'].startswith('pending:'), 'executor handoff requires a fresh implementation context')
-        if t.get('session_policy') == 'resume' and prev and call['conversation_id'] != prev['call']['conversation_id']:
+        if not mechanical_release(t) and t.get('session_policy') == 'resume' and prev and call['conversation_id'] != prev['call']['conversation_id']:
             string(d.get('replacement_reason'), 'new context requires replacement_reason')
-        if t.get('session_policy', 'new') in {'new','independent'} and not retry:
+        if not mechanical_release(t) and t.get('session_policy', 'new') in {'new','independent'} and not retry:
             require(not any(a['call']['conversation_id'] == call['conversation_id'] for a in s['state']['attempts']), 'new/independent context reused')
         started = d.get('started_at', at); timestamp(started)
         a = {'id': f'A{len(s["state"]["attempts"])+1:04}', 'task': tid, 'subjects': current_subjects(s, tid), 'plan_version': s['plan_version'], 'consumes': list(active_budgets), 'call': copy.deepcopy(call), 'started_at': started, 'result': None, 'retry_of': retry, 'replacement_reason': d.get('replacement_reason'), 'historical_simulation': kind == 'history'}
