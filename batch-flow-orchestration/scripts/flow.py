@@ -839,6 +839,10 @@ def status(s, at=None):
             continue
         if not d['resolution']:
             owner = decision_owner(d)
+            # Even a user-owned authorization point needs a lead-authored
+            # request before the coordinator may ask the user anything.
+            if owner == 'user':
+                owner = 'architect'
             instruction = d['reason']
             if d['signal'] in {'budget_exhausted','scope_blocked','severe_block'} or d.get('decision_point') == 'SEVERE_BLOCK':
                 instruction = '先派技术负责人诊断并登记 resolve；当前不是等待用户确认。只有负责人明确登记用户确认恢复条件后才请求用户决定。问题：' + instruction
@@ -948,9 +952,12 @@ def status(s, at=None):
         item['goal_context'] = goal_context(s, item)
         # role names identify the performer, not permission for the coordinator
         # to do the work. Keep the payload separate from dispatch instructions.
-        if role == 'user' or item['kind'] in {'REQUEST_AUTHORIZATION','ASSIGN_MODELS'}:
+        if role == 'user':
             mode='request_user'
-            guidance='向用户提出当前明确待决项；只登记用户原始决定，不代替用户决定。'
+            guidance='只转述技术负责人正式登记的用户确认条件；不自拟选项，只登记用户原始决定。'
+        elif item['kind'] in {'REQUEST_AUTHORIZATION','ASSIGN_MODELS'}:
+            mode='register'
+            guidance='由 next 登记管理缺项并派技术负责人明确用户待办；编排者不直接提出用户选择。'
         elif item['kind'] == 'REPORT_PROGRESS':
             mode='collect_progress'
             guidance='向实际责任会话收集可核查进度并登记；不自行探索源码、运行验证或诊断。'
@@ -1081,7 +1088,7 @@ def pre_yield(s, owner='orchestrator', boundary_audit=None, root=None):
     busy=any(report['tasks'].get(tid)=='RUNNING' for tid in owned)
     # A confirmation only checks existing evidence. While owned work is still running, checking now
     # cannot change the answer and may race the running writer, so it waits instead of forcing CONTINUE.
-    work=[a for a in report['actions'] if relevant(a) and a['role']!='user' and a['kind'] not in {'REQUEST_AUTHORIZATION','ASSIGN_MODELS'}
+    work=[a for a in report['actions'] if relevant(a) and a['role']!='user'
           and not (a['kind']=='CONFIRM_CONDITION' and (a['target'] in waiting or busy))]
     problems=[]; running=[]
     for tid,state in report['tasks'].items():
@@ -1105,7 +1112,7 @@ def pre_yield(s, owner='orchestrator', boundary_audit=None, root=None):
                 problems.append(dict(task=tid,attempt=a['id'],reason='verify dispatch evidence, report overdue progress, and rearm timer if still running'))
         except (OSError,ValueError,KeyError,TypeError,OverflowError):
             problems.append(dict(task=tid,attempt=a['id'],reason='timer receipt unavailable; verify actual task and timer state'))
-    user=[a for a in report['actions'] if (a['role']=='user' or a['kind'] in {'REQUEST_AUTHORIZATION','ASSIGN_MODELS'}) and relevant(a)]
+    user=[a for a in report['actions'] if a['role']=='user' and relevant(a)]
     local_complete=owner=='architect' and all(report['tasks'][tid] in {'SATISFIED','RETIRED','INACTIVE'} for tid in owned)
     disposition='CONTINUE' if work or problems else 'WAIT_HOST' if running else 'WAIT_USER' if user else 'COMPLETE' if (report['complete'] or local_complete) else 'STALLED'
     audit_report=boundary_audit or {'status':'not_configured'}
@@ -1558,7 +1565,9 @@ def operate(s, op, actor, root, at):
         existing_ids = {r['id'] for other in s['decisions'].values() if other['resolution'] for r in other['resolution']['requirements']}
         require(not existing_ids & {r['id'] for r in d['requirements']}, 'recovery requirement ids must be unique across decisions')
         user_hashes = evidence(d['user_evidence'], root) if d['user_evidence'] else {}
-        require(decision_owner(dec) != 'user' or user_hashes, 'user-owned decision requires referenced user response')
+        requests_user = any(r['kind'] == 'confirmation' and r.get('owner') == 'user' for r in d['requirements'])
+        require(decision_owner(dec) != 'user' or user_hashes or requests_user,
+                'user-owned decision requires referenced user response or an explicit lead-authored user confirmation')
         # Recovery work cannot block itself; blocks denote downstream actions, not every affected activity.
         require(not set(dec['blocks']) & {r['target'] for r in d['requirements'] if r['kind']=='task'}, 'recovery task blocks itself; scope blocks to downstream steps')
         if dec.get('handling') and d.get('context'):

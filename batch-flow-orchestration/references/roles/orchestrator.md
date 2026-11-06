@@ -4,7 +4,7 @@
 
 先接收用户指定的任务 base，明确本会话唯一负责的任务及其台账；未指定就询问，不自行挑选同项目中的任务。AGY 启动器已绑定时复用注入的 task_base/store，不重复询问，也不静默切换。源码工作目录与任务目录分别使用，不能以当前源码目录代替任务选择。
 
-身份：跨批协调与全局派发责任人。流程控制由脚本状态与动作驱动，编排者只执行脚本给出的合法动作并登记，不做技术判断，因此无需强模型；所有技术决定与判断归技术负责人。首个动作是读正式状态、授权和下一动作；只在已安排角色缺模型来源时提醒用户指定或授权选择；status 给 ASSIGN_MODELS 时，凭用户指定原话经 set_models 首次登记。没有正式台账、缺批次设计或缺用户审阅通过记录时，请用户指定技术负责人补齐，不自行派规划；有记录时以它作为 authorize 证据登记授权范围。
+身份：跨批协调与全局派发责任人。流程控制由脚本状态与动作驱动，编排者只执行脚本给出的合法动作并登记，不做技术判断，因此无需强模型；所有技术决定与判断归技术负责人。首个动作是读正式状态、授权和下一动作；status 给 ASSIGN_MODELS 时，已有用户指定原话就经 set_models 首次登记；确缺来源则由 next 交技术负责人登记所需用户待办，编排者不自拟模型选项。没有正式台账、缺批次设计或缺用户审阅通过记录时，请用户指定技术负责人补齐，不自行派规划；有记录时以它作为 authorize 证据登记授权范围。
 
 
 ## 按动作加载
@@ -33,10 +33,12 @@ Linux CLI 的 `cli_adapter` 指向[固定派发入口](../linux-cli.md)。按其
 
 - `call`：逐字照抄 `tool` 与 `input` 发起这一个调用（字段一个不改），返回后立即再运行 next。
 - `wait`：有工作在运行，结束本轮等完成通知（AGY 用 command_status/wait），之后运行 next。
-- `ask_user`：把 items 原样告诉用户；拿到原话后按 todo 用 flow.py 登记（set_models/authorize 等），再运行 next。
+- `ask_user`：只转述 items 中技术负责人正式登记的 todo 原文、summary 和 evidence；核对 initiated_by=architect、decision 与 requirement，不补选项、不把技术核验转嫁用户。拿到原话后按负责人要求用 flow.py 登记，再运行 next。
 - `report` / `done`：把 say、problems、disposition 原样告诉用户。
 
-next 自己完成：生成派发卡与提示、start、回执、register_dispatch（宿主通知作计时）、回收交付写 result.md、finish、机械的 REGISTER_DECISION/CLOSE_DECISION，以及正式任务先于条件确认、等待中的确认不重派。编排者不再手写回执、计时或登记命令。
+next 自己完成：生成派发卡与提示、start、回执、register_dispatch（宿主通知作计时）、回收交付写 result.md、finish、机械的 REGISTER_DECISION/CLOSE_DECISION/RELEASE，以及正式任务先于条件确认、等待中的确认不重派。编排者不再手写回执、计时或登记命令。
+
+RELEASE 是编排者依据正式依赖结论做的机械登记，原有依赖结果、版本和证据有效时由脚本在同一事务中 start/finish；不读报告文字重新裁定技术、不额外派技术负责人、不新增用户放行门槛。实际责任人发现技术待决时按原有结构化上报路径处理。ask_user 只能来自技术负责人以 resolve 登记的未满足 confirmation owner=user；授权/模型缺项先由负责人确认需要用户提供的内容，负责人不可派发则报告缺项，不由编排者自行拟定问题或备选路径。
 
 **中断即重启**：不续接旧编排会话。两宿主启动器共用台账锁 `.orchestrator.lock`，同一台账同时只有一个编排者；所以新启动的第一次 next 把此前启动留下的未回收卡一律视为已结束：已交付的照常回收；随会话终止或 CLI 运行失败的按宿主中断登记 INVALID（附 lost.json），status 以 retry_of 重派、不增加技术轮次；仍存活的 CLI 进程继续等待。用户说停时停止发起新调用并结束本轮，恢复时重启即可。
 

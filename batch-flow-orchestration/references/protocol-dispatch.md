@@ -89,6 +89,10 @@ record、snapshot、`--repo/--git-ref` 的行为与证据路径规则见[证据�
 
 ## 输出与限制
 
+`dispatch_card.py next` 的 `ask_user` 只包含技术负责人正式 `resolve` 发起且前置已满足的用户确认项；每项返回 `initiated_by=architect`、`decision`、`requirement`、`summary`、`todo` 原文和证据路径。仅有 role=user、未处置的协调动作或编排者自己的解释不足以发问。模型/授权缺项经脚本登记为负责人待决，不能直接生成用户选择。未登记为待决的机械 RELEASE 根据既有正式依赖与证据原子登记，不增加一次负责人裁决或用户确认。
+
+CLI 在输出 next 结果前统一校验：call 才能包含 tool/input，ask_user 才能包含 items，wait 才能附带 user_items；所有用户项须逐字段等于当前正式负责人请求。动作混搭、未知 do 或来源/原文不符统一返回 report 与协议错误，不把矛盾输出交给编排者解释。
+
 AGY 启动器会话中，CLI status/pre_yield 和写操作的 next 返回 host_capabilities，以及派发动作 cli_adapter.profile。只读 `capabilities --store <绑定台账>` 可单独恢复同一信息，不依赖台账已初始化；不搜索 runtime，不读取其他启动会话。该宿主元数据是输出派生信息，不写入正式 plan/flow.json，详细绑定与权限见 hosts-agy-codex.md。
 
 decision_progress 的 confirmed 可带 budget_approval，把后续用户批准的预算范围与原始证据一次保存在 confirmation 中；bind_budget_approval 仅给已有未标注的用户确认补范围，不回填裁决头。plan_update 统一核验两种授权来源、证据有效性与作用范围，详见[先建议、后批准](protocol-decisions.md#先建议后用户批准单处登记)。

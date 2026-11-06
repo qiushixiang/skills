@@ -180,7 +180,8 @@ class ReviewRegressions(unittest.TestCase):
         self.assertEqual(report['tasks']['execute'], 'WAIT_MODELS')
         action = next(a for a in report['actions'] if a['target'] == 'execute')
         self.assertEqual((action['kind'], action['missing']), ('ASSIGN_MODELS', {'role': 'executor'}))
-        self.assertEqual(flow.pre_yield(self.state, 'architect')['disposition'], 'WAIT_USER')
+        self.assertEqual(action['orchestrator_action']['mode'],'register')
+        self.assertEqual(flow.pre_yield(self.state, 'architect')['disposition'], 'CONTINUE')
         self.assertEqual(report['unassigned_models'], {'roles': ['executor', 'reviewer'], 'backups': ['execute']})
         call = dict(tool='t', model='m', effort='e', conversation_id='exec-1')
         with self.assertRaisesRegex(flow.FlowError, 'model not assigned'):

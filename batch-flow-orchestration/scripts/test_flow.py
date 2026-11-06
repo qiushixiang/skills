@@ -1347,10 +1347,11 @@ class FlowTests(unittest.TestCase):
         self.assertFalse(flow.success(self.s,'done'))
         self.assertEqual(flow.status(self.s)['tasks']['regular'],'READY')
 
-    def test_pure_user_authorization_point_keeps_user_owner(self):
+    def test_pure_user_authorization_point_keeps_owner_but_routes_first_to_lead(self):
         self.s['plan']['decision_points']['upload']=dict(signal='authorization_required',owner='user',blocks=['done'],instruction='approve upload')
         self.apply('orchestrator','signal',dict(id='upload',signal='authorization_required',reason='upload needs consent',blocks=['done'],decision_point='upload',evidence=[str(self.e)]))
-        self.assertEqual(next(a for a in flow.status(self.s)['actions'] if a['target']=='upload')['role'],'user')
+        self.assertEqual(self.s['decisions']['upload']['owner'],'user')
+        self.assertEqual(next(a for a in flow.status(self.s)['actions'] if a['target']=='upload')['role'],'architect')
         with self.assertRaises(flow.FlowError):
             self.apply('architect','resolve',dict(id='upload',summary='cannot bypass user authorization',requirements=[dict(id='u',kind='confirmation',owner='architect',depends_on=[],instruction='confirm')],evidence=[str(self.e)],user_evidence=[]))
 
@@ -1454,9 +1455,10 @@ class FlowTests(unittest.TestCase):
         self.apply('orchestrator','register_dispatch',data)
         with self.assertRaises(flow.FlowError):self.apply('orchestrator','register_dispatch',dict(data,handle='duplicate-new-agent'))
 
-    def test_pre_yield_user_wait_and_complete_are_distinct(self):
+    def test_pre_yield_authorization_gap_needs_coordination_not_a_user_question(self):
         self.apply('orchestrator','authorize',dict(batches=[],evidence=[str(self.e)]))
-        self.assertEqual(flow.pre_yield(self.s)['disposition'],'WAIT_USER')
+        self.assertEqual(flow.pre_yield(self.s)['disposition'],'CONTINUE')
+        self.assertEqual(flow.pre_yield(self.s)['user_actions'],[])
         self.apply('orchestrator','authorize',dict(batches=['B'],evidence=[str(self.e)]))
         for task in ['execute','regular','third','done']:self.pass_task(task)
         self.assertEqual(flow.pre_yield(self.s)['disposition'],'COMPLETE')

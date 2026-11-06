@@ -907,13 +907,116 @@ def reconcile(store, spec, started):
     return out
 
 
-def mechanical_registrations(store):
+def coordinator_context(s, action):
+    """Pin formal inputs without interpreting report prose or acceptance criteria."""
+    tasks = {}
+    def visit(tid):
+        if tid in tasks or tid not in s['plan']['tasks']:
+            return
+        task = s['plan']['tasks'][tid]
+        attempt = flow.latest(s, tid)
+        tasks[tid] = dict(definition=task, subjects=flow.current_subjects(s, tid),
+                          attempt={k:attempt.get(k) for k in ['id','result','subjects','evidence']} if attempt else None)
+        for dependency in task['depends_on']:
+            visit(dependency)
+    visit(action['target'])
+    data = dict(kind=action['kind'], target=action['target'], tasks=tasks)
+    data['request'] = {k:action.get(k) for k in ['missing','scope']}
+    return data
+
+
+def coordinator_source(s, action):
+    return 'coordinator:' + action['kind'] + ':' + action['target'] + ':' + flow.digest(coordinator_context(s, action))
+
+
+def lead_user_request(s, action):
+    """Only a pending user confirmation submitted by architect may become ask_user."""
+    if action['kind'] != 'CONFIRM_CONDITION' or not action.get('decision'):
+        return None
+    decision = s['decisions'].get(action['decision'], {})
+    resolution = decision.get('resolution') or {}
+    if decision.get('status') in {'closed','superseded'} or not flow.intact_evidence(resolution.get('evidence_hashes', {})):
+        return None
+    requirement = next((r for r in resolution.get('requirements', []) if r['id'] == action['target']), None)
+    if not requirement or requirement['kind'] != 'confirmation' or requirement.get('owner') != 'user':
+        return None
+    authored = any(h['actor'] == 'architect' and any(
+        op['type'] == 'resolve' and op['data'].get('id') == decision['id']
+        and requirement in op['data'].get('requirements', [])
+        for op in h['operations']) for h in s['history'])
+    if not authored or flow.requirement_ok(s, requirement):
+        return None
+    requirements = {r['id']:r for r in resolution['requirements']}
+    if any(not flow.requirement_ok(s, requirements[dep]) for dep in requirement['depends_on']):
+        return None
+    return dict(kind=action['kind'], target=action['target'], initiated_by='architect',
+                decision=decision['id'], requirement=requirement['id'],
+                summary=resolution['summary'], todo=requirement['instruction'],
+                evidence=list(resolution['evidence_hashes']))
+
+
+def register_coordinator_check(store, s, action):
+    context = coordinator_context(s, action)
+    source = coordinator_source(s, action)
+    evidence = flow.save_record(Path(store).parent, dict(coordinator_check=context))
+    reason = '当前管理缺项先由技术负责人核对已有授权与配置，编排者不能自拟用户决策。'
+    reason += ('固定输入见 ' + evidence + '。需要用户决定时，以 resolve 的 confirmation owner=user 登记原文问题；'
+               '不需要用户且已满足时给出有证据的澄清闭环；存在未满足条件时登记实际恢复条件。不得让用户一句放行替代技术核验。')
+    numbers = [int(m.group(1)) for key in s['decisions'] if (m := re.fullmatch(r'DEC-(\d+)', key))]
+    data = dict(id='DEC-%02d' % (max(numbers, default=0)+1), signal='technical_decision',
+                source_key=source, blocks=[action['target']] if action['target'] in s['plan']['tasks'] else [],
+                reason=reason, evidence=[evidence])
+    run_flow(store, 'signal', '--actor', 'orchestrator', '--revision', str(s['revision']), data=data)
+
+
+def complete_mechanical_release(store, s, action, spec):
+    task = s['plan']['tasks'][action['target']]
+    need(task['kind'] == 'acceptance' and task['role'] == 'orchestrator', '不是编排者机械放行节点')
+    need(all(flow.success(s, dep) for dep in task['depends_on']), '正式依赖未满足或证据已失效，不能机械放行')
+    # Use existing formal conclusions. Do not interpret report prose, introduce
+    # another technical review, or turn a milestone into a new user approval.
+    dependencies = {dep:flow.latest(s, dep) for dep in task['depends_on']}
+    record = flow.save_record(Path(store).parent, dict(mechanical_release=action['target'],
+        revision=s['revision'], subjects=flow.current_subjects(s, action['target']),
+        dependencies={dep:{k:a.get(k) for k in ['id','result','subjects','evidence']} for dep,a in dependencies.items()}))
+    conversation = spec.get('session_id') or spec.get('owner_conversation')
+    need(conversation, '机械放行缺少当前编排者会话绑定')
+    config = s['plan']['roles']['orchestrator']
+    call = dict(tool=config['tool'], model=config['model'], effort=config['effort'], conversation_id=conversation)
+    attempt = 'A%04d' % (len(s['state']['attempts'])+1)
+    proof = [record] + [path for attempt_data in dependencies.values() for path in attempt_data.get('evidence', {})]
+    request = dict(request_id='mechanical-release-' + uuid.uuid4().hex, expected_revision=s['revision'],
+                   actor='orchestrator', operations=[
+                       dict(type='start', data=dict(task=action['target'], call=call)),
+                       dict(type='finish', data=dict(attempt=attempt, result='VERIFIED', evidence=list(dict.fromkeys(proof))))])
+    path = flow.save_record(Path(store).parent, request)
+    # One transaction: a crash cannot leave a fake running acceptance attempt.
+    run_flow(store, 'apply', '--request', path)
+
+
+def mechanical_registrations(store, spec=None):
     done = []
     for _ in range(20):
-        action = next((a for a in flow.status(load_json(store))['actions']
-                       if a['kind'] == 'CLOSE_DECISION' or (a['kind'] == 'REGISTER_DECISION' and a.get('issue'))), None)
+        s = load_json(store)
+        actions = flow.status(s)['actions']
+        action = next((a for a in actions if a['kind'] == 'CLOSE_DECISION'
+                       or (a['kind'] == 'REGISTER_DECISION' and a.get('issue'))), None)
         if action is None:
-            break
+            action = next((a for a in actions if a['kind'] in {'ASSIGN_MODELS','REQUEST_AUTHORIZATION'}
+                           or (a['kind'] == 'RELEASE' and a['role'] == 'orchestrator')), None)
+            if action is None:
+                break
+            if action['kind'] == 'RELEASE':
+                need(spec is not None, '机械放行需要当前启动器会话绑定')
+                complete_mechanical_release(store, s, action, spec)
+                done.append('RELEASE ' + action['target'])
+                continue
+            source = coordinator_source(s, action)
+            if not any(d.get('source_key') == source for d in s['decisions'].values()):
+                register_coordinator_check(store, s, action)
+                done.append('LEAD_CHECK ' + action['target'])
+                continue
+            break  # Unresolved/missing inputs stay with the lead, never ask the user here.
         if action['kind'] == 'CLOSE_DECISION':
             run_flow(store, 'close', '--actor', 'orchestrator', '--revision', str(revision(store)), '--id', action['target'],
                      '--note', '恢复条件已由 status 判定齐全，机械闭环')
@@ -1007,7 +1110,7 @@ def next_step(args):
     migrate_confirmation_waits(store)
     report = reconcile(store, spec, launch_started(spec, runtime))
     try:
-        report['registered'] = mechanical_registrations(store)
+        report['registered'] = mechanical_registrations(store, spec)
     except (CardError, flow.FlowError) as error:
         report['registered'] = []; report['problems'].append(dict(registration=str(error)))
     base = {k: v for k, v in report.items() if v and k != 'pending'}
@@ -1035,6 +1138,9 @@ def next_step(args):
     work.sort(key=lambda a: a['kind'] == 'CONFIRM_CONDITION')  # formal tasks before confirmations
     for action in work:
         try:
+            config = action.get('subagent_payload', {}).get('call_config', {})
+            need(all(config.get(k) for k in ['tool','model','effort']),
+                 '责任角色配置缺失；报告缺项，不由编排者自行发起用户选择')
             card = make(argparse.Namespace(store=store, kind=action['kind'], target=action['target'], workspace=None,
                                            runtime=str(runtime), as_lead=False, recheck=False))
             return dict(base, **emit(store, card, runtime))
@@ -1042,18 +1148,59 @@ def next_step(args):
             base.setdefault('problems', []).append(dict(action='%s %s' % (action['kind'], action['target']), error=str(error)))
     other = [dict(kind=a['kind'], target=a['target'], todo=a.get('orchestrator_todo') or a.get('instruction'))
              for a in gate['actions'] if a.get('orchestrator_action', {}).get('mode') not in {'dispatch', 'delegate_to_lead'}]
-    users = [dict(kind=a['kind'], target=a['target'], todo=a.get('orchestrator_todo') or a.get('instruction'))
-             for a in gate['user_actions']]
+    users = []
+    for action in gate['user_actions']:
+        request = lead_user_request(s, action)
+        if request:
+            users.append(request)
+        else:
+            base.setdefault('problems', []).append(dict(action=action['target'],
+                error='用户事项没有有效的技术负责人 resolve/owner=user 依据；不发起 ask_user'))
     if base.get('running') or gate['running']:
         return dict(base, do='wait', user_items=users, say='有工作在运行：running 中带 todo 的照做；否则结束本轮，等完成通知（AGY 用 command_status/wait/manage_subagents 等其结束）；之后运行 next。'
                     + ('另有待用户处理的事项，一并原样告诉用户。' if users else ''))
-    if other or users:
-        return dict(base, do='ask_user', items=other + users,
-                    say='把这些事项原样告诉用户；用户给出原话后按 todo 登记（flow.py），再运行 next。')
+    if users:
+        return dict(base, do='ask_user', items=users,
+                    say='仅转述技术负责人登记的 todo 原文及依据，不增补选项、不解释为用户承担技术核验；收到原话后按负责人要求登记，再运行 next。')
+    if other:
+        base.setdefault('problems', []).extend(dict(action=item['target'], todo=item['todo'],
+            error='协调事项尚未闭环，不能转成用户决策；由责任人补齐正式记录') for item in other)
     if base.get('problems'):
         return dict(base, do='report', say='把 problems 原样告诉用户，不自行修复或绕过。')
     return dict(base, do='done' if gate['disposition'] == 'COMPLETE' else 'report', disposition=gate['disposition'],
                 say='没有可派发的工作：把 disposition 告诉用户。')
+
+
+def checked_next_output(store, out):
+    """Enforce one meaning for each do before exposing it to the orchestrator."""
+    try:
+        need(isinstance(out, dict), 'next output must be an object')
+        mode = out.get('do')
+        need(mode in {'call','wait','ask_user','report','done','attention'}, 'unknown next do')
+        if mode == 'call':
+            need(isinstance(out.get('tool'), str) and bool(out['tool']) and isinstance(out.get('input'), dict),
+                 'call requires tool and input')
+        else:
+            need('tool' not in out and 'input' not in out, 'non-call output contains a host invocation')
+        need(mode == 'ask_user' or 'items' not in out, 'only ask_user may contain items')
+        need(mode == 'wait' or 'user_items' not in out, 'only wait may carry pending user_items')
+        questions = out.get('items') if mode == 'ask_user' else out.get('user_items', [])
+        need(isinstance(questions, list), 'user questions must be an array')
+        need(mode != 'ask_user' or bool(questions), 'ask_user requires explicit lead-originated questions')
+        if questions:
+            s = load_json(store)
+            for item in questions:
+                need(isinstance(item, dict), 'user question must be an object')
+                need(item.get('kind') == 'CONFIRM_CONDITION', 'mechanical/technical actions cannot be user questions')
+                expected = lead_user_request(s, dict(kind=item['kind'], target=item.get('target'), decision=item.get('decision')))
+                need(expected is not None and item == expected,
+                     'user question lacks current architect provenance or changes the registered wording/evidence')
+        return out
+    except (CardError, OSError, ValueError, KeyError, TypeError) as error:
+        # Do not forward the invalid payload as choices, and do not reinterpret
+        # it as a successful mechanical action.
+        return dict(do='report', problems=[dict(error='next output protocol error: ' + str(error))],
+                    say='next 输出协议冲突；报告 problems，由技能维护者修复。编排者不自拟问题、不猜测动作、不据此放行。')
 
 
 def main():
@@ -1073,7 +1220,7 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == 'next':
-            out = next_step(args)
+            out = checked_next_output(args.store, next_step(args))
             if out.get('problems'):
                 out['say'] = out['say'] + ' problems 原样告诉用户。'
         elif args.command == 'make':
