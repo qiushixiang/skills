@@ -82,6 +82,7 @@ def capabilities(spec):
         '用户说停：停止发起新调用并结束本轮；要恢复时重启编排者即可（next 会处理上次留下的工作）。',
         '禁止：读业务源码、改代码或设计书、Git 写、产品构建/测试、任意 shell 组合。被 ROLE_BOUNDARY_BLOCKED 拦截时不要换方式绕过，向用户报告。',
         '技术内容（实现、审阅、裁决、方案）一律交给角色，你只协调。',
+        '用户口语指定角色模型时，先按 linux-cli.md 使用 agent_cli.py models 查询指定后端，再用 resolve-model 校验映射；唯一匹配直接 set_models，真实多候选才确认变体。未指定 effort 沿用 default，不重复询问。',
     ])
 
 

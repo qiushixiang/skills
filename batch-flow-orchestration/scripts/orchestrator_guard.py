@@ -92,6 +92,20 @@ def check_bash(inputs, cwd, read_roots, card_root=None):
         if script.name == 'agent_cli.py' and 'run' in words[2:3] and card_root is not None and \
                 not matches_card('Bash', dict(command=command.strip()), card_root, ['command']):
             return 'agent_cli.py run must be copied verbatim from dispatch_card.py next'
+        if script.name == 'agent_cli.py' and words[2:3] in (['models'], ['resolve-model']):
+            import os
+            from model_catalog import safe_metadata_command
+            try:
+                launch = os.environ['BATCH_FLOW_CLAUDE_LAUNCH']
+                if not re.fullmatch(r'[a-zA-Z0-9_-]+', launch) or card_root is None:
+                    raise ValueError('missing launcher binding')
+                management = Path(card_root).resolve().parent.parent
+                spec = json.loads((management/'.claude-launch'/launch/'spec.json').read_text())
+                records = management/'records'
+                if not safe_metadata_command(words[2:], spec['profiles'], records):
+                    raise ValueError('unbound profile or catalogue path')
+            except (OSError, KeyError, ValueError):
+                return 'model queries require a launcher-bound profile and catalogue under records'
         return None
     if exe in READ_COMMANDS:
         paths = [word for word in words[1:] if not word.startswith('-')]

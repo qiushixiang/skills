@@ -33,6 +33,23 @@ runtime 必须来自本会话的启动绑定，不按目录时间猜选。维护
 
 ## 2. 派发与续接
 
+### 用户口语指定模型：先查目录，再解析
+
+模型变更先查询用户指定的后端，不要求用户提供完整 ID；只有用户要求跨后端比较时才查询全部已绑定后端。编排者通过 capabilities 取已核查 profile，使用统一管理入口，不直接调用原生 CLI 或读取认证配置：
+
+```text
+python3 <技能目录>/scripts/agent_cli.py models --profile <已绑定profile> --output <records内不存在的目录文件.json>
+python3 <技能目录>/scripts/agent_cli.py resolve-model --profile <同一profile> --catalog <上述目录文件.json> --name '用户所说的模型名' --effort default
+```
+
+LLM 依据用户原话理解工具、模型和变体，使用目录中的显示名或完整 ID 调用 resolve-model；名称映射需向用户复述。脚本对大小写、分隔符和版本前缀 V 做确定性规范化；唯一结果返回 `status=resolved` 和可用于 set_models 的 config。多个候选返回 `needs_clarification`，LLM 用显示名/变体向用户确认；没有结果返回 `not_found`，不完整目录返回 `unverified`，均不自动选择近似模型。用户没有指定 effort 时继承 default，不重复询问。模型名自带 High/Medium/Low 变体与独立 effort 参数分别保留，不能互相推定。
+
+例如用户说“AGY Gemini 3.8 Flash”，目录若只返回 High/Medium/Low 三个变体，则需要确认变体，不能静默选 Medium。目录中的完整 ID 不靠技能示例固化。LLM 可以从目录定位用户明确指定的版本或提供商，但不能把“指定版本”改为“最新版别名”。
+
+目录记录 CLI 版本、查询来源、时间、profile 指纹及白名单模型元数据；一小时后或 profile 改变时重新查询，文件不可覆盖。AGY 使用 models，OpenCode 使用 api model.list --standalone，Codex 使用 app-server 的 initialize/model/list 元数据 RPC；这些入口不发送推理提示词。Claude 当前只有 help 中的模型别名，返回 complete=false，不冒报完整远端目录。各后端实际配置的默认模型没有可靠来源时记录 unknown（null），不从旧任务或模型排序推定。查询失败停止解析，不自动重试或更换模型。
+
+目录只证明 CLI 广告的模型元数据，不证明认证、账号可用性或推理成功。查询/解析不改台账和角色配置、不派发代理；解析后仍按[用户指定模型直接登记](protocol-plan.md#用户指定模型的直接登记)执行 set_models。受限 AGY/Claude 编排者只接受启动器绑定 profile，目录读写限定 records；旧会话沿现有固定入口使用新命令，无需扩大原生 CLI 权限。
+
 首次派发前，在实际将运行适配器的执行环境中运行 `python3 <技能目录>/scripts/agent_cli.py check --profile <本CLI的profile.json>`。它只核对固定二进制的 --version，不能证明认证/网络/模型可用；不可见时报告当前执行环境问题，不推断宿主未安装。AGY [受限启动器](hosts-agy-codex.md#agy-编排者linux-受限启动)按用户选择关闭编排者终端沙箱，check/run 仍受固定工具门禁限制，不传 BypassSandbox；其他宿主沿各自原有权限执行，不自行绕过沙箱。
 
 登记 start/decision_start 前，再用同一 check 命令补上拟用的 `--model <模型> --effort <effort> --cwd <工作目录>` 做完整本地参数检查；续接同时提供下述 conversation/resume-from。它不调用模型，也不保证模型支持所有已通过语法检查的配置，真实可用性仍以远端完成记录为准。

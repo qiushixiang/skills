@@ -37,7 +37,7 @@ FLAGS={
     'progress_timer.py':{'--ticket','--task','--goal','--handle','--seconds'},
     'dispatch_card.py':{'--store','--card'},
     'agent_cli.py':{'--profile','--task','--cwd','--model','--effort','--prompt-file','--run-dir',
-                    '--access','--conversation','--resume-from','--add-dir'},
+                    '--access','--conversation','--resume-from','--add-dir','--output','--catalog','--name'},
 }
 
 
@@ -67,6 +67,7 @@ def next_command(spec):
 def loop_text(spec):
     status=shlex.join([spec['python'],str(SCRIPTS/'flow.py'),'--store',spec['store'],'status'])
     return ('\n启动时先运行 '+status+'，展示状态后结束本轮，等用户明确要求继续；不要自动运行 next。'
+            '\n用户口语指定角色模型时，先按 linux-cli.md 使用 agent_cli.py models 查询指定后端，再用 resolve-model 校验映射；唯一匹配直接 set_models，真实多候选才确认变体。未指定 effort 沿用 default，不重复询问。'
             '\n用户要求继续后，运行 '+next_command(spec)+'，按输出的 do 字段办：'
             'do=call 时逐字照抄 tool 与 input 发起这一个调用（字段一个不改），返回后立即再运行 next；'
             'do=wait 时用 command_status/wait 等在跑的命令结束，再运行 next；'
@@ -131,6 +132,9 @@ def safe_command(command,spec):
         ticket=option('--ticket')
         return args[0] in {'wait','cancel'} and bool(ticket) and within(ticket,spec['records'])
     profile=option('--profile')
+    if args[0] in {'models','resolve-model'}:
+        from model_catalog import safe_metadata_command
+        return safe_metadata_command(args,spec.get('profiles',[]),spec['records'])
     if args[0]=='collect':
         output=option('--run-dir')
         return bool(output) and within(output,spec['records'])

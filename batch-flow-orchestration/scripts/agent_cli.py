@@ -442,6 +442,14 @@ def collect(output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
+    models = commands.add_parser('models', help='query model metadata only; never calls a model')
+    models.add_argument('--profile', required=True)
+    models.add_argument('--output', help='new catalogue JSON file; never overwritten')
+    resolve = commands.add_parser('resolve-model', help='resolve user wording against a fresh checked catalogue')
+    resolve.add_argument('--profile', required=True)
+    resolve.add_argument('--catalog', required=True)
+    resolve.add_argument('--name', required=True)
+    resolve.add_argument('--effort', default='default')
     check = commands.add_parser('probe')
     check.add_argument('--backend', required=True, choices=REQUIRED)
     check.add_argument('--binary')
@@ -465,6 +473,16 @@ def main():
     finish.add_argument('--run-dir', required=True)
     args = parser.parse_args()
     try:
+        if args.command in {'models', 'resolve-model'}:
+            import model_catalog
+            check_profile(args.profile)
+            profile = read(args.profile)
+            result = (model_catalog.query(profile) if args.command == 'models' else
+                      model_catalog.resolve(profile, read(args.catalog), args.name, args.effort))
+            if args.command == 'models' and args.output:
+                save(args.output, result)
+            print(json.dumps(result, ensure_ascii=False), flush=True)
+            return 0
         if args.command == 'run':
             return run(args.profile, args)
         if args.command == 'check' and any(getattr(args, key) is not None for key in ['model','effort','cwd','conversation','resume_from']):
