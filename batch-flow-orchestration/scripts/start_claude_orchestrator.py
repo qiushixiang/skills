@@ -70,7 +70,8 @@ def capabilities(spec):
         'Claude Code batch-flow 编排者（受限启动，会话 %s）' % spec['session_id'],
         '任务目录：' + spec['task_base'], '台账：' + spec['store'], '源码工作目录：' + spec['workspace'], '技能目录：' + str(SKILL),
         '',
-        '你只做一件事：运行 ' + next_command(spec) + '，按输出的 do 字段办：',
+        '启动时先运行 ' + status + '，展示状态后结束本轮，等用户明确要求继续；不要自动运行 next。',
+        '用户要求继续后，运行 ' + next_command(spec) + '，按输出的 do 字段办：',
         '- do=call：逐字照抄 tool 与 input 发起这一个调用（字段一个不改），返回后立即再运行 next。',
         '- do=wait：结束本轮，等完成通知；任何完成通知到达后运行 next。',
         '- do=ask_user：把 items 原样告诉用户；拿到用户原话后按 todo 用 flow.py 登记（如 set_models/authorize），再运行 next。',
@@ -100,7 +101,7 @@ def settings(spec):
         'PreToolUse': [{'matcher': '*', 'hooks': [guard]}],
         'PostToolUse': [{'matcher': '*', 'hooks': [cmd(str(SCRIPTS / 'role_audit.py'), 'record', '--host', 'claude', '--conversation', sid, '--log', log)]}],
         'Stop': [{'hooks': [cmd(str(SCRIPTS / 'stop_hook_pre_yield.py'), '--host', 'claude', '--store', store, '--role', 'orchestrator',
-                                '--conversation', sid, '--audit-log', log, '--next-command', next_command(spec))]}],
+                                '--conversation', sid, '--audit-log', log, '--inspect-until-next', '--next-command', next_command(spec))]}],
     }}
 
 
@@ -149,7 +150,7 @@ def argv_for(spec, binary, runtime):
     for extra in [spec['task_base'], str(SKILL)]:
         if not within(extra, spec['workspace']):
             argv += ['--add-dir', extra]
-    argv.append('你是本任务的 batch-flow 编排者。现在运行 next。')
+    argv.append('你是本任务的 batch-flow 编排者。现在只运行 status 并展示状态，等用户明确要求继续后再运行 next。')
     return argv
 
 

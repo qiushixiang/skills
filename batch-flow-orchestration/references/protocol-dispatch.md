@@ -46,6 +46,8 @@ init.data 必须给 plan、simulation、context 和 task_mode（local 或 batche
 
 编排者的actor=orchestrator不能执行init、plan_update、resolve或change_subject，也不能finish其他角色的任务。代交时actor仍是原责任角色且技术载荷不变，不等于编排者获得该职责。actor是责任标签，脚本不能认证谁实际提交或限制shell/文件访问；职责隔离由派发约束与宿主权限共同落实，不宣称角色校验可以阻止所有文件越权。
 
+正式任务与非任务条件确认按台账身份区分：`plan.tasks` 中的 confirmation（动作 CONFIRM）仍须 start/finish；`CONFIRM_CONDITION` 才是 decision_progress 条件登记。`dispatch_owner=architect` 且任务 role=architect 时，派发卡直接调用技术负责人，以 architect 登记 start，回收首行结果后自动 finish；附加条件确认不能替代任务完成。旧卡缺少正式 start/attempt 时回收报错，核对已有证据后走当前正式任务入口，不回填历史 attempt。
+
 call 包含 tool/model/effort/conversation_id；handoff任务按status的call_config核对。start 时会话未知可暂用 pending:xxx，finish.call 必须补实际记录；技术成功不能接受未确认会话。角色模型配置由工具调用原始结果核实，脚本检查登记值一致，不能认证远端实际使用模型。
 
 执行者在实现过程中更新对象版本后，可在 finish.subject_versions 显式声明当前完整版本映射；程序另存 started_subjects，保留开始版本。审阅角色不能借此更换被审版本。

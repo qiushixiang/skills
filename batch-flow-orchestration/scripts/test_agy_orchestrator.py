@@ -41,6 +41,8 @@ class LauncherTests(unittest.TestCase):
     def command(self,*parts):return shlex.join([sys.executable,str(launcher.SCRIPTS/'flow.py'),'--store',self.spec['store'],*parts])
 
     def test_parent_is_bound_and_capabilities_are_injected(self):
+        self.assertIn('启动时先运行', launcher.loop_text(self.spec))
+        self.assertIn('展示状态后结束本轮', launcher.loop_text(self.spec))
         result=self.start()
         self.assertIn('编排者能力',result['injectSteps'][0]['systemMessage']['systemMessage'])
         self.assertEqual(launcher.load(self.runtime/'owner.json')['conversation_id'],'main')
@@ -174,7 +176,10 @@ class LauncherTests(unittest.TestCase):
     def test_dry_run_does_not_install_hooks_or_call_a_model(self):
         binary=self.root/'agy';binary.write_text('#!'+sys.executable+'\nimport sys\nassert sys.argv[1:]==["--version"]\nprint("1.4.12")\n');binary.chmod(0o700)
         args=argparse.Namespace(workspace=str(self.root),task_base=str(self.root),store=None,model='user-model',effort='medium',binary=str(binary),dry_run=True)
-        with patch('builtins.print'):self.assertEqual(launcher.launch(args),0)
+        with patch('builtins.print') as output:self.assertEqual(launcher.launch(args),0)
+        dry=json.loads(output.call_args_list[-1].args[0])
+        self.assertIn('现在只运行 status', dry['argv'][-1])
+        self.assertNotIn('现在运行 next', dry['argv'][-1])
         self.assertFalse((self.root/'.agents').exists())
 
     def test_session_without_hooks_is_ended(self):

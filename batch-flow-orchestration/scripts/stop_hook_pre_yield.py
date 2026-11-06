@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import io
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +20,21 @@ def explicit_stop(event):
         return True
     last=str(event.get('lastUserInput',''))
     return any(word in last for word in ('先停','暂停','停止','停下','先别跑','中断','先别动'))
+
+def next_was_run(log, conversation, command):
+    """Startup inspection ends once this owner has actually called next."""
+    if not log or not command:
+        return False
+    expected=shlex.split(command)
+    for line in log.read_text().splitlines():
+        row=json.loads(line)
+        if row.get('session_id')!=conversation or row.get('kind')!='tool':
+            continue
+        inputs=row.get('inputs') or {}
+        actual=inputs.get('command') or inputs.get('CommandLine') or ''
+        if isinstance(actual,str) and shlex.split(actual)==expected:
+            return True
+    return False
 
 def read_event(timeout=2.0):
     if sys.stdin.isatty():
@@ -79,6 +95,7 @@ def main():
     parser.add_argument('--audit-log',type=Path,help='optional bound role audit log; missing/invalid log blocks when enabled')
     parser.add_argument('--audit-management-root',type=Path,action='append',default=[])
     parser.add_argument('--next-command',help='Claude Code launcher: the one command that advances the orchestrator')
+    parser.add_argument('--inspect-until-next',action='store_true',help='allow status-only startup to yield until next is called')
     args=parser.parse_args()
     event, err = read_event()
     if not isinstance(event, dict):
@@ -118,6 +135,14 @@ def main():
         # A repeated stop must not silently waive a detected boundary violation.
         print(json.dumps(response(args.host,True,message),ensure_ascii=False))
         return
+    if args.inspect_until_next and args.role=='orchestrator' and args.audit_log:
+        try:
+            inspecting=not next_was_run(args.audit_log,args.conversation,args.next_command)
+        except (OSError,ValueError,AttributeError):
+            inspecting=False  # Audit/configuration failures keep the existing blocking behavior.
+        if inspecting:
+            print(json.dumps(response(args.host)))
+            return
     if report['can_yield']:
         print(json.dumps(response(args.host)))
         return

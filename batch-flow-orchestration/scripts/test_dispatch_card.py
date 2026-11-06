@@ -234,9 +234,71 @@ class CardTests(unittest.TestCase):
         self.assertEqual(flow.pre_yield(s)['dispatch_problems'], [])  # lead-held attempt, no orchestrator timer
         (d / 'receipt.txt').write_text('done. agentId: agent-9'); (d / 'result.md').write_text('结果：VERIFIED\n')
         self.assertEqual(self.card('finish', '--store', str(self.store), '--card', cid, '--revision', self.rev(), '--conversation', 'agent-9')['result'], 'VERIFIED')
+        outer_dir = self.store.parent / 'records' / 'dispatch' / outer['card']
+        (outer_dir / 'receipt.txt').write_text('agentId: lead-agent')
+        (outer_dir / 'result.md').write_text('结果：VERIFIED\n结论与依据：执行者已完成\n')
+        self.assertEqual(self.card('finish', '--store', str(self.store), '--card', outer['card'], '--revision', self.rev(),
+                                   '--conversation', 'lead-agent')['result'], 'VERIFIED')
         self.build(lambda p: None)
         err = self.card('make', '--store', str(self.store), '--kind', 'EXECUTE', '--target', 'execute', '--runtime', str(self.runtime), '--as-lead', ok=False)
         self.assertIn('delegate_to_lead', err['error'])
+
+    def architect_gate_fixture(self):
+        def mutate(p):
+            p['roles']['architect'].update(tool='claude', model='opus', effort='default')
+            p['tasks']['gate'] = dict(kind='confirmation', role='architect', scope=['B'], subjects=['code'],
+                                    depends_on=[], consumes=[], dispatch_owner='architect', instruction='verify host evidence')
+            p['tasks']['execute']['depends_on'] = ['gate']
+        self.build(mutate)
+
+    def test_architect_owned_formal_confirmation_finishes_before_board(self):
+        self.architect_gate_fixture()
+        out = self.next(); cid = out['card']
+        directory = self.store.parent / 'records' / 'dispatch' / cid
+        card = json.loads((directory / 'card.json').read_text())
+        self.assertEqual((card['target'], card['role'], card['actor'], card['ledger_start']),
+                         ('gate', 'architect', 'architect', 'start'))
+        prompt = (directory / 'prompt.md').read_text()
+        self.assertIn('你直接承担本台账正式任务', prompt)
+        self.assertNotIn('这是条件确认/裁决类动作，不是台账正式任务', prompt)
+        self.assertIn('不要用 decision_progress 代替', prompt)
+        self.assertIsNone(self.attempt('gate').get('result'))
+        self.agent('s1', 'gate-agent', cid, report='结果：VERIFIED\n结论与依据：已有宿主证据有效\n需登记的操作：无\n')
+        out = self.next()
+        self.assertEqual(self.attempt('gate')['result'], 'VERIFIED')
+        self.assertEqual(flow.status(json.loads(self.store.read_text()))['tasks']['gate'], 'SATISFIED')
+        self.assertEqual(self.attempt('execute')['task'], 'execute')
+        self.assertEqual(out['collected'][0]['card'], cid)
+        self.assertNotEqual(out['card'], cid)
+        self.next()
+        self.assertEqual(len([a for a in json.loads(self.store.read_text())['state']['attempts'] if a['task'] == 'gate']), 1)
+
+    def test_legacy_formal_card_cannot_silently_finish_as_non_task(self):
+        self.architect_gate_fixture()
+        out = self.card('make', '--store', str(self.store), '--kind', 'CONFIRM', '--target', 'gate', '--runtime', str(self.runtime))
+        cid = out['card']; directory = self.store.parent / 'records' / 'dispatch' / cid
+        card = json.loads((directory / 'card.json').read_text())
+        card.update(mode='delegate_to_lead', ledger_start=None, actor='orchestrator')
+        (directory / 'card.json').write_text(json.dumps(card))
+        (directory / 'receipt.txt').write_text('agentId: old-agent')
+        (directory / 'result.md').write_text('结果：VERIFIED\n需登记的操作：decision_progress\n')
+        out = self.card('finish', '--store', str(self.store), '--card', cid, '--revision', self.rev(),
+                        '--conversation', 'old-agent', ok=False)
+        self.assertIn('旧正式任务卡缺少 start/attempt', out['error'])
+        self.assertEqual(json.loads(self.store.read_text())['state']['attempts'], [])
+        if (directory / 'state.json').exists():
+            self.assertFalse(json.loads((directory / 'state.json').read_text()).get('finished'))
+
+    def test_architect_formal_wait_keeps_board_blocked_and_routes_diagnosis(self):
+        self.architect_gate_fixture()
+        cid = self.next()['card']
+        self.agent('s1', 'gate-agent', cid, report='结果：WAIT_EVIDENCE\n结论与依据：缺少宿主实证\n')
+        self.next()
+        s = json.loads(self.store.read_text())
+        self.assertEqual(self.attempt('gate')['result'], 'WAIT_EVIDENCE')
+        self.assertEqual(flow.status(s)['tasks']['execute'], 'WAIT_DEPENDENCY')
+        self.assertEqual(len([a for a in s['state']['attempts'] if a['task'] == 'gate']), 1)
+        self.assertTrue(s['decisions'])
 
     def confirmation_fixture(self, delegate):
         def mutate(p):

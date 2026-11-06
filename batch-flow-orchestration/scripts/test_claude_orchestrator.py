@@ -44,6 +44,9 @@ class LauncherTests(unittest.TestCase):
                     self.assertIn(sid, h['command'])
         self.assertIn('--card-root', hooks['PreToolUse'][0]['hooks'][0]['command'])
         argv = out['argv']
+        self.assertIn('现在只运行 status', argv[-1])
+        self.assertNotIn('现在运行 next', argv[-1])
+        self.assertIn('--inspect-until-next', hooks['Stop'][0]['hooks'][0]['command'])
         self.assertEqual(argv[argv.index('--session-id') + 1], sid)
         self.assertEqual(argv[argv.index('--model') + 1], 'haiku')
         agents = json.loads(argv[argv.index('--agents') + 1])

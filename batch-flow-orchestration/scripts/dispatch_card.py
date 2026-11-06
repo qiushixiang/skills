@@ -303,6 +303,11 @@ def render_prompt(card, payload, s, store, task_base, workspace):
                   '', '    ' + inner, '',
                   '执行角色交付后，按技术负责人职责核对其原始证据与验收项；台账只经 flow.py 登记，不直接写 flow.json。'
                   '你的交付写明子卡 ID、执行角色结果、核对结论，以及仍需派发责任人代交的操作（参数文件放在 ' + card['dir'] + ' 下）。']
+    elif role == 'architect' and card.get('ledger_start') == 'start':
+        lines += ['', '## 你直接承担本台账正式任务（role=architect）',
+                  '这是台账正式任务 %s（动作 %s）。按本任务指令核验并交付，不再派发子代理。' % (target, kind),
+                  'dispatch_card.py 在调用前登记 start，回收后按首行结果登记 finish；不要用 decision_progress 代替本任务完成。'
+                  '附加条件确认仍在“需登记的操作”列出，由派发责任人原样代交。']
     elif card['mode'] == 'delegate_to_lead' and is_agent_tool(card['tool']):
         lines += ['', '## 你负责核对本动作（不派发执行者）',
                   '这是条件确认/裁决类动作，不是台账正式任务：不要拉起执行者或审阅者，也不要自己实现。实际工作由对应正式任务完成；'
@@ -348,6 +353,12 @@ def make(args):
         need(lead_dispatchable(s, args.kind, args.target),
              '%s %s 不是台账正式任务：条件确认只由技术负责人核对，不另派执行者（实际工作走对应正式任务）' % (args.kind, args.target))
         mode = 'dispatch'
+    # The owner is also the performer: dispatch the formal task directly, so its
+    # result goes through start/finish rather than the non-task handback path.
+    self_owned_task = (mode == 'delegate_to_lead' and payload.get('role') == 'architect'
+                       and lead_dispatchable(s, args.kind, args.target))
+    if self_owned_task:
+        mode = 'dispatch'
     if mode == 'delegate_to_lead':
         role = 'architect'; config = dict(s['plan']['roles'].get('architect') or {})
         need(config, 'plan.roles.architect 未配置，无法移交局部技术负责人')
@@ -388,7 +399,7 @@ def make(args):
     card = dict(format=FORMAT, id=card_id, dir=str(directory), store=str(store), revision=s['revision'], kind=args.kind,
                 goal_context_hash=flow.digest(flow.goal_context(s, payload)), decision=payload.get('decision'),
                 target=args.target, mode=mode, role=role, tool=tool, model=model, effort=effort,
-                actor='architect' if as_lead else 'orchestrator', lead=as_lead, launch=(spec or {}).get('launch_id'),
+                actor='architect' if as_lead or self_owned_task else 'orchestrator', lead=as_lead, launch=(spec or {}).get('launch_id'),
                 subjects=flow.current_subjects(s, args.target) if args.target in s['plan']['tasks'] else None,
                 access='write' if role in WRITE_ROLES else 'read', resume=resume, created_at=now(),
                 ledger_start='start' if args.target in s['plan']['tasks'] and args.kind in TASK_KINDS and mode == 'dispatch'
@@ -629,6 +640,11 @@ def finish_card(store, directory, revision, conversation_arg=None):
     text = result_path.read_text(encoding='utf-8')
     value = parse_result(text)
     out = dict(ok=True, card=card['id'], result=value, result_file=str(result_path), conversation_id=conversation)
+    current = load_json(store)
+    need(not (card['ledger_start'] != 'start' and card.get('role') == 'architect'
+              and lead_dispatchable(current, card['kind'], card['target'])
+              and current['plan']['tasks'][card['target']]['role'] == 'architect'),
+         '旧正式任务卡缺少 start/attempt，不能按非任务交付回收；请核对已有证据后按当前正式任务入口重新登记，不回填历史 attempt')
     if card['ledger_start'] != 'start':
         if card['kind'] == 'CONFIRM_CONDITION' and value == 'WAIT_EVIDENCE':
             res = register_confirmation_wait(store, card, result_path, revision)

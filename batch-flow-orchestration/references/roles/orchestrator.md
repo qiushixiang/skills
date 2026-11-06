@@ -27,7 +27,9 @@ Linux CLI 的 `cli_adapter` 指向[固定派发入口](../linux-cli.md)。按其
 
 ### 派发只用 next（两宿主相同）
 
-编排者只运行 `scripts/dispatch_card.py next --store <台账>`，按输出 `do` 办：
+两个启动器初始只运行 `scripts/flow.py --store <台账> status`，展示状态后结束本轮，等待用户明确要求继续；此时 Stop hook 不因存在可派发任务而强制推进。首次调用 next 后恢复正常推进与交还门禁，角色审计仍生效。
+
+用户要求继续后，编排者运行 `scripts/dispatch_card.py next --store <台账>`，按输出 `do` 办：
 
 - `call`：逐字照抄 `tool` 与 `input` 发起这一个调用（字段一个不改），返回后立即再运行 next。
 - `wait`：有工作在运行，结束本轮等完成通知（AGY 用 command_status/wait），之后运行 next。

@@ -1574,6 +1574,7 @@ def operate(s, op, actor, root, at):
                 previous['budget_approval']=copy.deepcopy(d['budget_approval'])
             else:
                 require(not previous or not previous.get('budget_approval'),'budget approval scope is immutable; use a new user condition for new authorization')
+                require(not requirement_ok(s, req) or 'budget_approval' in d, 'confirmation already satisfied; if a formal plan task is READY, complete it with start/finish instead of repeating decision_progress')
                 s['state']['confirmations'][req['id']] = {'decision': d['id'], 'evidence': hashes}
                 if 'budget_approval' in d:s['state']['confirmations'][req['id']]['budget_approval']=copy.deepcopy(d['budget_approval'])
         else:

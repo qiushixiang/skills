@@ -22,12 +22,30 @@ class HookTests(unittest.TestCase):
         state,_=flow.apply_request(state,auth,self.root)
         self.store=self.root/'flow.json';self.store.write_text(json.dumps(state))
     def tearDown(self):self.tmp.cleanup()
-    def run_hook(self,host,event,role='orchestrator',conversation='owner-1',audit_log=None):
+    def run_hook(self,host,event,role='orchestrator',conversation='owner-1',audit_log=None,extra=()):
         argv=[sys.executable,str(SCRIPT),'--host',host,'--store',str(self.store),'--role',role,'--conversation',conversation]
         if audit_log:argv+=['--audit-log',str(audit_log)]
+        argv+=list(extra)
         run=subprocess.run(argv,input=json.dumps(event),capture_output=True,text=True,timeout=10)
         self.assertEqual(run.returncode,0,run.stderr)
         return json.loads(run.stdout)
+    def test_startup_status_yields_until_owner_calls_next(self):
+        import shlex
+        command=shlex.join([sys.executable,str(SCRIPT.with_name('dispatch_card.py')),'next','--store',str(self.store)])
+        for host in ['claude','agy']:
+            log=self.root/(host+'-inspect.jsonl')
+            bound={'conversationId':'owner-1'} if host=='agy' else {'session_id':'owner-1'}
+            def record(cmd):
+                event=dict(bound,toolCall=dict(name='run_command',args=dict(CommandLine=cmd))) if host=='agy' else dict(bound,tool_name='Bash',tool_input=dict(command=cmd))
+                role_audit.append_event(log,host,'owner-1',event)
+            role_audit.append_event(log,host,'owner-1',bound,begin=True)
+            record(shlex.join([sys.executable,str(SCRIPT.with_name('flow.py')),'--store',str(self.store),'status']))
+            extra=['--inspect-until-next','--next-command',command]
+            self.assertEqual(self.run_hook(host,bound,audit_log=log,extra=extra),{'decision':'stop'} if host=='agy' else {})
+            record(command)
+            result=self.run_hook(host,bound,audit_log=log,extra=extra)
+            self.assertEqual(result['decision'],'continue' if host=='agy' else 'block')
+
     def test_host_specific_continue_and_session_binding(self):
         agy=self.run_hook('agy',{'conversationId':'owner-1','terminationReason':'model_stop'})
         codex=self.run_hook('codex',{'session_id':'owner-1','stop_hook_active':False})
@@ -90,6 +108,8 @@ class HookTests(unittest.TestCase):
                 report=self.run_hook(host,dict(bound,stop_hook_active=active),audit_log=log)
                 self.assertEqual(report['decision'],'continue' if host=='agy' else 'block')
                 self.assertIn('role audit violation',report['reason'])
+            inspected=self.run_hook(host,bound,audit_log=log,extra=['--inspect-until-next','--next-command','unused'])
+            self.assertIn('role audit violation',inspected['reason'])
             self.assertEqual(self.run_hook(host,dict(bound,terminationReason='user_canceled'),audit_log=log),{'decision':'stop'} if host=='agy' else {})
         # Ordinary task-state loop prevention still applies to a local architect;
         # orchestrator-specific auditing does not inspect the architect's work.

@@ -65,7 +65,9 @@ def next_command(spec):
 
 
 def loop_text(spec):
-    return ('\n工作方式（与 Claude Code 编排者相同）：只运行 '+next_command(spec)+'，按输出的 do 字段办：'
+    status=shlex.join([spec['python'],str(SCRIPTS/'flow.py'),'--store',spec['store'],'status'])
+    return ('\n启动时先运行 '+status+'，展示状态后结束本轮，等用户明确要求继续；不要自动运行 next。'
+            '\n用户要求继续后，运行 '+next_command(spec)+'，按输出的 do 字段办：'
             'do=call 时逐字照抄 tool 与 input 发起这一个调用（字段一个不改），返回后立即再运行 next；'
             'do=wait 时用 command_status/wait 等在跑的命令结束，再运行 next；'
             'do=ask_user 时把 items 原样告诉用户，拿到原话后按 todo 用 flow.py 登记，再运行 next；'
@@ -252,7 +254,7 @@ def hook(event_name,runtime,event,environ=None):
             return {'decision':'stop','reason':'No initialized ledger yet; report missing approved plan/role configuration to the user. This is not project completion.'}
         command=[spec['python'],str(SCRIPTS/'stop_hook_pre_yield.py'),'--host','agy','--store',spec['store'],
                  '--role','orchestrator','--conversation',owner,'--audit-log',str(Path(runtime)/'audit.jsonl'),
-                 '--next-command',next_command(spec)]
+                 '--inspect-until-next','--next-command',next_command(spec)]
         result=subprocess.run(command,input=json.dumps(event),capture_output=True,text=True,timeout=15,check=True)
         return json.loads(result.stdout)
     return {}
@@ -325,7 +327,7 @@ def launch(args):
     spec['runtime']=str(runtime)
     argv=[binary,'--agent',AGENT,'--model',args.model,'--effort',args.effort,'--mode','accept-edits',
           '--settings',json.dumps({'toolPermission':'request-review','enableTerminalSandbox':False}),
-          '--prompt-interactive','你是 batch-flow 编排者。'+capabilities()+'\n当前任务 base：'+str(task_base)+'\n本任务台账：'+str(store)+'\n只协调这个任务，不搜索或切换其他任务。'+loop_text(spec)+'\n现在运行 next。']
+          '--prompt-interactive','你是 batch-flow 编排者。'+capabilities()+'\n当前任务 base：'+str(task_base)+'\n本任务台账：'+str(store)+'\n只协调这个任务，不搜索或切换其他任务。'+loop_text(spec)+'\n现在只运行 status 并展示状态，等用户明确要求继续后再运行 next。']
     if not within(task_base,workspace):argv[1:1]=['--add-dir',str(task_base)]
     print(capabilities(),flush=True)
     print('主模型：'+args.model+' / '+args.effort+'；台账：'+str(store),flush=True)
