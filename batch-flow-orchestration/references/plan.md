@@ -61,4 +61,5 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow init --plan plan.
 - `protected`：受保护路径 glob（如 `tests/run_board_test.sh`）。执行者改动即登记为 FAILED 并转技术负责人（trigger `protected_change`）；放开须裁决 `open` 带 `allow_protected`，并经用户批准。
 - `no_review`：交付目标不属于任何审阅组时必须写明原因，否则计划不通过。
 - `design_ref`：设计文档章节标题（有 `design.path` 时每个交付目标必填，须能匹配标题）。脚本记下章节哈希（`design.sections`）；章节后来被改，相关交付目标暂停派发，并开 `design_drift` 裁决（处置 `{"refresh_design": true}` 表示方案不变，重新固定哈希）。
+- 可选 `deliverables.*.non_goals`（字符串列表，卡片目标节列出“不要做”）与 `review_groups.*.focus`（字符串，审阅卡列出审阅重点）。计划编制方法见 [技术负责人](technical-lead.md)。
 - `instruction`、`acceptance` 不得为空。`policy.rounds.review < 1 + 返修链长度` 时写入 `plan.warnings`，审阅轮次可能不够。

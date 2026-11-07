@@ -16,9 +16,32 @@ EXECUTOR = ['结果：VERIFIED | FAILED | ARCH_DECISION_REQUIRED | WAIT_EVIDENCE
 REVIEWER = ['结果：RELEASE | FIX_REQUIRED', '固定版本：<被审版本>', '复跑与证据：<records/ 下证据文件的绝对路径>', '未复跑原因：（沿用执行者记录而未亲自复跑时必填）',
             '阻断：B1 | 返修:<交付目标> | 方案级:是/否 | 关闭条件:...（FIX_REQUIRED 时每项一行）',
             '非阻断建议：...', '候选新项：（可选）']
-SCHEMA = ('{"diagnosis": "...", "actions": [{"open": "implement|repair|review|triage", "target": "...", "input": {...}}, '
-          '{"supersede": "WO-n", "reason": "..."}, {"retry": "WO-n", "reason": "...", "fresh_session": false}, '
-          '{"plan_revision": "<草案路径>"}, {"grant": {"<目标>": {"implement": 1}}}, {"ask_user": "<问题>"}]}')
+REFS = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'references')
+NORMS = {
+    'implement': [('engineering.md', '必要验证、证据标准、复杂度与最小改动'), ('roles.md', '执行者')],
+    'review': [('engineering.md', '审阅边界与问题处置、证据标准'), ('roles.md', '审阅者')],
+    'decide': [('technical-lead.md', '裁决（decide）')],
+    'triage': [('technical-lead.md', '分诊（triage）')],
+}
+NORMS['repair'] = NORMS['implement']
+SCHEMA = (
+    '{"diagnosis": "...", "actions": [ 动作… ]}，每个动作恰有一种键：\n'
+    '- {"open": "implement|repair|review|triage", "target": "<交付目标/审阅组/批次>", "input": {"instruction": "..."}, '
+    '"allow_protected": ["<glob>"], "fresh_session": false}  开立工单；allow_protected 放开受保护路径 → 转用户；目标在授权包络外 → 转用户\n'
+    '- {"supersede": "WO-n", "reason": "..."}  作废工单；对象是审阅、放行或有依赖方的工单 → 转用户\n'
+    '- {"retry": "WO-n", "reason": "...", "fresh_session": false}  重新开放失败/开立中的工单\n'
+    '- {"grant": {"<目标>": {"implement": 1}}}  追加额度 → 转用户\n'
+    '- {"plan_revision": "<草案路径>"}  修订计划 → 转用户\n'
+    '- {"ask_user": "<问题>", "options": [...]}  向用户提问\n'
+    '- {"refresh_design": true}  设计文档措辞调整、方案不变时重新固定章节哈希（design_drift 触发用）\n'
+    '其余动作在授权包络内由脚本直接执行。')
+
+
+def _norms(o):
+    rows = NORMS.get(o['type'])
+    if not rows:
+        return ''
+    return _lines('%s：%s' % (os.path.join(REFS, f), s) for f, s in rows)
 
 
 def _lines(xs):
@@ -40,6 +63,8 @@ def _goal(state, o):
     for d in model.deliverables_of(plan, o['target']):
         spec = plan['deliverables'][d]
         out.append('交付目标 %s %s；验收：%s' % (d, spec['title'], '；'.join(spec['acceptance']) or '见指令'))
+        if spec.get('non_goals'):
+            out.append('非目标（不要做）：%s' % '；'.join(spec['non_goals']))
     return '\n'.join(out)
 
 
@@ -102,6 +127,9 @@ def _body(state, o, run_dir):
                     out.append('- %s（返修:%s）关闭条件：%s' % (f['id'], rep['target'], f['closure']))
         else:
             out.append('首审：独立复跑验收并核对证据，不沿用作者的结论。')
+        focus = plan['review_groups'].get(o['target'], {}).get('focus')
+        if focus:
+            out.append('审阅重点：%s' % focus)
         return '\n'.join(out)
     if t == 'decide':
         out = ['触发：%s；对象工单 %s，运行 %s。' % (inp.get('trigger'), inp.get('subject'), inp.get('run')),
@@ -133,6 +161,8 @@ def render(state, order_id, assignment, run_dir=None):
     o = state.orders[order_id]
     parts = [('目标', _goal(state, o)), ('环境', _environment(state, assignment, run_dir)),
              ('本单', _body(state, o, run_dir)), ('约束', _constraints(state, o)), ('交付', _delivery(o))]
+    if _norms(o):
+        parts.insert(4, ('规范', '按下列文件的对应章节工作：\n' + _norms(o)))
     head = '# 工单 %s（%s，%s）' % (o['id'], o['type'], o['target'] or '-')
     return head + '\n\n' + '\n\n'.join('## %s\n%s' % p for p in parts) + '\n'
 
