@@ -364,3 +364,37 @@ scripts/agent_cli.py      保留（CLI 适配器，已验证的宿主细节）
 | `bf/cli.py --base <dir> <cmd>` | `status`、`report`、`run [--parallel N]`、`stop`、`resume`、`answer <id> --file <原话> --approve|--reject`、`init --plan <json> --approval <file>`、`revise --plan <json> --approval <file>` |
 | `front.allowed(command) -> bool` | 只放行 `<python> <bf/cli.py> --base <dir> {status, report, run, stop, resume, answer}` 的单条命令，拒绝管道、重定向、分号、其他脚本与写操作子命令 |
 | triage 候选项 ID | 每张 triage 工单内按出现顺序编号 `C1, C2, …` |
+
+## 19. 阶段 C 契约：模型扩展与 v1 导入
+
+以 `scripts/test_bf_import.py` 为准。
+
+### 19.1 计划模型扩展（真实计划需要）
+
+- 审阅组可以跨批次，此时必须写 `batch`（决定由哪个批次的 release 等待它）；`reviewer: reviewer | third_party` 指定审阅角色。
+- 一个交付目标可以属于多个审阅组（常规审阅 + 阶段第三方审阅）；后开立的 implement 加入它所在的全部开立中的审阅。
+- `depends_on` 可以引用审阅组 ID：该组的 review 工单完成才算满足（用于“本地提交”这类必须在审阅通过后进行的交付目标）。
+- “本地提交”等不新增类型，按普通交付目标（implement）处理。
+
+### 19.2 v1 导入 `importer.import_v1(v1_store, base, approval) -> report`
+
+| v1 | v2 |
+|---|---|
+| plan.batches（按定义顺序） | batches |
+| design / execute / commit / verify 任务，以及 role≠orchestrator 的 confirmation 任务（非 retired、非 decision_only） | deliverables：instruction、acceptance（取任务 goal_contract.acceptance）、batch（scope 最后一个）|
+| review / third_party 任务 | review_groups：成员 = v1 `review_sources`；跨批次时 batch = scope 最后一个；third_party → `reviewer: third_party` |
+| acceptance 任务 | 丢弃（release 自动）；依赖它的任务改为依赖它的依赖（递归展开） |
+| 任务 depends_on | 依赖 deliverable 或审阅组 ID |
+| roles：executor / architect / reviewer / third_party；handoff.backup | executor / lead / reviewer / third_party / backup_executor |
+| cli_execution | env |
+| plan.goal_contract | goal：objective、constraints（acceptance）、non_goals |
+| authorized_batches | envelope.batches |
+| design 关联 | design：path、sha256 |
+| v1 已成功的任务 | 对应工单 done，带一条 `performer: imported` 的运行，证据取 v1 最新尝试的证据哈希；批次完成任务成功 → release done |
+| v1 未成功的任务 | 开立的新工单，无运行（用户决定重新执行），v1 尝试列入报告 `v1_attempts_not_carried` |
+
+- 目标目录必须不存在已初始化的 v2；approval 是用户同意切换的原话文件。
+- v1 文件只读，导入前后哈希不变。
+- 报告写入 `<base>/import-report.json`：`deliverables, done, open, dropped, v1_open_decisions, v1_attempts_not_carried, broken_evidence`。
+- 导入时证据已不符的列入 `broken_evidence`，其依赖方按 I5 不可派发。
+- CLI：`bf/cli.py --base <dir> import --v1 <flow.json> --approval <file>`。
