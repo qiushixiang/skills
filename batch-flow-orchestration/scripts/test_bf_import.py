@@ -61,7 +61,7 @@ class ModelExtensions(unittest.TestCase):  # §19.1
         for target in ['D1', 'D2']:
             oid = api.orders(api.load(self.base), type='implement', target=target)[0]['id']
             rid = api.start(self.base, oid)
-            ev = self.base / 'records' / ('%032x.json' % len(target + oid))
+            ev = self.base / 'records' / ('%032x.json' % (len(target + oid) * 10 + ord(target[-1])))
             ev.write_text(target)
             api.deliver(self.base, oid, rid, '结果：VERIFIED\n停止原因：完成\n验证证据：%s\n' % ev, conversation_id='c' + target)
         commit = api.orders(api.load(self.base), type='implement', target='C12')[0]['id']
