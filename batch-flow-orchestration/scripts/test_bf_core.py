@@ -107,7 +107,7 @@ class Base(unittest.TestCase):
     def fix(self, *findings):
         return '结果：FIX_REQUIRED\n复跑与证据：%s\n%s\n' % (self.evidence(), '\n'.join(findings))
 
-    def run(self, order_id, text, events=(), conversation_id=None, start_conversation=None, **kw):
+    def go(self, order_id, text, events=(), conversation_id=None, start_conversation=None, **kw):
         run_id = api.start(self.base, order_id, conversation_id=start_conversation)
         return api.deliver(self.base, order_id, run_id, text, events=events,
                            conversation_id=conversation_id or 'conv-%s-%s' % (order_id, run_id), **kw)
@@ -116,8 +116,8 @@ class Base(unittest.TestCase):
         return self.one('implement', target)['id']
 
     def verify_batch1(self):
-        self.run(self.impl('D1'), self.done())
-        self.run(self.impl('D2'), self.done())
+        self.go(self.impl('D1'), self.done())
+        self.go(self.impl('D2'), self.done())
 
 
 class StoreInvariants(Base):
@@ -162,15 +162,15 @@ class StoreInvariants(Base):
         self.assertEqual(json.loads(lines[-1])['request_id'], 'req-1')
 
     def test_state_is_derived_from_files_only(self):  # I7
-        self.run(self.impl('D1'), self.done())
+        self.go(self.impl('D1'), self.done())
         before = api.runnable(self.st(), parallel=3)
         self.assertEqual(api.runnable(api.load(self.base), parallel=3), before)
 
     def test_runs_are_append_only(self):  # I9
         oid = self.impl('D1')
-        self.run(oid, INFEASIBLE)
+        self.go(oid, INFEASIBLE)
         first = copy.deepcopy(self.one('implement', 'D1')['runs'][0])
-        self.run(oid, INFEASIBLE)
+        self.go(oid, INFEASIBLE)
         runs = self.one('implement', 'D1')['runs']
         self.assertEqual(len(runs), 2)
         self.assertEqual(runs[0], first)
@@ -189,7 +189,7 @@ class Selection(Base):
         st = self.st()
         self.assertEqual(api.runnable(st), [self.impl('D1')])
         self.assertEqual(api.runnable(st, parallel=3), [self.impl('D1'), self.impl('D2')])  # D3 waits for D1, D2
-        self.run(self.impl('D1'), NEEDS_DECISION)
+        self.go(self.impl('D1'), NEEDS_DECISION)
         decide = self.one('decide', 'D1')['id']
         self.assertEqual(api.runnable(self.st(), parallel=3), [decide, self.impl('D2')])  # decide before implement
 
@@ -208,7 +208,7 @@ class Selection(Base):
         self.assertEqual(api.runnable(self.st(), parallel=5), [self.impl('D1'), self.impl('D2')])
 
     def test_open_decide_blocks_its_target_only(self):  # §5.4
-        self.run(self.impl('D1'), NEEDS_DECISION)
+        self.go(self.impl('D1'), NEEDS_DECISION)
         runnable = api.runnable(self.st(), parallel=5)
         self.assertNotIn(self.impl('D1'), runnable)
         self.assertIn(self.impl('D2'), runnable)
@@ -265,7 +265,7 @@ class Gate(Base):
     def test_legal_environment_block_without_work_is_exempt_and_opens_decide(self):  # §7
         oid = self.impl('D1')
         blocked = cmd("/bin/bash -lc '%s preflight'" % ENTRY, 1, 'ERROR: Sandbox detected: NoNewPrivs is 1')
-        out = self.run(oid, ENV_BLOCK, events=[blocked])
+        out = self.go(oid, ENV_BLOCK, events=[blocked])
         self.assertTrue(out['legal'])
         run = self.one('implement', 'D1')['runs'][0]
         self.assertEqual((run['result'], run['exempt']), ('WAIT_EVIDENCE', True))
@@ -274,7 +274,7 @@ class Gate(Base):
 
     def test_environment_block_after_edits_is_charged(self):  # §7
         blocked = cmd("/bin/bash -lc '%s preflight'" % ENTRY, 1, 'ERROR: Sandbox detected')
-        self.run(self.impl('D1'), ENV_BLOCK, events=[EDIT, blocked])
+        self.go(self.impl('D1'), ENV_BLOCK, events=[EDIT, blocked])
         self.assertFalse(self.one('implement', 'D1')['runs'][0]['exempt'])
 
     def test_review_findings_must_be_structured_and_in_group(self):  # §10.2
@@ -291,7 +291,7 @@ class Routing(Base):
         review = self.one('review', 'R12')['id']
         self.assertEqual(api.runnable(self.st()), [review])
         self.assertEqual(api.assign(self.st(), review)['role'], 'reviewer')
-        self.run(review, self.release_text())
+        self.go(review, self.release_text())
         release = self.one('release', 'B1')['id']
         runnable = api.runnable(self.st(), parallel=5)
         self.assertIn(release, runnable)
@@ -304,7 +304,7 @@ class Routing(Base):
     def test_fix_required_repairs_only_named_target_with_findings(self):  # §5.2, problem 5/6
         self.verify_batch1()
         review = self.one('review', 'R12')['id']
-        self.run(review, self.fix('阻断：B1 | 返修:D1 | 方案级:否 | 关闭条件:改正报告文字'))
+        self.go(review, self.fix('阻断：B1 | 返修:D1 | 方案级:否 | 关闭条件:改正报告文字'))
         repair = self.one('repair', 'D1')
         self.assertEqual(api.orders(self.st(), type='repair', target='D2'), [])
         self.assertEqual([f['id'] for f in repair['input']['findings']], ['B1'])
@@ -317,23 +317,23 @@ class Routing(Base):
         out = api.deliver(self.base, repair['id'], rid, self.done('阻断关闭：B1=已关闭 已改第 2.3 节\n'), events=[EDIT])
         self.assertTrue(out['legal'])
         self.assertEqual(api.runnable(self.st()), [review])
-        self.run(review, self.release_text())
+        self.go(review, self.release_text())
         self.assertEqual(self.one('review', 'R12')['state'], 'done')
 
     def test_repair_chain_does_not_inherit_implement_stage(self):  # §8, problem 7
         oid = self.impl('D1')
         for _ in range(3):
-            self.run(oid, INFEASIBLE)
+            self.go(oid, INFEASIBLE)
         self.assertEqual(api.assign(self.st(), oid)['stage'], 'backup')
-        self.run(oid, self.done())
-        self.run(self.impl('D2'), self.done())
-        self.run(self.one('review', 'R12')['id'], self.fix('阻断：B1 | 返修:D1 | 方案级:否 | 关闭条件:x'))
+        self.go(oid, self.done())
+        self.go(self.impl('D2'), self.done())
+        self.go(self.one('review', 'R12')['id'], self.fix('阻断：B1 | 返修:D1 | 方案级:否 | 关闭条件:x'))
         a = api.assign(self.st(), self.one('repair', 'D1')['id'])
         self.assertEqual((a['stage'], a['model']), ('primary', 'exec-m'))
 
     def test_plan_level_finding_goes_to_lead(self):  # §8
         self.verify_batch1()
-        self.run(self.one('review', 'R12')['id'], self.fix('阻断：B1 | 返修:D2 | 方案级:是 | 关闭条件:改方案'))
+        self.go(self.one('review', 'R12')['id'], self.fix('阻断：B1 | 返修:D2 | 方案级:是 | 关闭条件:改方案'))
         a = api.assign(self.st(), self.one('repair', 'D2')['id'])
         self.assertEqual((a['stage'], a['role']), ('lead', 'lead'))
 
@@ -344,13 +344,13 @@ class Routing(Base):
         self.verify_batch1()
         review = self.one('review', 'R12')['id']
         finding = '阻断：B1 | 返修:D1 | 方案级:否 | 关闭条件:x'
-        self.run(review, self.fix(finding))
+        self.go(review, self.fix(finding))
         stages = []
         for _ in range(4):
             repair = self.one('repair', 'D1')
             stages.append(api.assign(self.st(), repair['id'])['stage'])
-            self.run(repair['id'], self.done('阻断关闭：B1=已关闭 y\n'), events=[EDIT])
-            self.run(review, self.fix(finding))
+            self.go(repair['id'], self.done('阻断关闭：B1=已关闭 y\n'), events=[EDIT])
+            self.go(review, self.fix(finding))
         self.assertEqual(stages, ['primary', 'primary', 'backup', 'lead'])
         self.assertEqual(len(api.orders(self.st(), type='repair', target='D1')), 1)  # same order reopened
         with self.assertRaises(BfError):
@@ -363,7 +363,7 @@ class Routing(Base):
         for _ in range(5):
             a = api.assign(self.st(), oid)
             stages.append((a['stage'], a['model']))
-            self.run(oid, INFEASIBLE)
+            self.go(oid, INFEASIBLE)
         self.assertEqual(stages, [('primary', 'exec-m')] * 3 + [('backup', 'backup-m'), ('lead', 'lead-m')])
         with self.assertRaises(BfError):
             api.assign(self.st(), oid)
@@ -372,12 +372,12 @@ class Routing(Base):
         self.assertEqual(api.assign(self.st(), decide['id'])['role'], 'lead')
 
     def test_decide_within_envelope_executes_directly(self):  # §7
-        self.run(self.impl('D1'), NEEDS_DECISION)
+        self.go(self.impl('D1'), NEEDS_DECISION)
         decide = self.one('decide', 'D1')['id']
         decision = {'diagnosis': '按方案 B 继续', 'actions': [
             {'open': 'implement', 'target': 'D2', 'input': {'instruction': '补充 D2 的接口说明'}},
             {'retry': self.impl('D1'), 'reason': '按方案 B', 'fresh_session': True}]}
-        out = self.run(decide, '结果：VERIFIED\n停止原因：完成\n', decision=decision)
+        out = self.go(decide, '结果：VERIFIED\n停止原因：完成\n', decision=decision)
         self.assertTrue(out['legal'])
         self.assertEqual(self.one('decide', 'D1')['state'], 'done')
         self.assertEqual(len(api.orders(self.st(), type='implement', target='D2')), 2)
@@ -385,18 +385,18 @@ class Routing(Base):
         self.assertEqual(api.assign(self.st(), self.impl('D1'))['session']['mode'], 'fresh')
 
     def test_decide_supersede(self):  # §7
-        self.run(self.impl('D1'), NEEDS_DECISION)
+        self.go(self.impl('D1'), NEEDS_DECISION)
         decide = self.one('decide', 'D1')['id']
-        self.run(decide, '结果：VERIFIED\n停止原因：完成\n',
+        self.go(decide, '结果：VERIFIED\n停止原因：完成\n',
                  decision={'diagnosis': 'd', 'actions': [{'supersede': self.impl('D1'), 'reason': '目标已由 D2 覆盖'}]})
         self.assertEqual(api.orders(self.st(), type='implement', target='D1')[0]['state'], 'superseded')
 
     def test_grant_or_plan_change_asks_user(self):  # §7, I2, I6
         oid = self.impl('D1')
         for _ in range(5):
-            self.run(oid, INFEASIBLE)
+            self.go(oid, INFEASIBLE)
         decide = self.one('decide', 'D1')['id']
-        self.run(decide, '结果：VERIFIED\n停止原因：完成\n',
+        self.go(decide, '结果：VERIFIED\n停止原因：完成\n',
                  decision={'diagnosis': 'd', 'actions': [{'grant': {'D1': {'implement': 2}}}]})
         ask = self.one('ask_user', 'D1')
         self.assertIn(ask['id'], self.one('implement', 'D1')['needs'])
@@ -408,8 +408,8 @@ class Routing(Base):
     def test_rejected_answer_returns_to_lead(self):  # §7
         oid = self.impl('D1')
         for _ in range(5):
-            self.run(oid, INFEASIBLE)
-        self.run(self.one('decide', 'D1')['id'], '结果：VERIFIED\n停止原因：完成\n',
+            self.go(oid, INFEASIBLE)
+        self.go(self.one('decide', 'D1')['id'], '结果：VERIFIED\n停止原因：完成\n',
                  decision={'diagnosis': 'd', 'actions': [{'grant': {'D1': {'implement': 1}}}]})
         api.answer(self.base, self.one('ask_user', 'D1')['id'], '不加预算，缩小范围', approve=False)
         decides = api.orders(self.st(), type='decide', target='D1', state_='open')
@@ -432,19 +432,19 @@ class Routing(Base):
 
     def test_decide_limit_per_source_then_ask_user(self):  # §8
         oid = self.impl('D1')
-        self.run(oid, NEEDS_DECISION)
+        self.go(oid, NEEDS_DECISION)
         for _ in range(2):
             decide = self.one('decide', 'D1', state_='open')['id']
-            self.run(decide, '结果：VERIFIED\n停止原因：完成\n', decision={'diagnosis': 'still unclear', 'actions': []})
-            self.run(oid, NEEDS_DECISION)
+            self.go(decide, '结果：VERIFIED\n停止原因：完成\n', decision={'diagnosis': 'still unclear', 'actions': []})
+            self.go(oid, NEEDS_DECISION)
         self.assertEqual(len(api.orders(self.st(), type='decide', target='D1')), 2)
         self.assertEqual(api.orders(self.st(), type='decide', target='D1', state_='open'), [])
         self.assertEqual(self.one('ask_user', 'D1')['state'], 'open')
 
     def test_candidates_go_to_batch_triage_and_gate_release(self):  # §5.2, decision 3
-        self.run(self.impl('D1'), self.done('候选新项：\n- CAN 自测偶发超时（records/x）\n- SII 偶发读失败\n'))
-        self.run(self.impl('D2'), self.done())
-        self.run(self.one('review', 'R12')['id'], self.release_text())
+        self.go(self.impl('D1'), self.done('候选新项：\n- CAN 自测偶发超时（records/x）\n- SII 偶发读失败\n'))
+        self.go(self.impl('D2'), self.done())
+        self.go(self.one('review', 'R12')['id'], self.release_text())
         triage = self.one('triage', 'B1')
         self.assertEqual(len(triage['input']['items']), 2)
         release = self.one('release', 'B1')['id']
@@ -463,7 +463,7 @@ class Routing(Base):
 
     def test_budget_never_reset_and_revision_needs_approval(self):  # I2
         oid = self.impl('D1')
-        self.run(oid, INFEASIBLE)
+        self.go(oid, INFEASIBLE)
         plan = copy.deepcopy(self.st().plan)
         with self.assertRaises(BfError):
             api.revise_plan(self.base, plan, Path(self.tmp.name) / 'missing.txt')
@@ -476,8 +476,8 @@ class Routing(Base):
         self.assertEqual(len(self.one('implement', 'D1')['runs']), 1)
 
     def test_broken_evidence_blocks_dependents(self):  # I5
-        self.run(self.impl('D1'), self.done())
-        self.run(self.impl('D2'), self.done())
+        self.go(self.impl('D1'), self.done())
+        self.go(self.impl('D2'), self.done())
         evidence = list(self.one('implement', 'D1')['runs'][0]['evidence'])[0]
         Path(evidence).write_text('changed')
         st = self.st()
@@ -491,13 +491,13 @@ class Context(Base):  # §9
         a = api.assign(self.st(), oid)
         self.assertEqual(a['session']['mode'], 'fresh')
         self.assertTrue(a['session']['rule'])
-        self.run(oid, INFEASIBLE, conversation_id='s1')
+        self.go(oid, INFEASIBLE, conversation_id='s1')
         a = api.assign(self.st(), oid)
         self.assertEqual((a['session']['mode'], a['session']['conversation_id']), ('resume', 's1'))
         rid = api.start(self.base, oid, conversation_id='s1')
         api.deliver(self.base, oid, rid, INFEASIBLE, conversation_id='s1', session_kb=400)
         self.assertEqual(api.assign(self.st(), oid)['session']['mode'], 'fresh')  # over the size limit
-        self.run(oid, INFEASIBLE, conversation_id='s2')
+        self.go(oid, INFEASIBLE, conversation_id='s2')
         a = api.assign(self.st(), oid)
         self.assertEqual(a['stage'], 'backup')
         self.assertEqual(a['session']['mode'], 'fresh')  # stage change
@@ -512,33 +512,33 @@ class Context(Base):  # §9
         self.assertEqual(api.assign(self.st(), oid)['session']['mode'], 'fresh')
 
     def test_repair_review_decide_triage(self):
-        self.run(self.impl('D1'), self.done(), conversation_id='impl-1')
-        self.run(self.impl('D2'), self.done(), conversation_id='impl-2')
+        self.go(self.impl('D1'), self.done(), conversation_id='impl-1')
+        self.go(self.impl('D2'), self.done(), conversation_id='impl-2')
         review = self.one('review', 'R12')['id']
         a = api.assign(self.st(), review)
         self.assertEqual(a['session']['mode'], 'fresh')
-        self.run(review, self.fix('阻断：B1 | 返修:D1 | 方案级:否 | 关闭条件:x'), conversation_id='rev-1')
+        self.go(review, self.fix('阻断：B1 | 返修:D1 | 方案级:否 | 关闭条件:x'), conversation_id='rev-1')
         repair = self.one('repair', 'D1')['id']
         self.assertEqual(api.assign(self.st(), repair)['session']['mode'], 'fresh')
-        self.run(repair, self.done('阻断关闭：B1=已关闭 y\n'), events=[EDIT], conversation_id='rep-1')
+        self.go(repair, self.done('阻断关闭：B1=已关闭 y\n'), events=[EDIT], conversation_id='rep-1')
         a = api.assign(self.st(), review)
         self.assertEqual((a['session']['mode'], a['session']['conversation_id']), ('resume', 'rev-1'))
-        self.run(review, self.release_text(), conversation_id='rev-1')
-        self.run(self.impl('D3'), NEEDS_DECISION, conversation_id='impl-3')
+        self.go(review, self.release_text(), conversation_id='rev-1')
+        self.go(self.impl('D3'), NEEDS_DECISION, conversation_id='impl-3')
         decide = self.one('decide', 'D3')['id']
-        self.run(decide, '结果：VERIFIED\n停止原因：完成\n', decision={'diagnosis': 'd', 'actions': []}, conversation_id='lead-1')
-        self.run(self.impl('D3'), NEEDS_DECISION, conversation_id='impl-3')
+        self.go(decide, '结果：VERIFIED\n停止原因：完成\n', decision={'diagnosis': 'd', 'actions': []}, conversation_id='lead-1')
+        self.go(self.impl('D3'), NEEDS_DECISION, conversation_id='impl-3')
         second = api.orders(self.st(), type='decide', target='D3', state_='open')[0]['id']
         a = api.assign(self.st(), second)
         self.assertEqual((a['session']['mode'], a['session']['conversation_id']), ('resume', 'lead-1'))
 
     def test_review_never_resumes_an_author_session(self):  # I4
-        self.run(self.impl('D1'), self.done(), conversation_id='shared')
-        self.run(self.impl('D2'), self.done(), conversation_id='impl-2')
+        self.go(self.impl('D1'), self.done(), conversation_id='shared')
+        self.go(self.impl('D2'), self.done(), conversation_id='impl-2')
         review = self.one('review', 'R12')['id']
-        self.run(review, self.fix('阻断：B1 | 返修:D1 | 方案级:否 | 关闭条件:x'), conversation_id='rev-1')
+        self.go(review, self.fix('阻断：B1 | 返修:D1 | 方案级:否 | 关闭条件:x'), conversation_id='rev-1')
         repair = self.one('repair', 'D1')['id']
-        self.run(repair, self.done('阻断关闭：B1=已关闭 y\n'), events=[EDIT], conversation_id='rev-1')  # same id as reviewer
+        self.go(repair, self.done('阻断关闭：B1=已关闭 y\n'), events=[EDIT], conversation_id='rev-1')  # same id as reviewer
         a = api.assign(self.st(), review)
         self.assertEqual(a['session']['mode'], 'fresh')
         with self.assertRaises(BfError):
@@ -546,14 +546,14 @@ class Context(Base):  # §9
 
     def test_decide_does_not_resume_an_author_lead_session(self):
         oid = self.impl('D1')
-        self.run(oid, NEEDS_DECISION, conversation_id='e0')
-        self.run(self.one('decide', 'D1', state_='open')['id'], '结果：VERIFIED\n停止原因：完成\n',
+        self.go(oid, NEEDS_DECISION, conversation_id='e0')
+        self.go(self.one('decide', 'D1', state_='open')['id'], '结果：VERIFIED\n停止原因：完成\n',
                  decision={'diagnosis': 'd', 'actions': []}, conversation_id='L')
-        self.run(oid, INFEASIBLE, conversation_id='e1')
-        self.run(oid, INFEASIBLE, conversation_id='e2')
-        self.run(oid, INFEASIBLE, conversation_id='e3')  # backup
+        self.go(oid, INFEASIBLE, conversation_id='e1')
+        self.go(oid, INFEASIBLE, conversation_id='e2')
+        self.go(oid, INFEASIBLE, conversation_id='e3')  # backup
         self.assertEqual(api.assign(self.st(), oid)['stage'], 'lead')
-        self.run(oid, NEEDS_DECISION, conversation_id='L', start_conversation='L')  # lead implemented D1 in session L
+        self.go(oid, NEEDS_DECISION, conversation_id='L', start_conversation='L')  # lead implemented D1 in session L
         second = self.one('decide', 'D1', state_='open')['id']
         self.assertEqual(api.assign(self.st(), second)['session']['mode'], 'fresh')
 
