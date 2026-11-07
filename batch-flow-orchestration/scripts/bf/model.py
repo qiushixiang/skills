@@ -66,6 +66,11 @@ def normalize(plan):
         spec.setdefault('reviewer', 'reviewer')
         need(spec['reviewer'] in ('reviewer', 'third_party') and spec['reviewer'] in roles,
              'review group %s: reviewer role %s unavailable' % (g, spec['reviewer']))
+    for g, spec in groups.items():
+        need(isinstance(spec.get('focus', ''), str), 'review group %s: focus must be a string' % g)
+    for d, spec in dels.items():
+        ng = spec.get('non_goals', [])
+        need(isinstance(ng, list) and all(isinstance(x, str) for x in ng), 'deliverable %s: non_goals must be a list of strings' % d)
     covered = set(x for g in groups.values() for x in g['deliverables'])
     for d, spec in dels.items():
         need(d in covered or str(spec.get('no_review') or '').strip(),

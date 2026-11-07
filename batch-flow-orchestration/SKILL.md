@@ -27,10 +27,10 @@ description: 以下情形加载：用户要求使用本技能（batch-flow / 分
 
 | 身份 | 读 |
 |---|---|
-| 技术负责人：编制或修订计划 | [计划编制](references/plan.md) |
+| 技术负责人：编制或修订计划 | [计划编制](references/plan.md)；按需读 [技术负责人](references/technical-lead.md)、[设计书](references/design-book.md)、[工程规范](references/engineering.md) |
 | 聊天前端 | 启动提示即全部规则；需要时读 [运行与恢复](references/operations.md) |
-| 执行者、审阅者、技术负责人（处理工单） | 只按收到的工单卡工作；卡内已含目标、环境、本单要做的事、约束和交付格式。角色要点见 [角色](references/roles.md) |
-| 维护本技能 | [设计书](design/workorder-redesign.md)；改脚本后运行 `scripts/test_bf_core.py`、`test_bf_runner.py`、`test_bf_ops.py`、`bf/test_adapter.py`；改适配器另运行 `test_agent_cli.py`、`test_model_catalog.py` |
+| 执行者、审阅者、技术负责人（处理工单） | 只按收到的工单卡工作；卡内已含目标、环境、本单要做的事、约束和交付格式，并按卡的“## 规范”节读所列文件的对应章节。角色要点见 [角色](references/roles.md) |
+| 维护本技能 | [设计书](design/workorder-redesign.md)；改脚本后运行 `scripts/test_bf_core.py`、`test_bf_runner.py`、`test_bf_ops.py`、`test_bf_integrity.py`、`test_bf_evidence.py`、`test_bf_front.py`、`test_bf_adjust.py`、`test_bf_cards.py`、`bf/test_adapter.py`；改适配器另运行 `test_agent_cli.py`、`test_model_catalog.py` |
 
 ## 硬规则
 
