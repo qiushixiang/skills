@@ -327,3 +327,24 @@ scripts/agent_cli.py      保留（CLI 适配器，已验证的宿主细节）
 2. 默认额度：implement 3 / backup 1 / lead 1 / repair 2 / review 3，同一触发源 decide 上限 2——已同意。
 3. 候选新项分诊位置：每批 release 前——待确认。
 4. 并发：计划阶段声明依赖与独占资源，运行时选择是否并发，默认串行（§6.4）——已定。
+
+## 17. 阶段 A 接口契约
+
+以 `scripts/test_bf_core.py` 为准（测试即规格）；Python 3.8，仅标准库。包 `scripts/bf/`，对外入口 `bf.api`：
+
+| 函数 | 作用 |
+|---|---|
+| `init(base, plan, approval)` | 校验计划，写 plan.json / orders.json / events.jsonl；为每个交付目标开 implement，为每个审阅组开 review，为每个批次开 release |
+| `load(base) -> State` | `.plan`、`.orders`（id→工单）、`.revision`、`.stopped` |
+| `orders(state, type=None, target=None, state_=None)` | 按工单号排序的列表 |
+| `runnable(state, parallel=1)` | 可派发工单 ID，按 §5.4 优先级；release 也在其中 |
+| `assign(state, order_id)` | 纯函数：`{stage, role, tool, model, effort, session:{mode, conversation_id, rule}}`；额度用尽抛 `BfError` |
+| `start(base, order_id, conversation_id=None, expected_revision=None, request_id=None) -> run_id` | 按 assign 登记 run |
+| `deliver(base, order_id, run_id, text, events=(), decision=None, conversation_id=None, session_kb=None, ...)` | 门禁 + 路由；返回 `{legal, reason, outcome: continue/registered, opened:[...]}` |
+| `release(base, order_id)` | 机械放行 |
+| `answer(base, order_id, text, approve)` | 用户回答 ask_user |
+| `revise_plan(base, plan, approval)` | 计划修订（需用户原话文件） |
+| `stop(base)` / `resume(base)` | 用户停止 / 恢复 |
+| `broken_evidence(state)` | 哈希不符的证据列表 |
+
+错误一律抛 `bf.api.BfError`。
