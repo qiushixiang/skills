@@ -98,6 +98,7 @@ def grant(base, target, approval, **rounds):
 def _holds(base, targets, approval, op, hold):
     def fn(st):
         p = st.plan
+        p.setdefault('holds', [])  # plans written before holds existed
         known = set(p['deliverables']) | set(p['review_groups']) | set(b['id'] for b in p['batches'])
         need(targets and all(t in known for t in targets), 'unknown hold target')
         if not hold:

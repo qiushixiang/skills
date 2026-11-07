@@ -135,6 +135,15 @@ class Adjust(unittest.TestCase):
         adjust.unhold(self.base, ['D1', 'B1'], self.words('恢复'))
         self.assertIn(self.impl('D1'), api.runnable(self.st(), parallel=5))
 
+    def test_plan_written_before_holds_still_loads(self):  # upgrade safety for live tasks
+        path = self.base / 'plan.json'
+        plan = json.loads(path.read_text())
+        plan.pop('holds', None)
+        path.write_text(json.dumps(plan))
+        self.assertIn(self.impl('D1'), api.runnable(self.st(), parallel=5))
+        adjust.hold(self.base, ['D1'], self.words('D1 先停'))
+        self.assertNotIn(self.impl('D1'), api.runnable(self.st(), parallel=5))
+
     def test_user_supersede(self):
         adjust.supersede(self.base, self.impl('D2'), self.words('D2 不做了'), reason='用户取消')
         o = api.orders(self.st(), type='implement', target='D2')[0]

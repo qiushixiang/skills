@@ -69,7 +69,7 @@ def runnable(state, parallel=1):
         return []
     plan = state.plan
     bad = _broken_orders(state)
-    held = set(plan['holds'])
+    held = set(plan.get('holds') or [])
     running = [o for o in state.orders.values() if o['state'] == 'running']
     busy_targets = set(o['target'] for o in running if o['target'])
     busy_res = set()
