@@ -13,8 +13,13 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog='bf')
     ap.add_argument('--base', required=True)
     sub = ap.add_subparsers(dest='cmd', required=True)
-    for name in ('status', 'report', 'stop', 'resume'):
+    for name in ('status', 'stop', 'resume'):
         sub.add_parser(name)
+    sub.add_parser('report').add_argument('--text', action='store_true')
+    for name in ('retry', 'escalate'):
+        p = sub.add_parser(name)
+        p.add_argument('order')
+        p.add_argument('--note', required=True)
     run = sub.add_parser('run')
     run.add_argument('--parallel', type=int, default=1)
     run.add_argument('--profile', action='append', default=[], help='backend=profile.json (repeatable)')
@@ -59,8 +64,13 @@ def main(argv=None):
                 counts[o['state']] = counts.get(o['state'], 0) + 1
             out = {'revision': r['revision'], 'stopped': r['stopped'], 'orders': counts, 'running': len(r['running']),
                    'ask_user': r['ask_user'], 'runnable': r['runnable']}
+        elif args.cmd == 'report' and args.text:
+            sys.stdout.write(api.report_text(base))
+            return 0
         elif args.cmd == 'report':
             out = api.report(base)
+        elif args.cmd in ('retry', 'escalate'):
+            out = {args.cmd: getattr(api, args.cmd)(base, args.order, args.note)}
         elif args.cmd in ('stop', 'resume'):
             out = {args.cmd: getattr(api, args.cmd)(base)}
         elif args.cmd == 'answer':
