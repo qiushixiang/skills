@@ -20,7 +20,8 @@ ADJUST = {
     'unhold': {'pos': 'many', 'flags': {'--approval': 1}, 'need': ('--approval',)},
     'supersede': {'pos': 'one', 'flags': {'--reason': 1, '--approval': 1}, 'need': ('--reason', '--approval')},
 }
-FLAGS = {'run': {'--parallel': 1, '--profile': 1}, 'answer': {'--file': 1, '--approve': 0, '--reject': 0}}
+ADJUST['retry'] = ADJUST['escalate'] = {'pos': 'one', 'flags': {'--note': 1}, 'need': ('--note',), 'order': True}
+FLAGS = {'report': {'--text': 0}, 'run': {'--parallel': 1, '--profile': 1}, 'answer': {'--file': 1, '--approve': 0, '--reject': 0}}
 SHELL_META = r'[;&|<>`$()\n\\]'
 SWITCH_FLAGS = ('-k', '-n')
 SWITCH_TARGET = re.compile(r'[^@\s/]+@[^@\s/]+')
@@ -50,6 +51,8 @@ def _switch_allowed(words, paths):
 
 def _adjust_allowed(spec, base, rest):
     values, pos, i = {}, [], 0
+    if spec.get('order') and (not rest or not re.match(r'^WO-\d+$', rest[0])):
+        return False
     while i < len(rest):
         tok = rest[i]
         if tok in spec['flags']:
@@ -120,23 +123,48 @@ def _inside(path, root, cwd=None):
     return path.startswith(root + os.sep)
 
 
+READ_TOOLS = ('Read', 'Grep', 'Glob', 'Skill')
+READONLY = ('ls', 'cat', 'head', 'tail', 'grep', 'rg', 'wc')
+FIND_WRITES = ('-exec', '-execdir', '-ok', '-okdir', '-delete', '-fprint', '-fprint0', '-fprintf', '-fls')
+GIT_READS = ('log', 'status', 'diff', 'show')
+HOOK_META = re.compile(r'[|;&<>`$\n\\]')
+
+
+def readonly_shell(command):
+    """ls/cat/head/tail/grep/rg/wc, find without write actions, and git log/status/diff/show (with -C <dir>)."""
+    if HOOK_META.search(command or ''):
+        return False
+    try:
+        w = shlex.split(command)
+    except ValueError:
+        return False
+    if not w:
+        return False
+    if w[0] in READONLY:
+        return not any(x in ('-f', '-F', '--follow', '--pre') or x.startswith('--pre=') for x in w[1:])
+    if w[0] == 'find':
+        return not any(x in FIND_WRITES for x in w[1:])
+    if w[0] == 'git' and len(w) >= 4 and w[1] == '-C':
+        return w[3] in GIT_READS and not any(x.startswith(('--output', '--ext-diff', '--exec')) for x in w[4:])
+    return False
+
+
 def hook_decision(event, base, account_switch=()):
-    """Allow only the front's duties: bf commands, reading attention and run cards, writing new answer files."""
+    """Operations role (design 22): read anything, write only new answer files, bf commands (not init/revise), the
+    configured account switch and a read-only shell."""
     base = os.path.normpath(str(base))
     tool, inp, cwd = event.get('tool_name'), event.get('tool_input') or {}, event.get('cwd')
     path = inp.get('file_path') or ''
     if tool == 'Bash':
-        ok = allowed(inp.get('command') or '', account_switch)
-    elif tool == 'Read':
-        ok = bool(path) and (os.path.normpath(path) == os.path.join(base, 'attention.md')
-                             or _inside(path, os.path.join(base, 'records', 'runs'), cwd))
+        command = inp.get('command') or ''
+        ok = not HOOK_META.search(command) and (allowed(command, account_switch) or readonly_shell(command))
     elif tool == 'Write':
         target = path if os.path.isabs(path) else os.path.join(cwd or '', path)
         ok = bool(path) and _inside(target, os.path.join(base, 'answers')) and not os.path.exists(target)
     else:
-        ok = tool in PASS_TOOLS
+        ok = tool in READ_TOOLS or tool in PASS_TOOLS
     return {'decision': 'allow' if ok else 'deny',
-            'reason': '' if ok else 'chat front may only run bf commands, read attention/run cards and write answers/'}
+            'reason': '' if ok else 'chat front may read anything, write only answers/, and run bf commands or a read-only shell'}
 
 
 def settings(base, account_switch=()):
@@ -148,26 +176,25 @@ def settings(base, account_switch=()):
 def prompt(base, account_switch=()):
     cli = '%s %s --base %s' % (sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cli.py'), base)
     lines = [
-        '你是 batch-flow v2 的聊天前端：启动/停止/查看驱动器，定时汇报，转交用户回答，执行用户的结构化调整。你不选择、不派发、不回收工单，不读写状态文件。',
+        '你是 batch-flow v2 的运维与沟通角色（聊天前端）。脚本负责派发、交付判定与额度；技术负责人负责技术判断；你负责运维、汇报和转达用户的决定。',
         '下文 CLI 指：%s' % cli,
-        '只能运行这些命令（单条，不加管道或重定向）：',
-        '- 查看：CLI status | CLI report',
-        '- 启动驱动器：CLI run，必须用 Bash 工具的 run_in_background 选项启动，这样它在你与用户交谈时持续运行；不要前台运行。',
-        '- 停止/恢复：CLI stop | CLI resume；stop 只阻止新派发，在途调用会自行结束并被回收。',
-        '- 登记用户回答：CLI answer WO-n --file %s/answers/<n>.txt --approve|--reject' % base,
-        '汇报：用户要求启动后，用 ScheduleWakeup 或 CronCreate 每 10 分钟运行一次 report，用自然语言转述：在途工单与耗时、新完成或新开立的工单、额度余量、需要用户回答的问题。',
-        '需要用户的事项见 %s/attention.md；把问题原样告诉用户。' % base,
-        '回答流程：用户口述决定后，把用户的原话写入新文件 %s/answers/<n>.txt（不要改写、不要补充），再运行 answer 命令，approve 对应用户同意。' % base,
-        '调整（每条都带 --approval %s/answers/<n>.txt，即用户原话文件）：' % base,
-        '- 换模型：CLI models <后端>（只读查目录）；CLI set-role <角色> --backend <后端> --name \'<用户的说法>\' [--effort E] --approval F。角色：executor backup_executor lead reviewer third_party。',
-        '- 范围：CLI envelope --add|--remove <批次>... --approval F；额度：CLI grant <交付目标> --implement|--backup|--lead|--repair|--review N --approval F（只增不减）。',
-        '- 暂停：CLI hold <交付目标或批次>... --approval F；恢复：CLI unhold ...；作废开立中的工单：CLI supersede WO-n --reason R --approval F。',
-        '流程：用户用自然语言提出调整时，先把它复述成上面的确切命令并请用户确认；确认后把用户的话原样写入 answers/<n>.txt，再运行命令。',
-        'set-role 返回 needs_clarification 或 not_found 时，把候选逐项展示给用户让其选择，绝不自己挑；用户选定后用确切的模型 id 重新执行。',
-        '新增或改写交付目标、验收、依赖属于计划修订，由技术负责人起草，你不运行 init/revise，告诉用户转交技术负责人。',
-        '被拦截时不要换方式绕过，向用户报告。可读文件：attention.md 与 records/runs/ 下的卡片和交付。']
+        '职责：',
+        '1. 启动、停止、查看驱动器：CLI run 必须用 Bash 的 run_in_background 启动，使它在你与用户交谈时持续运行；CLI stop / CLI resume（stop 只阻止新派发，在途调用会结束并被回收）；CLI status。',
+        '2. 每 10 分钟（用 ScheduleWakeup 或 CronCreate）及用户询问时运行 CLI report --text，把结果转述给用户，必要时加上你自己的判断（例如哪里可能卡住）。需要更多细节时读 CLI report 的 JSON、%s/attention.md 与 %s/records/runs/ 下的卡片和原始输出。' % (base, base),
+        '3. 处理运维故障：report 的“待你决定”里带运维故障的项，是 CLI 连续不可用而被暂停的工单。读它的 problem 和对应运行目录 %s/records/runs/<运行>/ 下的原始输出再判断：' % base,
+        '   - codex 额度或用量限制，且已配置账号切换命令：运行账号切换，然后 CLI retry WO-n --note \'已切换账号\'；',
+        '   - 认证失效、网络、需要用户操作的问题：如实告诉用户；用户处理后再 retry；',
+        '   - 看起来是技术问题（模型调用格式错误、反复同一异常等）：CLI escalate WO-n --note \'你的观察\'，交给技术负责人。',
+        '   工单号只用于命令，不要对用户说。',
+        '4. 转达用户的回答与调整，全部带用户原话文件 --approval %s/answers/<n>.txt：' % base,
+        '   - 回答问题：CLI answer WO-n --file %s/answers/<n>.txt --approve|--reject；' % base,
+        '   - 换模型：CLI models <后端>；CLI set-role <角色> --backend <后端> --name \'<用户的说法>\' [--effort E] --approval F（角色：executor backup_executor lead reviewer third_party）；多个候选或未找到时把候选展示给用户，绝不自己挑；',
+        '   - CLI envelope --add|--remove <批次>... --approval F；CLI grant <交付目标> --implement|--backup|--lead|--repair|--review N --approval F（只增不减）；CLI hold|unhold <交付目标或批次>... --approval F；CLI supersede WO-n --reason R --approval F。',
+        '   用户用自然语言提出调整时，先复述成确切命令请用户确认；确认后把用户的话原样写入新文件 %s/answers/<n>.txt（不改写），再运行命令。' % base,
+        '边界：不改代码或状态文件，不运行构建或测试，不做技术判断；新增或改写交付目标、验收、依赖是计划修订，由技术负责人起草，你不运行 init/revise。可以读取任何文件和运行只读命令（ls cat head tail grep rg wc find、git -C <目录> log status diff show）。被拦截时不要换方式绕过，向用户报告。',
+        '汇报写法：按批次与标题描述工作（如“S15「旧帧不发布」实施”），不要单独抛工单号，不罗列已完成项，只说正在做、下一步、需要用户决定的事和风险；简短。']
     for p in account_switch:
-        lines.append('账号切换：用户要求时可运行 %s [-k] [-n] [目标账号]，仅此形式。' % p)
+        lines.append('账号切换命令：%s [-k] [-n] [目标账号]（只此形式）。由你判断何时切换，例如 codex 额度用尽时；切换后对受影响工单 retry。' % p)
     return '\n'.join(lines)
 
 

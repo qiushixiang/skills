@@ -1,10 +1,11 @@
 """Public API of batch-flow v2 core (design 17). Every mutation is one transaction = one revision + one event."""
+import re
 import time
 
 from . import gate, model, policy, register, routing, context
 from .store import BfError, State, load, need, now, transact
 
-__all__ = ['abandon', 'report', 'BfError', 'init', 'load', 'orders', 'runnable', 'assign', 'start', 'deliver', 'release', 'answer',
+__all__ = ['retry', 'escalate', 'report_text', 'abandon', 'report', 'BfError', 'init', 'load', 'orders', 'runnable', 'assign', 'start', 'deliver', 'release', 'answer',
            'revise_plan', 'stop', 'resume', 'broken_evidence']
 
 
@@ -158,17 +159,62 @@ def abandon(base, order_id, run_id, reason, expected_revision=None, request_id=N
         run.update(ended=now(), result='INVALID', stop_reason=reason, exempt=True)
         o['state'] = 'open'
         tail = 0
-        for r in reversed(o['runs']):
+        for r in reversed(o['runs'][o.get('invalid_floor', 0):]):
             if r['result'] != 'INVALID':
                 break
             tail += 1
         if tail >= policy.rounds(st.plan, o['target'], 'invalid_retry', 2) and not routing._blocked_by_user_or_lead(st, o):
             if o['type'] in ('decide', 'triage'):
                 routing.fail_to_user(st, o, 'tool_failure')
-            else:
-                routing.open_decide(st, o, 'tool_failure', {'problem': reason})
+            else:  # operational: the chat front decides between retry and escalate (design 22)
+                o['ops'] = {'problem': reason, 'at': now()}
         return run_id
     return transact(base, 'abandon', actor, fn, expected_revision, request_id)
+
+
+def retry(base, order_id, note, expected_revision=None, request_id=None, actor='front'):
+    """Operational fault handled (for example the account was switched): clear the mark; failures cost no budget."""
+    def fn(st):
+        o = routing.get(st, order_id)
+        need(o.get('ops'), 'order %s has no pending operational problem' % order_id)
+        o.setdefault('ops_log', []).append({'op': 'retry', 'note': note, 'problem': o.pop('ops')['problem'], 'at': now()})
+        o['invalid_floor'] = len(o['runs'])
+        return order_id
+    return transact(base, 'retry', actor, fn, expected_revision, request_id)
+
+
+def escalate(base, order_id, note, expected_revision=None, request_id=None, actor='front'):
+    """The fault looks technical: hand it to the technical lead as a decide (trigger tool_failure)."""
+    def fn(st):
+        o = routing.get(st, order_id)
+        need(o.get('ops'), 'order %s has no pending operational problem' % order_id)
+        problem = o.pop('ops')['problem']
+        o.setdefault('ops_log', []).append({'op': 'escalate', 'note': note, 'problem': problem, 'at': now()})
+        o['invalid_floor'] = len(o['runs'])
+        routing.open_decide(st, o, 'tool_failure', {'problem': problem, 'note': note})
+        return order_id
+    return transact(base, 'escalate', actor, fn, expected_revision, request_id)
+
+
+VERBS = {'implement': '实施', 'repair': '返修', 'review': '审阅', 'decide': '裁决', 'triage': '分诊', 'release': '收尾'}
+ROLE_NAMES = {'executor': '执行者', 'backup_executor': '备用执行者', 'lead': '技术负责人', 'reviewer': '审阅者', 'third_party': '第三方审阅者'}
+
+
+def label(plan, target):
+    """Deliverable id plus its title (the batch title when the title is missing or just the id)."""
+    batch = next((b for b in plan['batches'] if b['id'] == model.batch_of(plan, target)), {})
+    title = plan['deliverables'].get(target, {}).get('title')
+    if target in plan['deliverables'] and title and title != target:
+        return '%s %s' % (target, title)
+    return '%s %s' % (target, batch.get('title') or '') if target else (batch.get('title') or '')
+
+
+def _who(st, o):
+    try:
+        a = policy.assign(st, o['id'])
+        return {'role': a['role'], 'tool': a['tool'], 'model': a['model'], 'effort': a['effort']}
+    except BfError:
+        return {'role': None, 'tool': None, 'model': None, 'effort': None}
 
 
 def report(base, recent=10):
@@ -189,15 +235,79 @@ def report(base, recent=10):
                 running.append(item)
     ask = [{'order': o['id'], 'target': o['target'], 'question': o['input'].get('question', '')}
            for o in orders(st, type='ask_user', state_='open')]
-    budgets = {}
-    for d in st.plan['deliverables']:
-        left = 0
-        for o in orders(st, type='implement', target=d):
-            if o['state'] != 'superseded':
-                spent = policy.used(o)
-                left += sum(max(n - spent.get(s, 0), 0) for s, n in policy.ladder(st.plan, o))
-        budgets[d] = left
+    plan = st.plan
+    budgets, finished = {}, set()
+    for d in plan['deliverables']:
+        impls = [o for o in orders(st, type='implement', target=d) if o['state'] != 'superseded']
+        if impls and all(o['state'] == 'done' for o in impls):
+            finished.add(d)
+            continue
+        budgets[d] = sum(max(n - policy.used(o).get(s, 0), 0) for o in impls for s, n in policy.ladder(plan, o))
+    for item in running:
+        item['label'] = label(plan, item['target'])
+        item.update(_who_run(st, item))
+    runnable_ids = routing.runnable(st, 10)
+    nxt = []
+    for oid in runnable_ids:
+        o = st.orders[oid]
+        if o['type'] != 'release':
+            nxt.append(dict(_who(st, o), label=label(plan, o['target']), type=o['type']))
+    inside = plan['envelope']['batches']
+    batches, first_open = [], True
+    for b in plan['batches']:
+        members = [d for d, s in plan['deliverables'].items() if s['batch'] == b['id']]
+        done_n = len([d for d in members if d in finished])
+        release = routing.by_key(st, 'release:' + b['id'])
+        started = done_n or any(o['runs'] for o in st.orders.values() if model.batch_of(plan, o['target']) == b['id'])
+        if (release and release['state'] == 'done') or (members and done_n == len(members)):
+            state = 'done'
+        elif b['id'] not in inside:
+            state = 'outside'
+        elif started or first_open:
+            state, first_open = 'active', False
+        else:
+            state = 'pending'
+        batches.append({'id': b['id'], 'title': b.get('title', ''), 'state': state, 'done': done_n, 'total': len(members)})
+    ops = [{'order': o['id'], 'label': label(plan, o['target']), 'problem': o['ops']['problem']}
+           for o in routing.sorted_orders(st) if o.get('ops')]
+    for item in ask:
+        item['label'] = label(plan, item['target'])
     ended.sort(key=lambda x: x['ended'])
     return {'revision': st.revision, 'stopped': st.stopped, 'running': running, 'recent': ended[-recent:], 'ask_user': ask,
-            'budgets': budgets, 'runnable': routing.runnable(st, 10),
-            'broken_evidence': routing.broken_paths(st)}
+            'budgets': budgets, 'runnable': runnable_ids, 'roles': plan['roles'], 'next': nxt, 'batches': batches,
+            'ops': ops, 'name': plan.get('name', ''), 'broken_evidence': routing.broken_paths(st)}
+
+
+def _who_run(st, item):
+    role = {'primary': 'executor', 'backup': 'backup_executor', 'lead': 'lead'}.get(item['performer'], item['performer'])
+    cfg = st.plan['roles'].get(role) or {}
+    return {'role': role, 'model': cfg.get('model'), 'tool': cfg.get('tool')}
+
+
+def _line(item):
+    who = ROLE_NAMES.get(item.get('role'), item.get('role') or '')
+    extra = '（%s %s / %s）' % (who, item.get('tool') or '', item.get('model') or '') if item.get('model') else ''
+    return item['label'] + extra
+
+
+def report_text(base):
+    """Short Chinese status note for people: titles, never order ids."""
+    r = report(base)
+    strip = lambda t: re.sub(r'WO-\d+', '', t or '').strip()[:100]
+    out = ['%s · %s' % (r['name'] or '任务', time.strftime('%H:%M'))]
+    out.append('已停止（stop），不再派发新工单。' if r['stopped'] else '')
+    out.append('正在做：' + ('；'.join('%s %s' % (VERBS.get(x['type'], x['type']), _line(x)) for x in r['running']) or '无'))
+    nxt = r['next'][:3]
+    out.append('下一步：' + ('；'.join('%s %s' % (VERBS.get(x['type'], x['type']), _line(x)) for x in nxt) +
+                           ('，等共 %d 项' % len(r['next']) if len(r['next']) > 3 else '') if nxt else '无可派发的工作'))
+    ask = ['%s：%s' % (x['label'], strip(x['question'])) for x in r['ask_user']] + \
+          ['%s：运维故障待处理（%s）' % (x['label'], strip(x['problem'])) for x in r['ops']]
+    out.append('待你决定：' + ('；'.join(ask) if ask else '无'))
+    roles = r['roles']
+    out.append('角色：' + '；'.join('%s %s / %s' % (ROLE_NAMES.get(k, k), v['tool'], v['model']) for k, v in roles.items()))
+    done_n = len([b for b in r['batches'] if b['state'] == 'done'])
+    active = ['%s（%d/%d）' % (b['title'] or b['id'], b['done'], b['total']) for b in r['batches'] if b['state'] == 'active']
+    pending = len([b for b in r['batches'] if b['state'] == 'pending'])
+    outside = len([b for b in r['batches'] if b['state'] == 'outside'])
+    out.append('批次：已完成 %d/%d；进行中 %s；待开始 %d；授权范围外 %d' % (done_n, len(r['batches']), '、'.join(active) or '无', pending, outside))
+    return '\n'.join(l for l in out if l) + '\n'

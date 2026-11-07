@@ -85,7 +85,7 @@ def runnable(state, parallel=1):
         return bool(impls) and all(i['state'] in SATISFIED and i['id'] not in bad for i in impls)
     cands = []
     for o in state.orders.values():
-        if o['state'] != 'open' or o['type'] == 'ask_user':
+        if o['state'] != 'open' or o['type'] == 'ask_user' or o.get('ops'):
             continue
         if not all(state.orders[n]['state'] in SATISFIED and n not in bad for n in o['needs'] if n in state.orders):
             continue
