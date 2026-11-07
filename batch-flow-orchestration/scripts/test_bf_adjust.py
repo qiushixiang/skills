@@ -104,7 +104,7 @@ class Adjust(unittest.TestCase):
         api.deliver(self.base, oid, run, INFEASIBLE, conversation_id='s1')
         self.assertEqual(api.assign(self.st(), oid)['session']['mode'], 'resume')
         query, resolve = fake_resolver([])
-        adjust.set_role(self.base, 'executor', 'opencode', 'deepseek flash', self.words('换模型'), query=query, resolve=resolve)
+        adjust.set_role(self.base, 'executor', 'opencode', 'deepseek v4.1 flash', self.words('换模型'), query=query, resolve=resolve)
         a = api.assign(self.st(), oid)
         self.assertEqual((a['tool'], a['session']['mode']), ('opencode', 'fresh'))
 
