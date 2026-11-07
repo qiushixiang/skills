@@ -398,3 +398,13 @@ scripts/agent_cli.py      保留（CLI 适配器，已验证的宿主细节）
 - 报告写入 `<base>/import-report.json`：`deliverables, done, open, dropped, v1_open_decisions, v1_attempts_not_carried, broken_evidence`。
 - 导入时证据已不符的列入 `broken_evidence`，其依赖方按 I5 不可派发。
 - CLI：`bf/cli.py --base <dir> import --v1 <flow.json> --approval <file>`。
+
+### 19.3 运行与前端（阶段 B 审查后补充，以 `scripts/test_bf_ops.py` 为准）
+
+- 工具失败（CLI 不可用、无退出、无会话）不是技术结果：适配器返回 `{invalid: true, problems}`，驱动器调用 `api.abandon` 登记 INVALID、免扣；同一工单连续 `policy.rounds.invalid_retry`（默认 2）次 INVALID → 开 decide（trigger `tool_failure`）。
+- 适配器启动参数：implement/repair/decide/triage 用 `--access write`，review 用 `--access read`；`--cwd` 取 `plan.workspace`（源码工作目录，导入时取自 v1 启动器 spec 或由 CLI `--workspace` 提供），缺失即报错；`AgentCliAdapter.argv(order, assignment, card_path, cli_dir, resume=None)` 可单独调用。
+- 聊天前端启动器（`bf/front.py`）：
+  - `hook_decision(event, base)`：Bash 只放行 `allowed()`；Read 只放行 `<base>` 下的 attention.md、report 输出、`records/runs/**` 的卡片与交付；Write 只放行 `<base>/answers/` 下新文件（用于用户原话）；ScheduleWakeup / CronCreate 放行（10 分钟汇报）；其他一律拒绝。
+  - `settings(base)`：Claude Code settings，PreToolUse 挂 `front.py hook --base <base>`。
+  - `prompt(base)`：职责、命令、每 10 分钟用 `bf report` 汇报、用户回答写入 `answers/` 后 `bf answer`，不超过 3000 字。
+  - `front.py launch --base <dir> [--model M]`：以上述 settings 与 prompt 启动 `claude` 交互会话。
