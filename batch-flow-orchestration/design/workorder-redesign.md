@@ -364,3 +364,47 @@ scripts/agent_cli.py      保留（CLI 适配器，已验证的宿主细节）
 | `bf/cli.py --base <dir> <cmd>` | `status`、`report`、`run [--parallel N]`、`stop`、`resume`、`answer <id> --file <原话> --approve|--reject`、`init --plan <json> --approval <file>`、`revise --plan <json> --approval <file>` |
 | `front.allowed(command) -> bool` | 只放行 `<python> <bf/cli.py> --base <dir> {status, report, run, stop, resume, answer}` 的单条命令，拒绝管道、重定向、分号、其他脚本与写操作子命令 |
 | triage 候选项 ID | 每张 triage 工单内按出现顺序编号 `C1, C2, …` |
+
+## 19. 阶段 C 契约：模型扩展与 v1 导入
+
+以 `scripts/test_bf_import.py` 为准。
+
+### 19.1 计划模型扩展（真实计划需要）
+
+- 审阅组可以跨批次，此时必须写 `batch`（决定由哪个批次的 release 等待它）；`reviewer: reviewer | third_party` 指定审阅角色。
+- 一个交付目标可以属于多个审阅组（常规审阅 + 阶段第三方审阅）；后开立的 implement 加入它所在的全部开立中的审阅。
+- `depends_on` 可以引用审阅组 ID：该组的 review 工单完成才算满足（用于“本地提交”这类必须在审阅通过后进行的交付目标）。
+- “本地提交”等不新增类型，按普通交付目标（implement）处理。
+
+### 19.2 v1 导入 `importer.import_v1(v1_store, base, approval) -> report`
+
+| v1 | v2 |
+|---|---|
+| plan.batches（按定义顺序） | batches |
+| design / execute / commit / verify 任务，以及 role≠orchestrator 的 confirmation 任务（非 retired、非 decision_only） | deliverables：instruction、acceptance（取任务 goal_contract.acceptance）、batch（scope 最后一个）|
+| review / third_party 任务 | review_groups：成员 = v1 `review_sources`；跨批次时 batch = scope 最后一个；third_party → `reviewer: third_party` |
+| acceptance 任务 | 丢弃（release 自动）；依赖它的任务改为依赖它的依赖（递归展开） |
+| 任务 depends_on | 依赖 deliverable 或审阅组 ID |
+| roles：executor / architect / reviewer / third_party；handoff.backup | executor / lead / reviewer / third_party / backup_executor |
+| cli_execution | env |
+| plan.goal_contract | goal：objective、constraints（acceptance）、non_goals |
+| authorized_batches | envelope.batches |
+| design 关联 | design：path、sha256 |
+| v1 已成功的任务 | 对应工单 done，带一条 `performer: imported` 的运行，证据取 v1 最新尝试的证据哈希；批次完成任务成功 → release done |
+| v1 未成功的任务 | 开立的新工单，无运行（用户决定重新执行），v1 尝试列入报告 `v1_attempts_not_carried` |
+
+- 目标目录必须不存在已初始化的 v2；approval 是用户同意切换的原话文件。
+- v1 文件只读，导入前后哈希不变。
+- 报告写入 `<base>/import-report.json`：`deliverables, done, open, dropped, v1_open_decisions, v1_attempts_not_carried, broken_evidence`。
+- 导入时证据已不符的列入 `broken_evidence`，其依赖方按 I5 不可派发。
+- CLI：`bf/cli.py --base <dir> import --v1 <flow.json> --approval <file>`。
+
+### 19.3 运行与前端（阶段 B 审查后补充，以 `scripts/test_bf_ops.py` 为准）
+
+- 工具失败（CLI 不可用、无退出、无会话）不是技术结果：适配器返回 `{invalid: true, problems}`，驱动器调用 `api.abandon` 登记 INVALID、免扣；同一工单连续 `policy.rounds.invalid_retry`（默认 2）次 INVALID → 开 decide（trigger `tool_failure`）。
+- 适配器启动参数：implement/repair/decide/triage 用 `--access write`，review 用 `--access read`；`--cwd` 取 `plan.workspace`（源码工作目录，导入时取自 v1 启动器 spec 或由 CLI `--workspace` 提供），缺失即报错；`AgentCliAdapter.argv(order, assignment, card_path, cli_dir, resume=None)` 可单独调用。
+- 聊天前端启动器（`bf/front.py`）：
+  - `hook_decision(event, base)`：Bash 只放行 `allowed()`；Read 只放行 `<base>` 下的 attention.md、report 输出、`records/runs/**` 的卡片与交付；Write 只放行 `<base>/answers/` 下新文件（用于用户原话）；ScheduleWakeup / CronCreate 放行（10 分钟汇报）；其他一律拒绝。
+  - `settings(base)`：Claude Code settings，PreToolUse 挂 `front.py hook --base <base>`。
+  - `prompt(base)`：职责、命令、每 10 分钟用 `bf report` 汇报、用户回答写入 `answers/` 后 `bf answer`，不超过 3000 字。
+  - `front.py launch --base <dir> [--model M]`：以上述 settings 与 prompt 启动 `claude` 交互会话。
