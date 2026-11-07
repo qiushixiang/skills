@@ -69,6 +69,26 @@ class AdapterSpec(unittest.TestCase):
             self.assertEqual(argv[argv.index('--conversation') + 1], 'sess-cli-1')
             self.assertEqual(res['decision']['diagnosis'], 'd')
 
+    def test_profiles_probed_once_and_reused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / '.batch-flow'
+            (base / 'records').mkdir(parents=True)
+            approval = Path(tmp) / 'a.txt'
+            approval.write_text('ok')
+            api.init(base, make_plan(workspace=tmp), approval)
+            log = Path(tmp) / 'probes.log'
+            fake = Path(tmp) / 'fake_probe.py'
+            fake.write_text("import sys\nfrom pathlib import Path\na = sys.argv[1:]\n"
+                            "open(%r, 'a').write(a[a.index('--backend') + 1] + '\\n')\n"
+                            "Path(a[a.index('--profile') + 1]).write_text('{}')\n" % str(log))
+            first = adapter.ensure_profiles(base, fake)
+            self.assertEqual(sorted(first), ['claude', 'codex', 'opencode'])
+            self.assertEqual(sorted(log.read_text().split()), ['claude', 'codex', 'opencode'])
+            self.assertEqual(adapter.ensure_profiles(base, fake), first)
+            self.assertEqual(len(log.read_text().split()), 3)  # reused, no second probe
+            override = adapter.ensure_profiles(base, fake, {'codex': '/x/c.json'})
+            self.assertEqual(override['codex'], '/x/c.json')
+
 
 if __name__ == '__main__':
     unittest.main()

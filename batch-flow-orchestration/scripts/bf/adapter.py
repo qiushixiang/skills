@@ -18,6 +18,27 @@ def _alive(pid):
         return False
 
 
+def ensure_profiles(base, agent_cli=None, explicit=None):
+    """backend -> profile path for every backend the plan's roles use: explicit overrides, else <base>/profiles/<b>.json,
+    created once with `agent_cli.py probe` (which never calls a model) when missing."""
+    base = Path(str(base))
+    cli = str(agent_cli or DEFAULT_AGENT_CLI)
+    out = dict(explicit or {})
+    for role in api.load(base).plan['roles'].values():
+        backend = model.backend(role['tool'])
+        if backend in out:
+            continue
+        path = base / 'profiles' / (backend + '.json')
+        if not path.is_file():
+            path.parent.mkdir(exist_ok=True)
+            done = subprocess.run([sys.executable, cli, 'probe', '--backend', backend, '--profile', str(path)],
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+            if done.returncode != 0 or not path.is_file():
+                raise api.BfError('probe of backend %s failed: %s' % (backend, done.stdout.strip()[-300:]))
+        out[backend] = str(path)
+    return out
+
+
 class AgentCliAdapter(object):
     def __init__(self, base, profiles, agent_cli=None, cwd=None):
         self.base, self.profiles = Path(base), dict(profiles)

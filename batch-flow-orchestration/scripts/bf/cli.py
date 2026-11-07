@@ -58,7 +58,7 @@ def main(argv=None):
             out = importer.import_v1(args.v1, base, args.approval, workspace=args.workspace)
         else:
             from bf import adapter, runner
-            profiles = dict(p.split('=', 1) for p in args.profile)
+            profiles = adapter.ensure_profiles(base, args.agent_cli, dict(p.split('=', 1) for p in args.profile))
             ad = adapter.AgentCliAdapter(base, profiles, agent_cli=args.agent_cli)
             runner.Runner(base, ad, parallel=args.parallel).run_until_idle()
             out = api.report(base)

@@ -180,6 +180,8 @@ def report(base, recent=10):
             item = {'order': o['id'], 'type': o['type'], 'target': o['target'], 'run': r['run_id'],
                     'performer': r['performer'], 'started': r['started']}
             if r['ended']:
+                if r['performer'] == 'imported':
+                    continue
                 item.update(result=r['result'], stop_reason=r['stop_reason'], ended=r['ended'], exempt=r['exempt'])
                 ended.append(item)
             else:
