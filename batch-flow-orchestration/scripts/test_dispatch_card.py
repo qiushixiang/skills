@@ -84,6 +84,9 @@ class CardTests(unittest.TestCase):
             spec['session_id'] = session
         (self.runtime / 'spec.json').write_text(json.dumps(spec))
 
+    def by_id(self, attempt_id):
+        return next(a for a in json.loads(self.store.read_text())['state']['attempts'] if a['id'] == attempt_id)
+
     def attempt(self, task):
         return [a for a in json.loads(self.store.read_text())['state']['attempts'] if a['task'] == task][-1]
 
@@ -189,6 +192,43 @@ class CardTests(unittest.TestCase):
     def rev(self):
         return str(json.loads(self.store.read_text())['revision'])
 
+    def test_ledger_cli_execution_becomes_launch_args_and_prestart_gate(self):
+        import argparse
+        import dispatch_card
+        import agent_cli
+        def configure(p):
+            p['roles']['executor'] = dict(tool='codex', model='gpt-6.1-terra', effort='medium')
+            p['cli_execution'] = {'codex':dict(require_host=True, add_dirs=[str(self.workspace)],
+                                             approval_policy='on-request', guide='Use the fixed absolute entrypoint.')}
+        self.build(configure)
+        profile = self.runtime/'codex-profile.json'
+        profile.write_text(json.dumps(dict(backend='codex', binary='/bin/codex', version='fake')))
+        spec_path = self.runtime/'spec.json'; spec = json.loads(spec_path.read_text())
+        spec['profiles'].append(str(profile)); spec_path.write_text(json.dumps(spec))
+        made = self.card('make', '--store', str(self.store), '--kind', 'EXECUTE', '--target', 'execute', '--runtime', str(self.runtime))
+        directory = self.store.parent/'records/dispatch'/made['card']
+        card = json.loads((directory/'card.json').read_text())
+        command = card['host_call']['input']['command']
+        self.assertIn('--require-host', command)
+        self.assertIn('--approval-policy on-request', command)
+        self.assertIn('--add-dir', command)
+        self.assertIn('Use the fixed absolute entrypoint.', (directory/'prompt.md').read_text())
+        before = self.store.read_bytes()
+        with unittest.mock.patch.object(agent_cli, 'check_execution', side_effect=ValueError('HOST_ENVIRONMENT_BLOCKED')):
+            with self.assertRaisesRegex(dispatch_card.CardError, 'HOST_ENVIRONMENT_BLOCKED'):
+                dispatch_card.start(argparse.Namespace(store=str(self.store), card=made['card'], revision=int(self.rev())))
+        self.assertEqual(self.store.read_bytes(), before)
+
+    def test_cli_execution_schema_rejects_unsafe_or_unknown_configuration(self):
+        for config in ({'codex': {'add_dirs': ['/']}}, {'codex': {'approval_policy':'never'}},
+                       {'codex': {'require_host':'yes'}}, {'unknown': {}}, {'codex': {'env': {'entry': []}}},
+                       {'codex': {'env': {'entry': ['relative/run']}}}, {'codex': {'env': {'entry': ['/a'], 'other': 1}}}):
+            p = plan(); p['cli_execution'] = config
+            with self.assertRaises(flow.FlowError):
+                flow.validate_plan(p)
+        p = plan(); p['cli_execution'] = {'codex': {'env': {'entry': ['/opt/run_'], 'preflight': '/opt/run_test.sh preflight'}}}
+        flow.validate_plan(p)
+
     def test_card_contents(self):
         out = self.card('make', '--store', str(self.store), '--kind', 'EXECUTE', '--target', 'execute', '--runtime', str(self.runtime))
         self.assertEqual(out['route'], 'agent')
@@ -200,6 +240,9 @@ class CardTests(unittest.TestCase):
         prompt = (d / 'prompt.md').read_text()
         self.assertIn('test action', prompt); self.assertIn('结果：VERIFIED | WAIT_EVIDENCE', prompt)
         self.assertIn('references/roles/executor.md', prompt)
+        self.assertIn('停止原因：完成 | 外部阻塞 | 待裁决 | 技术不可行 | 未完成', prompt)
+        self.assertIn('可自行补齐的工作须在本轮继续', prompt)  # Agent route: no in-place continuation
+        self.assertFalse(card['delivery_gate'])
         self.card('start', '--store', str(self.store), '--card', cid, '--revision', self.rev())
         self.card('start', '--store', str(self.store), '--card', cid, '--revision', self.rev(), ok=False)
         self.card('finish', '--store', str(self.store), '--card', cid, '--revision', self.rev(), '--conversation', 'agent-1', ok=False)
@@ -533,6 +576,160 @@ class CardTests(unittest.TestCase):
         self.assertIn('目标或计划版本', err['error'])
         self.assertFalse(json.loads(self.store.read_text())['state']['attempts'])
 
+
+    def write_cli_run(self, run, cid, text, items=(), code=0, conversation=None):
+        run.mkdir()
+        (run / 'request.json').write_text(json.dumps(dict(backend='codex', conversation=conversation, task='execute',
+                                                          cwd=str(self.workspace), started_at=flow.now())))
+        (run / 'receipt.json').write_text(json.dumps(dict(event='CLI_STARTED', pid=12345, task='execute')))
+        events = [dict(type='thread.started', thread_id=cid)] + [dict(type='item.completed', item=i) for i in items] + \
+                 [dict(type='item.completed', item=dict(type='agent_message', text=text)), dict(type='turn.completed')]
+        (run / 'stdout').write_text('\n'.join(json.dumps(e) for e in events)); (run / 'stderr').write_text('')
+        (run / 'exit.json').write_text(json.dumps(dict(returncode=code, ended_at=flow.now())))
+
+    def gated_card(self, env=None):
+        def configure(p):
+            p['roles']['executor'] = dict(tool='codex', model='gpt-6.1-terra', effort='medium')
+            p['cli_execution'] = {'codex': dict(require_host=True, guide='fixed entry', **({'env': env} if env else {}))}
+        self.build(configure)
+        profile = self.runtime / 'codex-profile.json'
+        profile.write_text(json.dumps(dict(format='batch-flow-cli/v1', backend='codex', binary='/bin/codex', version='fixture')))
+        spec_path = self.runtime / 'spec.json'; spec = json.loads(spec_path.read_text())
+        spec['profiles'].append(str(profile)); spec_path.write_text(json.dumps(spec))
+        out = self.next()
+        self.assertEqual(out['do'], 'call')
+        directory = self.store.parent / 'records' / 'dispatch' / out['card']
+        return out, directory, json.loads((directory / 'card.json').read_text())
+
+    UNFINISHED = '结果：FAILED\n停止原因：未完成\n上升问题：本批尚未完成；当前没有外部阻塞\n'
+
+    def test_unfinished_delivery_continues_in_same_attempt_then_fails_into_normal_rounds(self):
+        out, directory, card = self.gated_card(env=dict(entry=['/opt/entry/run_board_'], preflight='/opt/entry/run_board_test.sh preflight'))
+        self.assertTrue(card['delivery_gate'])
+        prompt = (directory / 'prompt.md').read_text()
+        self.assertLess(prompt.index('## 环境'), prompt.index('## 执行'))
+        self.assertIn('沙箱常态', prompt); self.assertIn('/opt/entry/run_board_test.sh preflight', prompt); self.assertIn('补充：fixed entry', prompt)
+        cid = '10000000-0000-4000-8000-000000000001'
+        attempt = self.attempt('execute')['id']
+        self.write_cli_run(directory / 'run', cid, self.UNFINISHED, items=[dict(type='file_change', changes=[])])
+        out = self.next()
+        self.assertEqual(out['do'], 'call')
+        command = out['input']['command']
+        self.assertIn('--conversation ' + cid, command); self.assertIn('--resume-from ' + str(directory / 'run'), command)
+        self.assertIn(str(directory / 'run-c1'), command); self.assertIn('continue-1.md', command)
+        self.assertNotIn(str(directory / 'prompt.md'), command)
+        self.assertIsNone(self.attempt('execute')['result']); self.assertEqual(self.attempt('execute')['id'], attempt)
+        self.assertIn('尚未完成', (directory / 'continue-1.md').read_text())
+        import orchestrator_guard
+        self.assertTrue(orchestrator_guard.matches_card('Bash', dict(command=command), directory.parent, ['command']))
+        # Continuation without progress is not continued again: registered FAILED, ordinary rounds apply.
+        self.write_cli_run(directory / 'run-c1', cid, self.UNFINISHED, conversation=cid)
+        out = self.next()
+        a = self.by_id(attempt)
+        self.assertEqual(a['result'], 'FAILED')
+        self.assertIn(str(directory / 'run-c1' / 'stdout'), a['evidence']); self.assertIn(str(directory / 'gate-1.json'), a['evidence'])
+        self.assertFalse(json.loads((directory / 'gate-1.json').read_text())['progress'])
+        # The next ordinary round starts from status as before (new attempt, normal budget).
+        self.assertEqual(out['do'], 'call'); self.assertNotEqual(self.attempt('execute')['id'], attempt)
+
+    def test_continuation_limit_then_failed(self):
+        out, directory, card = self.gated_card()
+        cid = '10000000-0000-4000-8000-000000000001'; edit = [dict(type='file_change', changes=[])]
+        self.write_cli_run(directory / 'run', cid, self.UNFINISHED, items=edit)
+        self.assertEqual(self.next()['do'], 'call')
+        self.write_cli_run(directory / 'run-c1', cid, self.UNFINISHED, items=edit, conversation=cid)
+        self.assertIn('run-c2', self.next()['input']['command'])
+        self.write_cli_run(directory / 'run-c2', cid, self.UNFINISHED, items=edit, conversation=cid)
+        self.next()
+        self.assertEqual(self.by_id('A0001')['result'], 'FAILED')
+        self.assertEqual(json.loads((directory / 'state.json').read_text())['continuations'], 2)
+
+    def test_legal_ends_finish_without_continuation(self):
+        cid = '10000000-0000-4000-8000-000000000001'
+        for text, result in [('结果：VERIFIED\n', 'VERIFIED'),
+                             ('结果：FAILED\n停止原因：技术不可行\n上升问题：三种方案均失败，见记录\n', 'FAILED'),
+                             ('结果：ARCH_DECISION_REQUIRED\n停止原因：待裁决\n上升问题：PDO 映射与冻结用例冲突\n', 'ARCH_DECISION_REQUIRED')]:
+            __import__('shutil').rmtree(self.store.parent / 'records', ignore_errors=True)
+            out, directory, card = self.gated_card()
+            self.write_cli_run(directory / 'run', cid, text)
+            self.next()
+            self.assertEqual(self.by_id('A0001')['result'], result, text)
+            self.assertFalse((directory / 'continue-1.json').exists())
+
+    def test_environment_block_requires_actual_entry_failure(self):
+        cid = '10000000-0000-4000-8000-000000000001'
+        wait = '结果：WAIT_EVIDENCE\n停止原因：外部阻塞\n上升问题：NoNewPrivs=1\n'
+        env = dict(entry=['/opt/entry/run_board_'])
+        out, directory, card = self.gated_card(env=env)
+        own_shell = dict(type='command_execution', command="awk '/NoNewPrivs/' /proc/self/status", exit_code=1)
+        self.write_cli_run(directory / 'run', cid, wait, items=[own_shell])
+        self.assertEqual(self.next()['do'], 'call')
+        self.assertIn('/opt/entry/run_board_', (directory / 'continue-1.md').read_text())
+        failed = dict(type='command_execution', command='/opt/entry/run_board_test.sh s3', exit_code=1)
+        passed = dict(failed, exit_code=0)
+        # A later successful entry run shows the environment works: still not a legal block.
+        self.write_cli_run(directory / 'run-c1', cid, wait, items=[failed, passed, dict(type='file_change', changes=[])], conversation=cid)
+        self.assertIn('run-c2', self.next()['input']['command'])
+        self.write_cli_run(directory / 'run-c2', cid, wait, items=[failed], conversation=cid)
+        self.next()
+        self.assertEqual(self.by_id('A0001')['result'], 'WAIT_EVIDENCE')
+
+    def test_environment_block_requires_the_entry_environment_failure_output(self):
+        cid = '10000000-0000-4000-8000-000000000001'
+        wait = '结果：WAIT_EVIDENCE\n停止原因：外部阻塞\n上升问题：入口前检失败\n'
+        out, directory, card = self.gated_card(env=dict(entry=['/opt/entry/run_board_'], blocked_output='Sandbox detected|Missing sudo rule'))
+        product = dict(type='command_execution', command='/opt/entry/run_board_test.sh s3', exit_code=1, aggregated_output='TC-03 FAIL')
+        self.write_cli_run(directory / 'run', cid, wait, items=[product])  # a failing product test is not an environment block
+        self.assertEqual(self.next()['do'], 'call')
+        # Wrapped or compound entry calls miss the host allow rule: their sandbox failure is self-inflicted.
+        wrapped = dict(type='command_execution', exit_code=1, aggregated_output='ERROR: Sandbox detected: NoNewPrivs is 1 (expected 0)',
+                       command="/bin/bash -lc 'date -u; /opt/entry/run_board_test.sh hostcheck'")
+        self.write_cli_run(directory / 'run-c1', cid, wait, items=[wrapped, dict(type='file_change', changes=[])], conversation=cid)
+        self.assertIn('run-c2', self.next()['input']['command'])
+        blocked = dict(wrapped, command="/bin/bash -lc '/opt/entry/run_board_test.sh hostcheck'")
+        self.write_cli_run(directory / 'run-c2', cid, wait, items=[blocked], conversation=cid)
+        self.next()
+        self.assertEqual(self.by_id('A0001')['result'], 'WAIT_EVIDENCE')
+
+    def test_decision_dispatch_constraint_forces_fresh_session_once(self):
+        import dispatch_card
+        s = json.loads(self.store.read_text())
+        s['plan']['tasks']['execute']['session_policy'] = 'resume'
+        s['state']['attempts'].append(dict(id='A0001', task='execute', started_at='2026-01-01T00:00:00+00:00', result='FAILED'))
+        s['decisions']['DEC-1'] = dict(id='DEC-1', status='closed', resolved_at='2026-01-02T00:00:00+00:00',
+                                       resolution=dict(dispatch=[dict(task='execute', fresh_session=True, note='先经入口运行 hostcheck')]))
+        got = flow.pending_dispatch_constraints(s, 'execute')
+        self.assertEqual([c['decision'] for c in got], ['DEC-1'])
+        s['state']['attempts'].append(dict(id='A0002', task='execute', started_at='2026-01-03T00:00:00+00:00', result=None))
+        self.assertEqual(flow.pending_dispatch_constraints(s, 'execute'), [])
+        with self.assertRaisesRegex(flow.FlowError, 'unknown task'):
+            flow.check_dispatch_constraints(s, [dict(task='nope', fresh_session=True)])
+        with self.assertRaisesRegex(flow.FlowError, '300'):
+            flow.check_dispatch_constraints(s, [dict(task='execute', note='x' * 301)])
+        card = dict(cli_execution={}, decision_notes=[dict(decision='DEC-1', note='先经入口运行 hostcheck')], access='write',
+                    role='executor', kind='EXECUTE', target='execute', mode='dispatch', id='c', tool='codex')
+        prompt = dispatch_card.render_prompt(card, dict(instruction='do it', target='execute'), json.loads(self.store.read_text()), self.store, self.task, self.workspace)
+        self.assertIn('裁决要求（DEC-1，本轮）：先经入口运行 hostcheck', prompt)
+
+    def test_fresh_session_constraint_overrides_resume_hint_in_make(self):
+        import argparse
+        import dispatch_card
+        out, directory, card = self.gated_card()
+        s = json.loads(self.store.read_text()); s['plan']['tasks']['execute']['session_policy'] = 'resume'
+        self.store.write_text(json.dumps(s))
+        cid = '10000000-0000-4000-8000-000000000001'
+        self.write_cli_run(directory / 'run', cid, '结果：FAILED\n停止原因：技术不可行\n上升问题：已试两种方案\n')
+        dispatch_card.finish_card(str(self.store), directory, int(self.rev()))
+        ns = lambda: argparse.Namespace(store=str(self.store), kind='EXECUTE', target='execute', workspace=None,
+                                        runtime=str(self.runtime), as_lead=False, recheck=False)
+        plain = dispatch_card.make(ns())
+        self.assertEqual(plain['resume'], cid)
+        with unittest.mock.patch.object(flow, 'pending_dispatch_constraints',
+                                        return_value=[dict(task='execute', fresh_session=True, note='入口先跑 hostcheck', decision='DEC-9')]):
+            fresh = dispatch_card.make(ns())
+        self.assertIsNone(fresh['resume']); self.assertIn('DEC-9', fresh['replacement_reason'])
+        self.assertNotIn('--conversation', fresh['host_call']['input']['command'])
+        self.assertIn('裁决要求（DEC-9，本轮）：入口先跑 hostcheck', Path(fresh['prompt_file']).read_text())
 
     def completed_cli_card(self, receipt=True, code=0, backend='codex'):
         model='deepseek/deepseek-flash' if backend=='opencode' else 'gpt-6.1-sol'

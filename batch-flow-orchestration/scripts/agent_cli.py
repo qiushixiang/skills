@@ -173,6 +173,8 @@ def build_command(profile, args, prompt):
     # Options precede resume: resume itself does not accept -s or -C.
     argv = [binary, 'exec', '-C', args.cwd, '-s', sandbox,
             '-m', args.model, '--json', '--skip-git-repo-check']
+    if getattr(args, 'approval_policy', None):
+        argv += ['-c', 'approval_policy=' + json.dumps(args.approval_policy)]
     if effort is not None:
         argv += ['-c', 'model_reasoning_effort=' + json.dumps(effort)]
     for directory in args.add_dir:
@@ -183,9 +185,30 @@ def build_command(profile, args, prompt):
     return argv, prompt
 
 
+def check_execution(config):
+    """Check declared launch requirements in the actual caller; no model or product tests."""
+    if config.get('require_host'):
+        try:
+            status = Path('/proc/self/status').read_text()
+        except OSError as error:
+            raise ValueError('HOST_ENVIRONMENT_BLOCKED: cannot verify parent NoNewPrivs') from error
+        if not any(line.split() == ['NoNewPrivs:', '0'] for line in status.splitlines()):
+            raise ValueError('HOST_ENVIRONMENT_BLOCKED: CLI parent has NoNewPrivs!=0; use the authorized host, do not change the child sandbox')
+    for directory in config.get('add_dirs', []):
+        path = Path(directory)
+        if not path.is_absolute() or path.resolve() == Path('/') or not path.is_dir():
+            raise ValueError('invalid authorized add-dir: ' + str(directory))
+    return dict(require_host=bool(config.get('require_host')), add_dirs=config.get('add_dirs', []),
+                approval_policy=config.get('approval_policy'))
+
+
 def validate_call(profile, args):
     """Reject invalid contracts before spawning a CLI or creating a run directory."""
     backend = profile['backend']
+    policy = getattr(args, 'approval_policy', None)
+    if policy and (backend != 'codex' or policy not in {'on-request', 'untrusted'}):
+        raise ValueError('approval-policy is supported only for Codex on-request/untrusted')
+    check_execution(dict(require_host=getattr(args, 'require_host', False)))
     if not args.model.strip() or not args.effort.strip():
         raise ValueError('model/effort must be explicit and non-empty')
     effort_override(backend, args.effort)
@@ -387,6 +410,8 @@ def run(profile_path, args):
                    conversation=args.conversation, argv=argv, stdin=input_text, started_at=now())
     request.update(effort_override=effort_override(profile['backend'], args.effort),
                    resume_from=getattr(args, 'resume_from', None))
+    request['execution'] = dict(require_host=getattr(args, 'require_host', False), add_dirs=args.add_dir,
+                                approval_policy=getattr(args, 'approval_policy', None))
     env, fds, token = None, (), None
     if profile['backend'] == 'opencode':
         env = opencode_env
@@ -469,6 +494,9 @@ def main():
     launch.add_argument('--resume-from', help='previous successful adapter run proving the actual session ID; required for every backend resume')
     launch.add_argument('--add-dir', action='append', default=[])
     launch.add_argument('--settings', help='AGY/Claude/OpenCode session settings JSON file; authorized policy only')
+    for command in (verify, launch):
+        command.add_argument('--require-host', action='store_true', help='require an unrestricted CLI parent (NoNewPrivs=0)')
+        command.add_argument('--approval-policy', choices=['on-request', 'untrusted'], help='explicit Codex approval policy')
     finish = commands.add_parser('collect')
     finish.add_argument('--run-dir', required=True)
     args = parser.parse_args()

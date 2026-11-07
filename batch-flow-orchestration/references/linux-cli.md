@@ -54,6 +54,8 @@ LLM 依据用户原话理解工具、模型和变体，使用目录中的显示�
 
 登记 start/decision_start 前，再用同一 check 命令补上拟用的 `--model <模型> --effort <effort> --cwd <工作目录>` 做完整本地参数检查；续接同时提供下述 conversation/resume-from。它不调用模型，也不保证模型支持所有已通过语法检查的配置，真实可用性仍以远端完成记录为准。
 
+使用派发卡时，`plan.cli_execution.<后端>` 的 require_host、add_dirs 和 Codex approval_policy 自动生成启动参数；父进程与目录检查在 start 前由脚本完成，run 再复查，guide 自动随卡传递。require_host 不清除外层限制，也不保证子进程已命中宿主放行规则；不满足时保留环境错误，不由编排者手工补参数。缺省保持旧行为，配置须来自本任务授权。
+
 `effort=default` 的唯一含义是**不覆盖 CLI 自身配置和模型默认值**：四个后端均省略 effort 覆盖参数，不发送字符串 default，不映射成 medium。OpenCode 当前仅接受 default，未核验的 effort/variant 映射一律在启动前拒绝。request.json 同时保存请求值和 effort_override（继承时为 null），不把继承冒报为某个已测实际 effort。需要固定数值时按用户指定设置明确值；非法枚举和已知模型不支持的值在启动前拒绝。Codex 模型支持情况参见[官方推理说明](https://developers.openai.com/api/docs/guides/reasoning)。
 
 先按 flow.py 的合法动作登记 start（裁决用 decision_start），再通过宿主可回收的异步/后台工具运行：

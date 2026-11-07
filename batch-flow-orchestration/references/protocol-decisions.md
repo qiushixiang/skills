@@ -109,6 +109,8 @@ plan_update 从同一 decision 下有效的用户 confirmation 读取授权：�
 
 恢复条件满足后用close一次闭环；内部检查条件并记录applied_at/closed_at，兼容旧的分别登记applied/closed。closed后仍重新检查整体任务门禁；其他裁决、缺第三方、预算或版本失效不会被本裁决清除。条件有依赖时，建议只提示依赖已满足的恢复任务。
 
+resolve.dispatch 可选，是对任务下一次派发的一次性约束数组：每项 {task, fresh_session?, note?}，note 不超过 300 字。resolve 之后该任务首次生成派发卡时，fresh_session 强制新执行会话并自动写 replacement_reason，note 以“裁决要求（裁决ID，本轮）”进入卡的执行节；该任务再有 start 后即失效。持续有效的操作要求仍写进任务指令（plan_update），不要堆在 note 里。
+
 纯澄清可用resolve.clarification=true，requirements=[]、user_evidence=[]，一次决定并关闭。仅architect所有、非budget_exhausted信号可用，且报告以来plan_version和subjects均未变化；需要后续修改/验证/确认时禁止使用。旧裁决没有报告版本记录时仍走显式恢复条件，不回填推断。澄清不替代实现、审阅、用户批准或其他门禁。
 
 

@@ -32,7 +32,7 @@ actor只能是五类角色；用户决定由编排者附原始来源登记。仅
 | change_subject | 执行者/技术负责人（执行者职责由dispatch_owner代交） | subject, version, evidence |
 | signal | 任一角色（执行者/审阅职责由dispatch_owner代交） | id, signal, reason, blocks, evidence；(decision_point, source_key) |
 | decision_start | 技术负责人 | id, call；登记待决事项开始诊断，不改变决定内容；仅修复旧无效 Codex 逻辑会话时可附 replacement_reason、evidence，保留 handling_history，见 contexts.md |
-| resolve | 技术负责人 | id, summary, requirements, evidence, user_evidence；(context, timing, call_id, clarification) |
+| resolve | 技术负责人 | id, summary, requirements, evidence, user_evidence；(context, timing, call_id, clarification, dispatch) |
 | repin_requirement | 技术负责人 | id, requirement, versions, evidence；(context, reason，二者至少一项)；仅重钉已有 task 恢复条件到目标当前完整版本映射 |
 | supersede_decision | 技术负责人 | id, replacement, reason, evidence, context；仅处理用户授权且正式停用全部旧范围的历史裁决，不代表通过 |
 | classify_attempt | 技术负责人 | attempt, kind, work_performed, reason, evidence；(source_attempt, decision_id, context)；追加可审计记账分类，不改写原尝试 |

@@ -21,6 +21,7 @@ init、plan_update、design_refresh 与 set_models 的参数规则；初始化�
 | decision_points | 裁决点ID对应signal、owner、blocks、instruction |
 | feedback_minutes | 可选；阶段kind对应反馈分钟阈值 |
 | context_groups | 可选；技术链路组ID对应不重叠批次ID数组，旧plan缺省保持兼容 |
+| cli_execution | 可选；按 CLI 后端配置启动环境，不按批次配置。每个后端支持 require_host（父进程 NoNewPrivs=0）、add_dirs（已授权绝对可写目录）、guide（随卡“环境”节传递）、env（entry：受控入口绝对路径前缀数组；可选 preflight：环境核对命令，blocked_output：入口环境失败输出的正则；用于卡首“环境”节及[交付门禁](protocol-budget.md#交付门禁与本轮续作)的外部阻塞核对）；Codex 可另设 approval_policy=on-request/untrusted。派发器转为实际参数并在 start 前检查，适配器启动时复查；不改变角色 read/write 沙箱、预算或验收 |
 
 默认常规通道示意（scope均为B01，版本和预算按本次计划填写）：
 

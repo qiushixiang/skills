@@ -120,7 +120,7 @@ OP_FIELDS = {
     'finish': ('attempt result evidence', 'closes ended_at call subject_versions timing cause call_id'),
     'signal': ('id signal reason blocks evidence', 'decision_point source_key'),
     'decision_start': ('id call', 'replacement_reason evidence'),
-    'resolve': ('id summary requirements evidence user_evidence', 'context timing call_id clarification'),
+    'resolve': ('id summary requirements evidence user_evidence', 'context timing call_id clarification dispatch'),
     'supersede_decision': ('id replacement reason evidence context', ''),
     'repin_requirement': ('id requirement versions evidence', 'context reason'),
     'decision_progress': ('id status evidence', 'requirement budget_approval'),
@@ -284,8 +284,30 @@ def active_review_budget_coverage(s, plan=None):
 
 
 def validate_plan(p, enforce_review_budget=True):
-    obj(p, ['name', 'roles', 'batches', 'subjects', 'budgets', 'tasks', 'decision_points'], ['feedback_minutes', 'context_groups', 'goal_contract'])
+    obj(p, ['name', 'roles', 'batches', 'subjects', 'budgets', 'tasks', 'decision_points'], ['feedback_minutes', 'context_groups', 'goal_contract', 'cli_execution'])
     string(p['name'], 'plan.name')
+    require(isinstance(p.get('cli_execution', {}), dict), 'cli_execution: expected object')
+    for backend, config in p.get('cli_execution', {}).items():
+        require(backend in {'codex', 'agy', 'claude', 'opencode'}, 'unsupported cli_execution backend')
+        obj(config, [], ['require_host', 'add_dirs', 'approval_policy', 'guide', 'env'])
+        if 'env' in config:
+            obj(config['env'], ['entry'], ['preflight', 'blocked_output'], label='cli_execution.env')
+            if 'blocked_output' in config['env']:
+                string(config['env']['blocked_output'], 'cli_execution.env.blocked_output')
+                try: re.compile(config['env']['blocked_output'])
+                except re.error as error: raise FlowError('cli_execution.env.blocked_output: invalid regex: %s' % error)
+            strings(config['env']['entry'], 'cli_execution.env.entry', nonempty=True)
+            require(all(Path(x).is_absolute() for x in config['env']['entry']), 'cli_execution.env.entry: absolute path prefixes only')
+            if 'preflight' in config['env']: string(config['env']['preflight'], 'cli_execution.env.preflight')
+        if 'require_host' in config: boolean(config['require_host'], 'require_host')
+        if 'add_dirs' in config:
+            strings(config['add_dirs'], 'add_dirs')
+            require(all(Path(x).is_absolute() and Path(x).resolve() != Path('/') for x in config['add_dirs']),
+                    'add_dirs must contain absolute, non-root directories')
+        if 'approval_policy' in config:
+            require(backend == 'codex' and config['approval_policy'] in {'on-request', 'untrusted'},
+                    'approval_policy supports codex on-request/untrusted only')
+        if 'guide' in config: string(config['guide'], 'cli_execution.guide')
     if 'goal_contract' in p:
         validate_goal_contract(p['goal_contract'], 'plan.goal_contract')
     require(isinstance(p['roles'], dict), 'plan.roles: expected object')
@@ -1255,6 +1277,32 @@ def check_requirements(s, rr):
         seen.update(ready)
 
 
+def check_dispatch_constraints(s, items):
+    """One-shot constraints for the next dispatch of a task after this resolution (fresh session, short note)."""
+    require(isinstance(items, list), 'resolve.dispatch: expected array')
+    for c in items:
+        obj(c, ['task'], ['fresh_session', 'note'], label='resolve.dispatch[]')
+        require(c['task'] in s['plan']['tasks'], 'resolve.dispatch: unknown task')
+        require(c.get('fresh_session') or c.get('note'), 'resolve.dispatch: give fresh_session and/or note')
+        if 'fresh_session' in c: boolean(c['fresh_session'], 'resolve.dispatch.fresh_session')
+        if 'note' in c:
+            string(c['note'], 'resolve.dispatch.note')
+            require(len(c['note']) <= 300, 'resolve.dispatch.note: at most 300 characters; durable rules belong in the task instruction')
+
+
+def pending_dispatch_constraints(s, tid):
+    """Constraints from effective resolutions made after the task's latest start (consumed by the next dispatch)."""
+    starts = [a['started_at'] for a in s['state']['attempts'] if a['task'] == tid]
+    last = max(starts) if starts else ''
+    out = []
+    for dec in s['decisions'].values():
+        res = dec.get('resolution')
+        if not res or dec.get('status') == 'superseded' or (dec.get('resolved_at') or '') <= last:
+            continue
+        out += [dict(c, decision=dec['id']) for c in res.get('dispatch', []) if c['task'] == tid]
+    return out
+
+
 def operate(s, op, actor, root, at):
     obj(op, ['type', 'data']); kind = op['type']; d = op['data']
     require(kind in OP_ROLES and actor in OP_ROLES[kind], f'{actor} cannot perform {kind}')
@@ -1608,6 +1656,7 @@ def operate(s, op, actor, root, at):
             registered = dec['handling']['call']['conversation_id']
             require(registered.startswith('pending:') or registered == d['context']['conversation_id'], 'decision context differs from handling session')
             dec['handling']['call']['conversation_id'] = d['context']['conversation_id']
+        check_dispatch_constraints(s, d.get('dispatch', []))
         dec['resolution'] = dict(d, evidence_hashes=evidence(d['evidence'], root), user_evidence=user_hashes)
         if 'timing' in d:
             require(dec.get('handling'), 'record decision_start before actual decision timing')

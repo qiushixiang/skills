@@ -47,6 +47,9 @@ def card_calls(card_root, lead=False):
             card = json.loads(path.read_text(encoding='utf-8'))
             if bool(card.get('lead')) == lead:
                 calls.append(card['host_call'])
+                # In-attempt continuations written by dispatch_card.py next for the same card.
+                for extra in sorted(path.parent.glob('continue-*.json')):
+                    calls.append(json.loads(extra.read_text(encoding='utf-8'))['host_call'])
         except (OSError, ValueError, KeyError):
             continue
     return calls

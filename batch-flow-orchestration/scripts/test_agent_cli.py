@@ -12,6 +12,40 @@ import agent_cli as cli
 
 
 class AdapterTests(unittest.TestCase):
+    def test_codex_launch_policy_is_explicit_on_new_and_resumed_calls(self):
+        for conversation in (None, 'actual-session'):
+            self.args.conversation = conversation
+            self.args.approval_policy = 'on-request'
+            argv, _ = cli.build_command(dict(backend='codex', binary='/bin/codex'), self.args, 'test')
+            self.assertIn('approval_policy="on-request"', argv)
+            self.assertEqual(argv[argv.index('-s') + 1], 'read-only')
+            if conversation:
+                self.assertLess(argv.index('approval_policy="on-request"'), argv.index('resume'))
+
+    def test_restricted_parent_is_rejected_without_starting_cli(self):
+        with patch.object(Path, 'read_text', return_value='NoNewPrivs:\t1\n'), patch.object(cli.subprocess, 'Popen') as launch:
+            with self.assertRaisesRegex(ValueError, 'HOST_ENVIRONMENT_BLOCKED'):
+                cli.check_execution(dict(require_host=True))
+            launch.assert_not_called()
+        self.assertFalse(Path(self.args.run_dir).exists())
+
+    def test_host_check_does_not_override_sandbox_or_directory_scope(self):
+        with patch.object(Path, 'read_text', return_value='NoNewPrivs:\t0\n'):
+            result = cli.check_execution(dict(require_host=True, add_dirs=[str(self.root)]))
+            self.assertTrue(result['require_host'])
+            with self.assertRaisesRegex(ValueError, 'add-dir'):
+                cli.check_execution(dict(add_dirs=['/']))
+        # No opt-in requirement keeps normal sandboxed tasks compatible.
+        self.assertFalse(cli.check_execution({})['require_host'])
+
+    def test_unconfigured_backends_keep_relative_add_dir_behavior(self):
+        for backend in ('agy', 'claude', 'opencode', 'codex'):
+            self.args.add_dir = ['.']
+            self.args.effort = 'default'
+            self.args.model = 'test/model' if backend == 'opencode' else 'explicit-model'
+            cli.validate_call(dict(backend=backend), self.args)
+            self.assertEqual(self.args.add_dir, [str(Path.cwd())])
+
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name)
         self.prompt=self.root/'prompt.txt'

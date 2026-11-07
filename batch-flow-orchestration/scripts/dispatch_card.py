@@ -51,13 +51,16 @@ LEAD_FLOW = {'DESIGN': 'workflows/plan-sync/SKILL.md', 'PLAN_REPAIR': 'workflows
              'PREPARE_RESUMPTION': 'workflows/recovery/SKILL.md', 'CONFIRM_CONDITION': 'workflows/recovery/SKILL.md',
              'REVIEW': 'workflows/review/SKILL.md', 'THIRD_PARTY_REVIEW': 'workflows/review/SKILL.md'}
 EXECUTOR_DELIVERY = """结果：VERIFIED | WAIT_EVIDENCE | FAILED | ARCH_DECISION_REQUIRED
-（结果只按本卡工作内容和验收判定：本卡要求的改动、构建与验证都完成即 VERIFIED。由后续审阅、板测等其他节点产生的实证不属本卡，
-不因其尚未运行写 WAIT_EVIDENCE；WAIT_EVIDENCE 只用于本卡要求的验证因外部条件无法完成。）
+停止原因：完成 | 外部阻塞 | 待裁决 | 技术不可行 | 未完成
+（只按本卡工作判定，其他节点的实证不属本卡。完成=本卡改动、构建、验证全部完成→VERIFIED；外部阻塞=本卡验证经受控入口实际运行仍因环境失败→WAIT_EVIDENCE；
+待裁决=范围或方案矛盾需负责人决定→ARCH_DECISION_REQUIRED；技术不可行=已试方案均失败且本卡范围内无其他路径→FAILED；其余一律写“未完成”。{gate_note}）
 改动与版本：<改动文件/范围；git 固定引用或 snapshot 记录路径；需更新的 subject→版本>
 验证证据：<flow.py record 生成的记录路径及对应验收项>
 未运行/失败：<项目、原因、最小缺项>
-上升问题：<矛盾/阻塞、影响、受阻任务、建议处理；无则写“无”>
+上升问题：<矛盾/阻塞、已试方案、影响、建议处理；待裁决/技术不可行时必填；否则写“无”>
 限制：<已知限制与残余风险>"""
+GATE_NOTE = '回收脚本按此字段核对：未完成或依据不足时让你在本轮继续，不另扣预算'
+CONTINUE_LIMIT = 2  # in-attempt continuations after a delivery that is not a legal end
 REVIEW_DELIVERY = """结果：RELEASE | FIX_REQUIRED | WAIT_EVIDENCE | ARCH_DECISION_REQUIRED
 固定版本：<被审对象及版本>
 复跑与证据：<原始记录路径、命令、工作目录、退出码及对应验收项>
@@ -270,6 +273,25 @@ def render_goal_context(context):
     return lines
 
 
+def render_environment(card):
+    """Environment facts first and short: sandbox state of the role's own shell is never task evidence."""
+    execution = card.get('cli_execution') or {}
+    if not execution:
+        return []
+    lines = ['', '## 环境']
+    if card.get('route_backend') in {'codex', 'agy', 'opencode'} or execution.get('require_host') or execution.get('env'):
+        lines.append('你的 shell 运行在 CLI 沙箱内：NoNewPrivs、capability、seccomp、只读目录等是沙箱常态，不用来判断任务环境，也不作为阻塞证据。')
+    env = execution.get('env')
+    if env:
+        lines.append('需要宿主权限的操作只经受控入口：%s。每次单独直接调用，不与其他命令组合、不另套 shell/flow.py，否则宿主放行规则不命中，会在沙箱内失败。' % '、'.join(env['entry']))
+        if env.get('preflight'):
+            lines.append('环境有疑问时先运行 `%s`，以其输出为环境结论。' % env['preflight'])
+        lines.append('“外部阻塞”只以本卡内最近一次实际运行受控入口的环境失败输出为证；回收时机械核对。')
+    if execution.get('guide'):
+        lines.append('补充：' + execution['guide'])
+    return lines
+
+
 def render_prompt(card, payload, s, store, task_base, workspace):
     role = card['role']; kind = card['kind']; target = card['target']
     docs = list(ROLE_DOCS[role])
@@ -280,7 +302,10 @@ def render_prompt(card, payload, s, store, task_base, workspace):
     lines = ['# %s · %s' % (role, target),
              '动作：%s；计划 %s。' % (kind, s['plan_version'])]
     lines += render_goal_context(flow.goal_context(s, payload))
+    lines += render_environment(card)
     lines += ['', '## 执行', payload.get('instruction', '').strip()]
+    for item in card.get('decision_notes') or []:
+        lines.append('裁决要求（%s，本轮）：%s' % (item['decision'], item['note']))
     lines += ['', '## 输入与约束', '工作目录：' + str(workspace), '台账：' + str(store)]
     if task_base != workspace:
         lines.append('任务目录：' + str(task_base))
@@ -319,7 +344,7 @@ def render_prompt(card, payload, s, store, task_base, workspace):
     elif card['mode'] == 'delegate_to_lead':
         lines += ['', '本动作由局部技术负责人处理：按职责实际处理，或经固定入口 ' + str(SCRIPTS / 'agent_cli.py') +
                   ' 派发并回收；需要登记的台账操作写成 --data 参数文件放在 ' + card['dir'] + ' 下，并在交付中列出。']
-    delivery = EXECUTOR_DELIVERY if role == 'executor' else REVIEW_DELIVERY if role in {'reviewer', 'third_party'} else LEAD_DELIVERY
+    delivery = EXECUTOR_DELIVERY.format(gate_note='；' + (GATE_NOTE if card.get('delivery_gate') else '可自行补齐的工作须在本轮继续')) if role == 'executor' else REVIEW_DELIVERY if role in {'reviewer', 'third_party'} else LEAD_DELIVERY
     lines += ['', '## 交付（最终回复只给以下结构，首行必须是“结果：<值>”）', '', '```text', delivery, '```']
     if role in {'reviewer', 'third_party'} and card['access'] == 'read':
         lines += ['', '只读审阅：直接复跑可在本环境执行的代表性验证；报告命令、工作目录、退出码和关键输出。',
@@ -392,6 +417,11 @@ def make(args):
                            % (resume, size // 1024, EXECUTOR_RESUME_MAX_BYTES // 1024))
             resume = None
     task = s['plan']['tasks'].get(args.target)
+    constraints = flow.pending_dispatch_constraints(s, args.target) if task and mode == 'dispatch' else []
+    fresh = [c['decision'] for c in constraints if c.get('fresh_session')]
+    if fresh and (resume or (task.get('session_policy') == 'resume' and not replacement)):
+        replacement = '%s 要求新执行会话（原上下文 %s 不续用）' % ('、'.join(fresh), resume or '按 context_hint')
+        resume = None
     prev = flow.latest(s, args.target) if task else None
     if not resume and not replacement and task and task.get('session_policy') == 'resume' and prev and mode == 'dispatch':
         replacement = '按 context_hint 新建（%s）' % (hint.get('reason') or '原上下文不可续')
@@ -409,6 +439,15 @@ def make(args):
                 ledger_start='start' if args.target in s['plan']['tasks'] and args.kind in TASK_KINDS and mode == 'dispatch'
                 else 'decision_start' if args.kind == 'DECIDE' and mode == 'dispatch' else None,
                 retry_of=payload.get('retry_of'), continuation_of=payload.get('continuation_of'), replacement_reason=replacement)
+    backend = CLI_TOOLS.get(tool) or ('claude' if host == 'agy' and tool in {'claude', 'claude-code'} else None)
+    if backend and s['plan'].get('cli_execution', {}).get(backend):
+        card['cli_execution'] = dict(s['plan']['cli_execution'][backend])
+    card['route_backend'] = backend
+    card['workspace'] = str(workspace)
+    card['decision_notes'] = [dict(decision=c['decision'], note=c['note']) for c in constraints if c.get('note')]
+    # Only orchestrator-driven background CLI executor tasks can be continued in place by next.
+    card['delivery_gate'] = (role == 'executor' and card['ledger_start'] == 'start' and tool in CLI_TOOLS
+                             and not as_lead and not (native or is_agent_tool(tool)))
     payload_path = directory / 'payload.json'
     write_new(payload_path, json.dumps(payload, ensure_ascii=False, indent=2) + '\n')
     card['payload_file'] = str(payload_path)
@@ -466,6 +505,13 @@ def make(args):
             argv += ['--conversation', resume, '--resume-from', str(prior_run(store, resume))]
         if not within(task_base, workspace):
             argv += ['--add-dir', str(task_base)]
+        execution = card.get('cli_execution', {})
+        if execution.get('require_host'):
+            argv.append('--require-host')
+        if execution.get('approval_policy'):
+            argv += ['--approval-policy', execution['approval_policy']]
+        for extra_dir in execution.get('add_dirs', []):
+            argv += ['--add-dir', extra_dir]
         card['route'] = 'cli'
         if host == 'agy':
             card['host_call'] = dict(tool='run_command', input=dict(CommandLine=shlex.join(argv)))
@@ -545,6 +591,12 @@ def start(args):
     need(not st.get('attempt') and not st.get('started'), '本卡已登记开始；不要重复 start')
     need(current_card_goals(card, load_json(args.store)), '任务目标或计划版本已变化；重新生成派发卡，不发送旧提示词')
     need(card['ledger_start'], '本动作没有 start 登记')
+    if card.get('cli_execution'):
+        import agent_cli
+        try:
+            agent_cli.check_execution(card['cli_execution'])
+        except ValueError as error:
+            raise CardError(str(error)) from error
     call = dict(tool=card['tool'], model=card['model'], effort=card['effort'], conversation_id=card.get('resume') or 'pending:' + card['id'])
     if card['ledger_start'] == 'start':
         data = {k: card[k] for k in ['retry_of', 'continuation_of', 'replacement_reason'] if card.get(k)}
@@ -589,6 +641,162 @@ def finish(args):
     return finish_card(args.store, card_dir(args.store, args.card), args.revision, args.conversation)
 
 
+# ---- delivery gate: a CLI turn ending is not the attempt ending ---------------------------------------
+# Structural checks only (no model, no keyword semantics). An illegal end is continued in the same native
+# session and the same attempt (no new budget); after CONTINUE_LIMIT, or without progress, it is registered
+# as FAILED and the existing round/takeover rules apply unchanged.
+
+def run_dirs(directory, st=None):
+    st = state(directory) if st is None else st
+    return [Path(directory) / 'run'] + [Path(directory) / ('run-c%d' % i) for i in range(1, st.get('continuations', 0) + 1)]
+
+
+def current_run(directory, st=None):
+    return run_dirs(directory, st)[-1]
+
+
+def delivery_field(text, name):
+    match = re.search(r'^\s*[*#>\s]*%s\s*[:：]\s*\**\s*(.*)$' % name, text or '', re.M)
+    return match.group(1).strip().strip('*').strip() if match else ''
+
+
+def environment_blocked(card, directory, st, text):
+    """The environment claim stands only on actual runs: the latest controlled-entry invocation in this card's raw
+    CLI events failed (and, when configured, printed the entry's own environment-failure output). A later successful
+    run means the environment works. Without env config: any failed command or a cited failed record of this card."""
+    env = (card.get('cli_execution') or {}).get('env') or {}
+    if not env:
+        return any(h['exit_code'] != 0 for h in command_runs(directory, st)) or bool(cited_failed_records(card, text))
+    runs = [h for h in command_runs(directory, st) if direct_entry(h['command'], env['entry'])]
+    if not runs or runs[-1]['exit_code'] == 0:
+        return False
+    return not env.get('blocked_output') or bool(re.search(env['blocked_output'], runs[-1]['output']))
+
+
+def direct_entry(command, entries):
+    """True only for a bare entry call: compound commands, flow.py wrappers or extra shells are not matched by host
+    allow rules, so their sandbox failure is self-inflicted rather than an environment block."""
+    try:
+        words = shlex.split(command)
+        if len(words) == 3 and Path(words[0]).name in {'bash', 'sh'} and words[1] in {'-c', '-lc'}:
+            inner = words[2]
+            if re.search(r'[;&|<>`$()\n]', inner):
+                return False
+            words = shlex.split(inner)
+    except ValueError:
+        return False
+    return bool(words) and any(words[0].startswith(e) for e in entries)
+
+
+def command_runs(directory, st):
+    """Completed command executions, in order, from this card's raw CLI event logs (Codex JSON events)."""
+    hits = []
+    for run in run_dirs(directory, st):
+        try:
+            lines = (run / 'stdout').read_text(encoding='utf-8', errors='replace').splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                item = json.loads(line).get('item') or {}
+            except (ValueError, AttributeError):
+                continue
+            if item.get('type') == 'command_execution' and item.get('exit_code') is not None:
+                hits.append(dict(run=str(run), command=item.get('command') or '', exit_code=item['exit_code'],
+                                 output=item.get('aggregated_output') or ''))
+    return hits
+
+
+def cited_failed_records(card, text):
+    root = Path(card['store']).parent / 'records'
+    hits = []
+    for name in sorted(set(re.findall(r'records/([0-9a-f]{8,})\.json', text or ''))):
+        try:
+            record = load_json(root / (name + '.json'))
+        except (OSError, CardError, ValueError):
+            continue
+        if str(record.get('exit_code')) not in ('0', 'None') and str(record.get('started_at', '')) >= card['created_at']:
+            hits.append(str(root / (name + '.json')))
+    return hits
+
+
+def delivery_gate(card, directory, st, text):
+    """Returns (legal, reason)."""
+    result = parse_result(text); why = delivery_field(text, '停止原因'); issue = delivery_field(text, '上升问题')
+    if result == 'VERIFIED':
+        return True, 'VERIFIED'
+    has_issue = bool(issue) and not issue.startswith('无')
+    if why.startswith('待裁决'):
+        return (result == 'ARCH_DECISION_REQUIRED' and has_issue), '待裁决须为 ARCH_DECISION_REQUIRED 且写明上升问题'
+    if why.startswith('技术不可行'):
+        return (result == 'FAILED' and has_issue), '技术不可行须为 FAILED 且在上升问题写明已试方案'
+    if why.startswith('外部阻塞'):
+        if result != 'WAIT_EVIDENCE':
+            return False, '外部阻塞须为 WAIT_EVIDENCE'
+        return environment_blocked(card, directory, st, text), '本卡原始运行中最近一次受控入口调用未运行、已成功或不是环境失败，环境阻塞依据不足'
+    if why.startswith('完成'):
+        return False, '停止原因为完成但结果不是 VERIFIED'
+    return False, '停止原因为“%s”：本卡尚未完成' % (why or '缺失')
+
+
+def made_progress(card, run):
+    """Edits in the raw event log, or a new flow.py record written during this run."""
+    try:
+        if '"file_change"' in (run / 'stdout').read_text(encoding='utf-8', errors='replace'):
+            return True
+        since = (run / 'request.json').stat().st_mtime
+    except OSError:
+        return False
+    records = Path(card['store']).parent / 'records'
+    return any(p.stat().st_mtime >= since for p in records.glob('*.json'))
+
+
+def continuation_call(card, directory, st, conversation, why):
+    k = st.get('continuations', 0) + 1
+    previous = current_run(directory, st)
+    prompt = Path(directory) / ('continue-%d.md' % k)
+    env = (card.get('cli_execution') or {}).get('env') or {}
+    lines = ['回收检查：派发卡 %s 尚未合法结束（%s）。这是同一轮次续作 %d/%d，不另扣预算。' % (card['id'], why, k, CONTINUE_LIMIT),
+             '继续完成本卡剩余工作（原卡：%s）。结束时按原卡交付结构重新给出完整最终回复。' % card['prompt_file']]
+    if env and '环境' in why:
+        lines.append('环境阻塞只以最近一次直接调用受控入口（%s，不组合命令、不另套 shell/flow.py）的环境失败输出为证；你 shell 的沙箱状态不是证据。' % '、'.join(env['entry'])
+                     + ('可先运行 `%s` 核对。' % env['preflight'] if env.get('preflight') else ''))
+    write_new(prompt, '\n'.join(lines) + '\n')
+    key = 'CommandLine' if card['host_call']['tool'] == 'run_command' else 'command'
+    words = shlex.split(card['host_call']['input'][key]); out = []
+    skip = {'--prompt-file', '--run-dir', '--conversation', '--resume-from'}
+    i = 0
+    while i < len(words):
+        if words[i] in skip:
+            i += 2; continue
+        out.append(words[i]); i += 1
+    out += ['--prompt-file', str(prompt), '--run-dir', str(Path(directory) / ('run-c%d' % k)),
+            '--conversation', conversation, '--resume-from', str(previous)]
+    call = dict(tool=card['host_call']['tool'], input=dict(card['host_call']['input'], **{key: shlex.join(out)}))
+    if 'description' in call['input']:
+        call['input']['description'] = '%s continue %d' % (card['host_call']['input']['description'], k)
+    write_new(Path(directory) / ('continue-%d.json' % k), json.dumps(dict(host_call=call, reason=why), ensure_ascii=False, indent=2))
+    return k
+
+
+def gate_or_continue(store, directory, card, report):
+    """Finish a legal delivery; otherwise continue in place, or finish as FAILED once continuation is spent."""
+    st = state(directory); k = st.get('continuations', 0)
+    text = report.get('response') or ''
+    legal, why = delivery_gate(card, directory, st, text)
+    run = current_run(directory, st)
+    progress = k == 0 or made_progress(card, run)
+    write_new(Path(directory) / ('gate-%d.json' % k), json.dumps(dict(run=str(run), legal=legal, reason=why, progress=progress,
+                                                                      result=parse_result(text), at=now()), ensure_ascii=False, indent=2))
+    if legal:
+        return finish_card(store, directory, revision(store))
+    if k < CONTINUE_LIMIT and progress:
+        st['continuations'] = continuation_call(card, directory, st, report['conversation_id'], why)
+        save_state(directory, st)
+        return None
+    return finish_card(store, directory, revision(store), result_override='FAILED')
+
+
 def register_confirmation_wait(store, card, result_path, rev):
     ledger = load_json(store)
     hashes = flow.evidence([str(result_path)], Path(store).resolve().parent)
@@ -616,7 +824,7 @@ def migrate_confirmation_waits(store):
         register_confirmation_wait(store, card, row['path'], revision(store))
 
 
-def finish_card(store, directory, revision, conversation_arg=None):
+def finish_card(store, directory, revision, conversation_arg=None, result_override=None):
     directory = Path(directory); card = load_json(directory / 'card.json'); st = state(directory)
     need(not st.get('finished'), '本卡已回收')
     result_path = directory / 'result.md'
@@ -624,15 +832,18 @@ def finish_card(store, directory, revision, conversation_arg=None):
     evidence = []
     if card['route'] == 'cli':
         import agent_cli
-        report = agent_cli.collect(directory / 'run')
+        run = current_run(directory, st)
+        report = agent_cli.collect(run)
         need(report.get('event') != 'CLI_INCOMPLETE', '后台运行尚未结束（无 exit.json）；等待完成通知，不要重派')
-        need(report.get('usable'), 'CLI 调用不可用：%s；保留 %s 原始记录，按恢复流程分类，不自动重试' % (report.get('problems'), directory / 'run'))
-        receipt = directory / 'run' / 'receipt.json'
-        need(receipt.is_file(), 'CLI 缺少原始启动回执 run/receipt.json；核查真实调用，不生成替代回执或重派')
+        need(report.get('usable'), 'CLI 调用不可用：%s；保留 %s 原始记录，按恢复流程分类，不自动重试' % (report.get('problems'), run))
+        receipt = run / 'receipt.json'
+        need(receipt.is_file(), 'CLI 缺少原始启动回执 %s/receipt.json；核查真实调用，不生成替代回执或重派' % run.name)
         if not result_path.exists():
             write_new(result_path, report.get('response') or '')
         conversation = report['conversation_id']
-        evidence += [str(directory / 'run' / name) for name in ['request.json', 'stdout', 'stderr', 'exit.json'] if (directory / 'run' / name).exists()]
+        for each in run_dirs(directory, st):
+            evidence += [str(each / name) for name in ['request.json', 'stdout', 'stderr', 'exit.json'] if (each / name).exists()]
+        evidence += [str(p) for p in sorted(directory.glob('gate-*.json'))]
     else:
         need(result_path.is_file() and result_path.read_text().strip(), '先把子代理最终报告原文 Write 为 %s' % result_path)
         conversation = card.get('resume') or conversation_arg
@@ -659,6 +870,8 @@ def finish_card(store, directory, revision, conversation_arg=None):
         return out
     need(st.get('attempt'), '本卡未登记 start')
     need(value in flow.RESULTS, '交付首行缺少合法“结果：<值>”（%s）；退回原角色补齐，不代填' % sorted(flow.RESULTS))
+    if result_override:
+        value = out['result'] = result_override  # gate.json records the executor's own result and why
     s = load_json(store)
     attempt = next(a for a in s['state']['attempts'] if a['id'] == st['attempt'])
     actor = attempt.get('performer_role') or card['role']
@@ -851,7 +1064,7 @@ def collect_agent(store, directory, card, spec, path):
 
 def cli_pid(directory):
     try:
-        return int(load_json(directory / 'run' / 'receipt.json')['pid'])
+        return int(load_json(current_run(directory) / 'receipt.json')['pid'])
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
@@ -919,25 +1132,31 @@ def reconcile(store, spec, started):
                     out['interrupted'].append(dict(card=card['id'], result=interrupt(store, directory, card, '编排者重启，技术负责人与其子代理随之终止')))
                 continue
             if card['route'] == 'cli':
-                pid = cli_pid(directory)
-                if (directory / 'run' / 'exit.json').exists() and not (directory / 'run' / 'request.json').exists():
+                pid = cli_pid(directory); run = current_run(directory, st)
+                if (run / 'exit.json').exists() and not (run / 'request.json').exists():
                     # agent_cli writes request.json before launching; an exit.json without it is not a real CLI run record.
                     out['interrupted'].append(dict(card=card['id'], result=interrupt(
                         store, directory, card, '运行目录有 exit.json 但缺 agent_cli 启动前写入的 request.json：不是真实 CLI 运行记录，不采信',
-                        dict(run=str(directory / 'run'))), reason='no_cli_request'))
-                elif (directory / 'run' / 'exit.json').exists():
+                        dict(run=str(run))), reason='no_cli_request'))
+                elif (run / 'exit.json').exists():
                     import agent_cli
-                    report = agent_cli.collect(directory / 'run')
-                    if report.get('usable'):
+                    report = agent_cli.collect(run)
+                    if report.get('usable') and card.get('delivery_gate'):
+                        done = gate_or_continue(store, directory, card, report)
+                        if done:
+                            out['collected'].append(done)
+                        else:
+                            out['pending'].append(card)  # same attempt, same session: next emits the continuation call
+                    elif report.get('usable'):
                         out['collected'].append(finish_card(store, directory, revision(store)))
                     else:  # a tool failure, not a technical result: INVALID keeps the raw run and lets status retry
                         out['interrupted'].append(dict(card=card['id'], result=interrupt(
-                            store, directory, card, 'CLI 运行不可用：%s' % report.get('problems'), dict(run=str(directory / 'run'))), reason='cli_failed'))
+                            store, directory, card, 'CLI 运行不可用：%s' % report.get('problems'), dict(run=str(run))), reason='cli_failed'))
                 elif pid and alive(pid):
                     if live:
-                        register_receipt(store, directory, card, st, 'pid:%d' % pid, directory / 'run' / 'receipt.json', spec)
+                        register_receipt(store, directory, card, st, 'pid:%d' % pid, run / 'receipt.json', spec)
                     out['running'].append(dict(card=card['id'], pid=pid))
-                elif live and pid is None:
+                elif pid is None and (live or st.get('continuations')):
                     out['pending'].append(card)
                 else:
                     out['interrupted'].append(dict(card=card['id'], result=interrupt(store, directory, card, 'CLI 运行随原编排会话终止（无 exit.json，进程已不在）', dict(pid=pid))))
@@ -1227,6 +1446,8 @@ def emit(store, card, runtime):
     if card['ledger_start'] and not st.get('started'):
         start(argparse.Namespace(store=store, card=card['id'], revision=revision(store)))
     call = card['host_call']
+    if st.get('continuations'):
+        call = load_json(Path(card['dir']) / ('continue-%d.json' % st['continuations']))['host_call']
     return dict(do='call', card=card['id'], tool=call['tool'], input=call['input'],
                 say='逐字照抄 tool 与 input 发起这一个调用（任何字段都不改）；调用返回后立即再运行 next。')
 
