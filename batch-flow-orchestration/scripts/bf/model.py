@@ -6,6 +6,8 @@ from pathlib import Path
 from .store import BfError, need, sha256_file, now
 
 DEFAULT_ROUNDS = {'implement': 3, 'backup': 1, 'lead': 1, 'repair': 2, 'review': 3, 'decide_per_source': 2}
+CLI_TOOLS = {'agy': 'agy', 'agy-cli': 'agy', 'codex': 'codex', 'codex-cli': 'codex', 'claude': 'claude',
+             'claude-cli': 'claude', 'claude-code': 'claude', 'opencode': 'opencode', 'opencode-cli': 'opencode'}
 ORDER_TYPES = ('implement', 'review', 'repair', 'decide', 'ask_user', 'triage', 'release')
 
 
@@ -108,3 +110,12 @@ def deliverables_of(plan, target):
     if target in plan['review_groups']:
         return list(plan['review_groups'][target]['deliverables'])
     return []
+
+
+def backend(tool):
+    """Backend a role tool maps to; plan.env is keyed by backend."""
+    return CLI_TOOLS.get(tool, tool)
+
+
+def env_for(plan, tool):
+    return plan['env'].get(backend(tool), {})

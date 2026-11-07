@@ -163,8 +163,8 @@ def add_candidates(state, order, items):
         return
     triages = [o for o in state.orders.values() if o['type'] == 'triage' and o['target'] == batch]
     open_t = next((o for o in triages if o['state'] == 'open' and not o['runs']), None)
-    n = sum(len(o['input']['items']) for o in triages)
-    new = [{'id': 'T%d' % (n + i + 1), 'text': t, 'source': order['id']} for i, t in enumerate(items)]
+    n = len(open_t['input']['items']) if open_t else 0
+    new = [{'id': 'C%d' % (n + i + 1), 'text': t, 'source': order['id']} for i, t in enumerate(items)]
     if open_t:
         open_t['input']['items'].extend(new)
         return

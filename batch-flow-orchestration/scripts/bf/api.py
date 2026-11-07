@@ -4,7 +4,7 @@ import time
 from . import gate, model, policy, register, routing, context
 from .store import BfError, State, load, need, now, transact
 
-__all__ = ['BfError', 'init', 'load', 'orders', 'runnable', 'assign', 'start', 'deliver', 'release', 'answer',
+__all__ = ['abandon', 'report', 'BfError', 'init', 'load', 'orders', 'runnable', 'assign', 'start', 'deliver', 'release', 'answer',
            'revise_plan', 'stop', 'resume', 'broken_evidence']
 
 
@@ -65,7 +65,7 @@ def deliver(base, order_id, run_id, text, events=(), decision=None, conversation
         run = next((r for r in o['runs'] if r['run_id'] == run_id), None)
         need(run is not None and run['ended'] is None, 'no open run %s on %s' % (run_id, order_id))
         p = gate.parse(text, st.base)
-        edited_now = gate.scan(run, events, st.plan['env'].get(run['tool'], {}))
+        edited_now = gate.scan(run, events, model.env_for(st.plan, run['tool']))
         legal, reason = gate.judge(st, o, run, p, decision, text)
         run['segments'] += 1
         if conversation_id:
@@ -143,3 +143,45 @@ def stop(base, expected_revision=None, request_id=None, actor='user'):
 
 def resume(base, expected_revision=None, request_id=None, actor='user'):
     return _set_stopped(base, False, 'resume', expected_revision, request_id, actor)
+
+
+def abandon(base, order_id, run_id, reason, expected_revision=None, request_id=None, actor='driver'):
+    """A run whose process is lost: INVALID and free of charge, the order becomes dispatchable again."""
+    def fn(st):
+        o = routing.get(st, order_id)
+        run = next((r for r in o['runs'] if r['run_id'] == run_id), None)
+        need(run is not None and run['ended'] is None, 'no open run %s on %s' % (run_id, order_id))
+        run.update(ended=now(), result='INVALID', stop_reason=reason, exempt=True)
+        o['state'] = 'open'
+        return run_id
+    return transact(base, 'abandon', actor, fn, expected_revision, request_id)
+
+
+def report(base, recent=10):
+    """Structured summary for the chat front: in-flight runs, latest finished runs, open questions, budgets left."""
+    st = load(base)
+    running, ended = [], []
+    for o in routing.sorted_orders(st):
+        for r in o['runs']:
+            item = {'order': o['id'], 'type': o['type'], 'target': o['target'], 'run': r['run_id'],
+                    'performer': r['performer'], 'started': r['started']}
+            if r['ended']:
+                item.update(result=r['result'], stop_reason=r['stop_reason'], ended=r['ended'], exempt=r['exempt'])
+                ended.append(item)
+            else:
+                item.update(segments=r['segments'], edited=r['edited'])
+                running.append(item)
+    ask = [{'order': o['id'], 'target': o['target'], 'question': o['input'].get('question', '')}
+           for o in orders(st, type='ask_user', state_='open')]
+    budgets = {}
+    for d in st.plan['deliverables']:
+        left = 0
+        for o in orders(st, type='implement', target=d):
+            if o['state'] != 'superseded':
+                spent = policy.used(o)
+                left += sum(max(n - spent.get(s, 0), 0) for s, n in policy.ladder(st.plan, o))
+        budgets[d] = left
+    ended.sort(key=lambda x: x['ended'])
+    return {'revision': st.revision, 'stopped': st.stopped, 'running': running, 'recent': ended[-recent:], 'ask_user': ask,
+            'budgets': budgets, 'runnable': routing.runnable(st, 10),
+            'broken_evidence': routing.broken_paths(st)}

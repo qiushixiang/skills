@@ -4,6 +4,8 @@ import re
 import shlex
 from pathlib import Path
 
+from . import model
+
 _LEAD = r'^[ \t*#>-]*'
 _SEP = r'[ \t]*[:：][ \t]*\**[ \t]*'
 FINDING = re.compile(_LEAD + r'阻断' + _SEP + r'(\S+?)[ \t]*[|｜][ \t]*返修[ \t]*[:：][ \t]*(\S+?)[ \t]*[|｜][ \t]*'
@@ -168,7 +170,7 @@ def judge(state, order, run, p, decision, text):
     if why.startswith('外部阻塞'):
         if res != 'WAIT_EVIDENCE':
             return False, '外部阻塞须为 WAIT_EVIDENCE'
-        return (environment_blocked(state.plan['env'].get(run['tool'], {}), run),
+        return (environment_blocked(model.env_for(state.plan, run['tool']), run),
                 '最近一次直接调用受控入口未运行、已成功或不是环境失败，环境阻塞依据不足')
     if why.startswith('完成'):
         return False, '停止原因为完成但结果不符'
