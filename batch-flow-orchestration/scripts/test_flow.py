@@ -87,6 +87,69 @@ class FlowTests(unittest.TestCase):
             raise RuntimeError('query failed')
         with self.assertRaisesRegex(RuntimeError,'query failed'):check(self.s)
         self.assertIsNone(flow._status_cache.get())
+
+    def test_shared_dependency_dag_checks_each_delivery_once_per_query(self):
+        # 14 diamonds have only 29 nodes, but enumerating ancestor paths visits
+        # tens of thousands of deliveries and repeatedly hashes their evidence.
+        tasks={};attempts=[];previous=[]
+        for layer in range(15):
+            names=['root'] if layer==0 else [f'left{layer}',f'right{layer}']
+            for name in names:
+                tasks[name]=dict(kind='acceptance',role='orchestrator',depends_on=list(previous),subjects=['code'])
+                attempts.append(dict(id='A'+name,task=name,result='VERIFIED',subjects={'code':'v1'},
+                                     evidence={str(self.e):flow.hashlib.sha256(self.e.read_bytes()).hexdigest()}))
+            previous=names
+        self.s['plan']['tasks']=tasks;self.s['state']['attempts']=attempts
+        @flow.status_query
+        def check(s):return all(flow.success(s,name) for name in previous)
+        with mock.patch.object(flow.hashlib,'sha256',wraps=flow.hashlib.sha256) as hashes:
+            self.assertTrue(check(self.s));self.assertLessEqual(hashes.call_count,len(tasks))
+        self.e.write_text('changed after query')
+        self.assertFalse(check(self.s))
+
+    def test_shared_dependency_dag_is_memoized_outside_status_too(self):
+        # plan_update/validate call success() through active_review_budget_coverage without a status scope;
+        # uncached that recursion is exponential and hung plan_update and the stop hook on a 60-task ledger.
+        tasks={};attempts=[];previous=[]
+        for layer in range(15):
+            names=['root'] if layer==0 else [f'left{layer}',f'right{layer}']
+            for name in names:
+                tasks[name]=dict(kind='acceptance',role='orchestrator',depends_on=list(previous),subjects=['code'])
+                attempts.append(dict(id='A'+name,task=name,result='VERIFIED',subjects={'code':'v1'},
+                                     evidence={str(self.e):flow.hashlib.sha256(self.e.read_bytes()).hexdigest()}))
+            previous=names
+        self.s['plan']['tasks']=tasks;self.s['state']['attempts']=attempts
+        with mock.patch.object(flow.hashlib,'sha256',wraps=flow.hashlib.sha256) as hashes:
+            self.assertTrue(flow.success(self.s,previous[0]));self.assertLessEqual(hashes.call_count,len(tasks))
+        self.assertIsNone(flow._status_cache.get())
+        self.e.write_text('changed after query')
+        self.assertFalse(flow.success(self.s,previous[0]))
+
+    def test_shared_dependency_cache_preserves_real_cycles(self):
+        evidence={str(self.e):flow.hashlib.sha256(self.e.read_bytes()).hexdigest()}
+        self.s['plan']['tasks']={name:dict(kind='acceptance',role='orchestrator',depends_on=[other],subjects=['code'])
+                                for name,other in [('a','b'),('b','a')]}
+        self.s['state']['attempts']=[dict(id='A'+name,task=name,result='VERIFIED',subjects={'code':'v1'},evidence=evidence)
+                                   for name in ['a','b']]
+        @flow.status_query
+        def check(s):return flow.success(s,'a')
+        self.assertFalse(check(self.s));self.assertIsNone(flow._status_cache.get())
+
+    def test_shared_dependency_cache_keeps_can_close_paths_separate(self):
+        evidence={str(self.e):flow.hashlib.sha256(self.e.read_bytes()).hexdigest()}
+        self.s['plan']['tasks']={name:dict(kind='acceptance',role='orchestrator',depends_on=[],subjects=['code'])
+                                for name in ['a','b']}
+        self.s['plan']['tasks']['b']['can_close']=['a']
+        self.s['state']['attempts']=[
+            dict(id='Aa',task='a',result='FAILED',subjects={'code':'v1'},evidence=evidence),
+            dict(id='Ab',task='b',result='VERIFIED',subjects={'code':'v1'},evidence=evidence,closes=['Aa'])]
+        @flow.status_query
+        def check(s):
+            self.assertTrue(flow.success(s,'a'))
+            self.assertFalse(flow.success(s,'a',{'b'}))
+            self.assertTrue(flow.success(s,'a'))
+        check(self.s)
+
     def test_start_before_dependencies_rejected(self):
         with self.assertRaises(flow.FlowError):self.start('done')
     def test_exhausted_budget_prompts_decision(self):

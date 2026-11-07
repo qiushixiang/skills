@@ -39,7 +39,13 @@ def cached_status_check(function):
     def wrapped(s, *args, **kwargs):
         scope = _status_cache.get()
         if scope is None or scope[0] is not s:
-            return function(s, *args, **kwargs)
+            # Outside status (operations, validate, hooks) memoize for this one top-level evaluation:
+            # the ledger cannot change during it, and uncached recursion is exponential on shared DAGs.
+            token = _status_cache.set((s, {}))
+            try:
+                return wrapped(s, *args, **kwargs)
+            finally:
+                _status_cache.reset(token)
         # Preserve the recursion path: a cycle encountered on one path must
         # not invalidate (or approve) a different path through the graph.
         def frozen(arg):
@@ -49,6 +55,27 @@ def cached_status_check(function):
         key = (function.__name__, tuple(map(frozen, args)),
                tuple((name, frozen(value)) for name, value in sorted(kwargs.items())))
         cache = scope[1]
+        if function.__name__ == 'success':
+            tid = args[0] if args else kwargs['tid']
+            seen = set((args[1] if len(args) > 1 else kwargs.get('seen')) or ())
+            graph_key = ('success_dependency_graph',)
+            if graph_key not in cache:
+                graph = {name: set(task['depends_on']) for name, task in s['plan']['tasks'].items()}
+                for name, task in s['plan']['tasks'].items():
+                    for target in task.get('can_close', []):
+                        graph[target].add(name)
+                cache[graph_key] = graph
+            reachable_key = ('success_reachable', tid)
+            if reachable_key not in cache:
+                reachable = set(); todo = [tid]
+                while todo:
+                    name = todo.pop()
+                    if name not in reachable:
+                        reachable.add(name); todo.extend(cache[graph_key].get(name, ()))
+                cache[reachable_key] = reachable
+            # Only ancestors reachable from this node can affect its cycle
+            # guard. Keeping every ancestor made shared DAGs exponential.
+            key = (function.__name__, tid, frozenset(seen & cache[reachable_key]))
         if key not in cache:
             cache[key] = function(s, *args, **kwargs)
         return cache[key]
@@ -235,6 +262,7 @@ def review_budget_coverage(p, excluded=(), historical_spend=None):
     return dict(ok=not errors,policy='full_path',reviews=rows,required_by_budget=demands,errors=errors,excluded_completed_tasks=sorted(excluded))
 
 
+@status_query
 def active_review_budget_coverage(s, plan=None):
     plan=s['plan'] if plan is None else plan
     done={bid for bid,b in s['plan']['batches'].items() if b.get('retired') or success(s,b['completion_task'])}
