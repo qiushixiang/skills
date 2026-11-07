@@ -32,17 +32,18 @@ class AgentCliAdapter(object):
         except (OSError, ValueError):
             return {}
 
-    def launch(self, order, assignment, card_path, run_dir, resume=None):
-        run_dir = Path(run_dir)
+    def argv(self, order, assignment, card_path, cli_dir, resume=None):
         backend = model.backend(assignment['tool'])
         profile = self.profiles.get(backend)
         if not profile:
             raise api.BfError('no profile configured for backend %s' % backend)
-        cli_dir = run_dir / ('cli-%d' % (len(list(run_dir.glob('cli-*'))) + 1))
-        argv = [sys.executable, self.agent_cli, 'run', '--profile', profile, '--task', order['id'], '--cwd', self.cwd,
+        plan = api.load(self.base).plan
+        if not plan.get('workspace'):
+            raise api.BfError('plan.workspace is not set (source working directory)')
+        argv = [sys.executable, self.agent_cli, 'run', '--profile', profile, '--task', order['id'], '--cwd', plan['workspace'],
                 '--model', assignment['model'], '--effort', assignment['effort'], '--prompt-file', str(card_path),
-                '--run-dir', str(cli_dir), '--access', 'write']
-        env = model.env_for(api.load(self.base).plan, assignment['tool'])
+                '--run-dir', str(cli_dir), '--access', 'read' if order['type'] == 'review' else 'write']
+        env = model.env_for(plan, assignment['tool'])
         for d in env.get('add_dirs') or []:
             argv += ['--add-dir', d]
         if env.get('require_host'):
@@ -54,6 +55,12 @@ class AgentCliAdapter(object):
             if not previous:
                 raise api.BfError('no recorded run dir for conversation %s' % resume)
             argv += ['--conversation', resume, '--resume-from', previous]
+        return argv
+
+    def launch(self, order, assignment, card_path, run_dir, resume=None):
+        run_dir = Path(run_dir)
+        cli_dir = run_dir / ('cli-%d' % (len(list(run_dir.glob('cli-*'))) + 1))
+        argv = self.argv(order, assignment, card_path, cli_dir, resume)
         log = open(str(run_dir / ('launch-%s.log' % cli_dir.name)), 'wb')
         proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         log.close()
@@ -75,7 +82,9 @@ class AgentCliAdapter(object):
                 report = json.loads(done.stdout.strip().splitlines()[-1])
             except (ValueError, IndexError):
                 report = {}
-        cid = report.get('conversation_id') if report.get('usable') else None
+        if not report.get('usable'):
+            return {'invalid': True, 'text': '', 'problems': report.get('problems') or ['no usable result (exit.json missing or collect failed)']}
+        cid = report.get('conversation_id')
         if cid:
             sessions = self._sessions()
             sessions[cid] = str(cli_dir)
@@ -99,5 +108,5 @@ class AgentCliAdapter(object):
             decision = json.loads((Path(handle['run_dir']) / 'decision.json').read_text(encoding='utf-8'))
         except (OSError, ValueError):
             pass
-        return {'conversation_id': cid, 'text': (report.get('response') or '') if report.get('usable') else '',
+        return {'conversation_id': cid, 'text': report.get('response') or '',
                 'events': events, 'session_kb': size // 1024, 'decision': decision}

@@ -48,6 +48,13 @@ class Runner(object):
             if res is None:
                 continue
             progress = True
+            if res.get('invalid'):  # tool failure, not a technical result: free of charge, bounded by invalid_retry
+                api.abandon(self.base, info['order'], run_id, 'CLI unusable: %s' % '; '.join(res.get('problems') or ['unknown']))
+                del self.inflight[run_id]
+                saved = self._dir(run_id) / 'inflight.json'
+                if saved.exists():
+                    saved.unlink()
+                continue
             out = api.deliver(self.base, info['order'], run_id, res.get('text') or '', events=res.get('events') or (),
                               decision=res.get('decision'), conversation_id=res.get('conversation_id'),
                               session_kb=res.get('session_kb'))

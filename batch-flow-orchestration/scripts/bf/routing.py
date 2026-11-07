@@ -77,6 +77,9 @@ def runnable(state, parallel=1):
     deciding = set(o['target'] for o in state.orders.values() if o['type'] == 'decide' and o['state'] in ('open', 'running'))
 
     def dep_ok(d):
+        if d in plan['review_groups']:
+            impls = [o for o in state.orders.values() if o['type'] == 'review' and o['target'] == d]
+            return bool(impls) and all(i['state'] in SATISFIED and i['id'] not in bad for i in impls)
         impls = [o for o in state.orders.values() if o['type'] == 'implement' and o['target'] == d]
         return bool(impls) and all(i['state'] in SATISFIED and i['id'] not in bad for i in impls)
     cands = []
@@ -145,15 +148,20 @@ def check_exhausted(state, order):
         return
     if _blocked_by_user_or_lead(state, order):
         return
-    if order['type'] == 'decide':
-        order['state'] = 'failed'
-        open_ask(state, order, order['origin']['ref'], '裁决未能产出有效处置')
-    elif order['type'] == 'triage':
-        order['state'] = 'failed'
-        release = by_key(state, 'release:' + model.batch_of(state.plan, order['target'])) or {}
-        open_ask(state, order, release.get('id'), '分诊未能产出有效处置')
+    if order['type'] in ('decide', 'triage'):
+        fail_to_user(state, order, '额度用尽')
     else:
         open_decide(state, order, 'exhausted')
+
+
+def fail_to_user(state, order, why):
+    """A decide/triage order that cannot be completed goes to the user (its only exit)."""
+    order['state'] = 'failed'
+    if order['type'] == 'decide':
+        open_ask(state, order, order['origin']['ref'], '裁决未能完成（%s）' % why)
+    else:
+        release = by_key(state, 'release:' + model.batch_of(state.plan, order['target'])) or {}
+        open_ask(state, order, release.get('id'), '分诊未能完成（%s）' % why)
 
 
 def add_candidates(state, order, items):
@@ -204,9 +212,9 @@ def link(state, order):
     plan = state.plan
     if order['type'] != 'implement' or order['target'] not in plan['deliverables']:
         return
-    g = model.group_of(plan, order['target'])
-    for key in (g and 'review:' + g, 'release:' + plan['deliverables'][order['target']]['batch']):
-        target = key and by_key(state, key)
+    keys = ['review:' + g for g in model.groups_of(plan, order['target'])]
+    for key in keys + ['release:' + plan['deliverables'][order['target']]['batch']]:
+        target = by_key(state, key)
         if target and target['state'] == 'open':
             target['needs'].append(order['id'])
 

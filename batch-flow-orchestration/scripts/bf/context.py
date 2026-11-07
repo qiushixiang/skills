@@ -36,7 +36,7 @@ def _last_session(runs, kb):
 def session_for(state, order, stage):
     t = order['type']
     kb = state.plan['policy']['context']['max_session_kb']
-    runs = [r for r in order['runs'] if r['ended']]
+    runs = [r for r in order['runs'] if r['ended'] and r['result'] != 'INVALID']
     if order.get('fresh_next'):
         return _fresh('fresh-requested')
     if t == 'implement':
@@ -56,7 +56,7 @@ def session_for(state, order, stage):
     if t == 'decide':
         prior = [o for o in state.orders.values() if o['type'] == 'decide' and o['target'] == order['target']
                  and o['id'] != order['id']]
-        finished = [r for o in prior for r in o['runs'] if r['ended']]
+        finished = [r for o in prior for r in o['runs'] if r['ended'] and r['result'] != 'INVALID']
         cid, why = _last_session(finished, kb)
         if cid and cid in author_sessions(state, order):
             return _fresh('decide-author-session')

@@ -38,6 +38,14 @@ def broken_evidence(state):
     return routing.broken_paths(state)
 
 
+def new_run(order_id, n, performer, tool, model_name, effort, session, mode, rule):
+    return {'run_id': '%s-r%d' % (order_id, n), 'performer': performer, 'tool': tool, 'model': model_name, 'effort': effort,
+            'session': session, 'session_mode': mode, 'session_rule': rule, 'started': now(), 'started_ts': time.time(),
+            'last_ts': time.time(), 'ended': None, 'result': None, 'stop_reason': None, 'evidence': {}, 'version': None,
+            'card': None, 'segments': 0, 'continuations': 0, 'exempt': False, 'edited': False, 'failed': False,
+            'entry': None, 'session_kb': None, 'env_rejected': False}
+
+
 def start(base, order_id, conversation_id=None, expected_revision=None, request_id=None, actor='driver'):
     def fn(st):
         need(not st.stopped, 'stopped by user')
@@ -45,12 +53,8 @@ def start(base, order_id, conversation_id=None, expected_revision=None, request_
         a = policy.assign(st, order_id)
         if o['type'] == 'review':
             need(conversation_id not in context.author_sessions(st, o), 'a session that authored the work cannot review it (I4)')
-        run = {'run_id': '%s-r%d' % (order_id, len(o['runs']) + 1), 'performer': a['stage'], 'tool': a['tool'],
-               'model': a['model'], 'effort': a['effort'], 'session': conversation_id,
-               'session_mode': a['session']['mode'], 'session_rule': a['session']['rule'],
-               'started': now(), 'started_ts': time.time(), 'last_ts': time.time(), 'ended': None, 'result': None,
-               'stop_reason': None, 'evidence': {}, 'version': None, 'card': None, 'segments': 0, 'continuations': 0,
-               'exempt': False, 'edited': False, 'failed': False, 'entry': None, 'session_kb': None, 'env_rejected': False}
+        run = new_run(order_id, len(o['runs']) + 1, a['stage'], a['tool'], a['model'], a['effort'], conversation_id,
+                      a['session']['mode'], a['session']['rule'])
         o['runs'].append(run)
         o['state'] = 'running'
         o.pop('fresh_next', None)
@@ -153,6 +157,16 @@ def abandon(base, order_id, run_id, reason, expected_revision=None, request_id=N
         need(run is not None and run['ended'] is None, 'no open run %s on %s' % (run_id, order_id))
         run.update(ended=now(), result='INVALID', stop_reason=reason, exempt=True)
         o['state'] = 'open'
+        tail = 0
+        for r in reversed(o['runs']):
+            if r['result'] != 'INVALID':
+                break
+            tail += 1
+        if tail >= policy.rounds(st.plan, o['target'], 'invalid_retry', 2) and not routing._blocked_by_user_or_lead(st, o):
+            if o['type'] in ('decide', 'triage'):
+                routing.fail_to_user(st, o, 'tool_failure')
+            else:
+                routing.open_decide(st, o, 'tool_failure', {'problem': reason})
         return run_id
     return transact(base, 'abandon', actor, fn, expected_revision, request_id)
 

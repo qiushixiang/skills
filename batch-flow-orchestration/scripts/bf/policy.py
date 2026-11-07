@@ -23,7 +23,7 @@ def ladder(plan, order, strict=True):
         if t == 'repair' and strict and order['input'].get('plan_level'):
             chain = [('lead', r('lead'))]  # plan-level finding goes straight to the lead
     elif t == 'review':
-        stage = 'third_party' if tg in plan['policy']['third_party_reviews'] and 'third_party' in plan['roles'] else 'reviewer'
+        stage = plan['review_groups'].get(tg, {}).get('reviewer', 'reviewer')
         chain = [(stage, r('review'))]
     elif t in ('decide', 'triage'):
         chain = [('lead', rounds(plan, tg, 'decide', r('lead')) + order.get('extra', 0))]

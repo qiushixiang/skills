@@ -36,7 +36,7 @@ class AdapterSpec(unittest.TestCase):
             (base / 'records').mkdir(parents=True)
             approval = Path(tmp) / 'a.txt'
             approval.write_text('ok')
-            api.init(base, make_plan(), approval)
+            api.init(base, make_plan(workspace=tmp), approval)
             fake = Path(tmp) / 'fake_agent_cli.py'
             fake.write_text(FAKE)
             ad = adapter.AgentCliAdapter(base, {'codex': 'p.json'}, agent_cli=fake)
