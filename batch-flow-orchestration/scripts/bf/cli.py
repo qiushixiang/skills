@@ -25,6 +25,26 @@ def main(argv=None):
     group = ans.add_mutually_exclusive_group(required=True)
     group.add_argument('--approve', action='store_true')
     group.add_argument('--reject', action='store_true')
+    sub.add_parser('models').add_argument('backend')
+    sr = sub.add_parser('set-role')
+    sr.add_argument('role')
+    sr.add_argument('--backend', required=True)
+    sr.add_argument('--name', required=True)
+    sr.add_argument('--effort', default='default')
+    en = sub.add_parser('envelope')
+    en.add_argument('--add', nargs='+', default=[])
+    en.add_argument('--remove', nargs='+', default=[])
+    gr = sub.add_parser('grant')
+    gr.add_argument('target')
+    for k in ('implement', 'backup', 'lead', 'repair', 'review'):
+        gr.add_argument('--' + k, type=int)
+    for name in ('hold', 'unhold'):
+        sub.add_parser(name).add_argument('targets', nargs='+')
+    sp = sub.add_parser('supersede')
+    sp.add_argument('order')
+    sp.add_argument('--reason', required=True)
+    for name in ('set-role', 'envelope', 'grant', 'hold', 'unhold', 'supersede'):
+        sub.choices[name].add_argument('--approval', required=True)
     for name in ('init', 'revise'):
         p = sub.add_parser(name)
         p.add_argument('--plan', required=True)
@@ -46,6 +66,21 @@ def main(argv=None):
         elif args.cmd == 'answer':
             text = Path(args.file).read_text(encoding='utf-8')
             out = {'answered': api.answer(base, args.order, text, approve=args.approve)}
+        elif args.cmd in ('models', 'set-role', 'envelope', 'grant', 'hold', 'unhold', 'supersede'):
+            from bf import adjust
+            if args.cmd == 'models':
+                out = adjust.models(base, args.backend)
+            elif args.cmd == 'set-role':
+                out = adjust.set_role(base, args.role, args.backend, args.name, args.approval, effort=args.effort)
+            elif args.cmd == 'envelope':
+                out = {'batches': adjust.envelope(base, args.approval, add=args.add, remove=args.remove)}
+            elif args.cmd == 'grant':
+                out = {'overrides': adjust.grant(base, args.target, args.approval, **dict(
+                    (k, getattr(args, k)) for k in ('implement', 'backup', 'lead', 'repair', 'review')))}
+            elif args.cmd in ('hold', 'unhold'):
+                out = {'holds': getattr(adjust, args.cmd)(base, args.targets, args.approval)}
+            else:
+                out = {'superseded': adjust.supersede(base, args.order, args.approval, args.reason)}
         elif args.cmd in ('init', 'revise'):
             plan = json.loads(Path(args.plan).read_text(encoding='utf-8'))
             out = {args.cmd: (api.init if args.cmd == 'init' else api.revise_plan)(base, plan, args.approval)}

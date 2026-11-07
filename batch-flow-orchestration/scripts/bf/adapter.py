@@ -18,6 +18,18 @@ def _alive(pid):
         return False
 
 
+def ensure_profile(base, backend, agent_cli=None):
+    """<base>/profiles/<backend>.json, created once with `agent_cli.py probe` (never calls a model) when missing."""
+    path = Path(str(base)) / 'profiles' / (backend + '.json')
+    if not path.is_file():
+        path.parent.mkdir(exist_ok=True)
+        done = subprocess.run([sys.executable, str(agent_cli or DEFAULT_AGENT_CLI), 'probe', '--backend', backend,
+                               '--profile', str(path)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        if done.returncode != 0 or not path.is_file():
+            raise api.BfError('probe of backend %s failed: %s' % (backend, done.stdout.strip()[-300:]))
+    return str(path)
+
+
 def ensure_profiles(base, agent_cli=None, explicit=None):
     """backend -> profile path for every backend the plan's roles use: explicit overrides, else <base>/profiles/<b>.json,
     created once with `agent_cli.py probe` (which never calls a model) when missing."""
@@ -28,14 +40,8 @@ def ensure_profiles(base, agent_cli=None, explicit=None):
         backend = model.backend(role['tool'])
         if backend in out:
             continue
-        path = base / 'profiles' / (backend + '.json')
-        if not path.is_file():
-            path.parent.mkdir(exist_ok=True)
-            done = subprocess.run([sys.executable, cli, 'probe', '--backend', backend, '--profile', str(path)],
-                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
-            if done.returncode != 0 or not path.is_file():
-                raise api.BfError('probe of backend %s failed: %s' % (backend, done.stdout.strip()[-300:]))
-        out[backend] = str(path)
+        path = ensure_profile(base, backend, cli)
+        out[backend] = path
     return out
 
 

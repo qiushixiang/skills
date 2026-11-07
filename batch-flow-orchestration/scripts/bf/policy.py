@@ -68,4 +68,4 @@ def assign(state, order_id):
     role = STAGE_ROLE[s]
     cfg = state.plan['roles'][role]
     return {'stage': s, 'role': role, 'tool': cfg['tool'], 'model': cfg['model'], 'effort': cfg['effort'],
-            'session': context.session_for(state, order, s)}
+            'session': context.session_for(state, order, s, cfg)}

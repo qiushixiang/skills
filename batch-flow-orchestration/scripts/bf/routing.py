@@ -69,6 +69,7 @@ def runnable(state, parallel=1):
         return []
     plan = state.plan
     bad = _broken_orders(state)
+    held = set(plan['holds'])
     running = [o for o in state.orders.values() if o['state'] == 'running']
     busy_targets = set(o['target'] for o in running if o['target'])
     busy_res = set()
@@ -90,6 +91,8 @@ def runnable(state, parallel=1):
             continue
         batch = model.batch_of(plan, o['target'])
         if batch and batch not in plan['envelope']['batches']:
+            continue
+        if held & set(model.deliverables_of(plan, o['target']) + [o['target'], batch]):
             continue
         if o['target'] in plan['deliverables'] and not all(dep_ok(d) for d in plan['deliverables'][o['target']]['depends_on']):
             continue

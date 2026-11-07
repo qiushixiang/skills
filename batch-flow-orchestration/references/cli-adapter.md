@@ -21,6 +21,8 @@ python3 <技能>/scripts/agent_cli.py models --profile <profile> --output <新�
 python3 <技能>/scripts/agent_cli.py resolve-model --profile <profile> --catalog <上述文件> --name '<用户说的名字>' --effort default
 ```
 
+运行中换角色模型用 `bf/cli.py --base <任务>/.batch-flow set-role <角色> --backend <后端> --name '<用户说法>' --approval <用户原话文件>`：自动完成查目录与解析，只有唯一结果才写入计划，候选多个或未找到时不改动并返回候选；目录存 `<base>/catalogs/`。换工具或模型后的下一次派发开新会话。
+
 多个候选时向用户确认变体。`effort=default` 表示不覆盖 CLI 自身配置。已核验：OpenCode v2.2.5 的 `deepseek/deepseek-flash` 即 DeepSeek V4.1 Flash 1017（2026-11-06，新建与续接两次真实调用通过）。
 
 ## 调用、续接与回收
