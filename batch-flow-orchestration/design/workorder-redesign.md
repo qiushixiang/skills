@@ -462,3 +462,7 @@ scripts/agent_cli.py      保留（CLI 适配器，已验证的宿主细节）
 4. **设计漂移**：`design_ref` 所指章节哈希变化 → 该章节的交付目标暂停派发；`check_design`（驱动器每次派发前调用）为漂移开一张 decide（trigger `design_drift`，列出受影响交付目标）。负责人处置：`refresh_design`（措辞调整，重钉哈希，授权包络内）或 `plan_revision`（实质变化，问用户）。
 5. **审阅完整性**：某审阅组已 RELEASE 后，组内交付目标又开立实施或返修 → 为该组新开审阅，批次放行等待它（第三方组同理）。decide 的 `supersede` 指向审阅、放行或有依赖方的工单 → 问用户。审阅 RELEASE 须至少引用一份本次运行内生成、退出码 0 的 record，否则须写“未复跑原因”。审阅的“非阻断建议”逐条进入本批分诊。
 6. **证据时效**：实施/返修 VERIFIED 与审阅 RELEASE 须至少引用一份本次运行开始之后（允许 2 秒时钟粒度）生成、退出码 0 的 record。
+
+## 25. 卡片链接角色规范（以 `scripts/test_bf_cards.py` 为准）
+
+恢复的角色规范（`references/technical-lead.md`、`design-book.md`、`engineering.md`、`roles.md`）通过卡片的“## 规范”节按章节引用，不整篇嵌入：实施/返修 → `engineering.md` 必要验证、证据标准 + `roles.md` 执行者；审阅 → `engineering.md` 审阅边界与问题处置、证据标准 + `roles.md` 审阅者；decide/triage → `technical-lead.md` 裁决或分诊。计划新增可选字段：交付目标 `non_goals`（卡片目标节列出）、审阅组 `focus`（审阅卡列出）。decide 卡列出全部处置动作（含 `refresh_design`、`allow_protected`）的写法。`SKILL.md` 的身份表补上新文档。
