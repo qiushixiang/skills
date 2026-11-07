@@ -78,6 +78,8 @@ def normalize(plan):
     env.setdefault('batches', list(ids))
     need(all(b in ids for b in env['batches']), 'envelope: unknown batch')
     p.setdefault('env', {})
+    holds = p.setdefault('holds', [])
+    need(all(h in dels or h in groups or h in ids for h in holds), 'holds: unknown deliverable, group or batch')
     return p
 
 

@@ -30,3 +30,12 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow answer WO-0012 --
 - 驱动器随时可以重启：状态全部在文件里；上次未回收的调用会被接管或登记为无效（免扣）后重派。
 - CLI 工具失败（无结果、认证错误）登记为无效、免扣；同一工单连续失败达到上限会转技术负责人诊断。
 - profile 缺失时 `run` 自动 probe（不调用模型），见 [CLI 适配器](cli-adapter.md)。
+
+## 调整
+
+用户随时可以调整，每条都带 `--approval <base>/answers/<n>.txt`（用户原话，一次调整 = 一次修订 + 一条事件）。命令均为 `bf/cli.py --base <任务>/.batch-flow ...`：
+
+- `models <后端>`：只读，查询模型目录；`set-role <角色> --backend B --name '<说法>' [--effort E]`：换角色模型，见 [CLI 适配器](cli-adapter.md)。
+- `envelope --add|--remove <批次>...`：自动推进范围；`grant <交付目标> --implement|--backup|--lead|--repair|--review N`：只增不减。
+- `hold <交付目标或批次>...` / `unhold ...`：只暂停这一部分；`supersede WO-n --reason R`：作废开立中的工单。
+- 新增或改写交付目标属于计划修订，由技术负责人起草（`revise`），聊天前端不运行 `init`/`revise`。
