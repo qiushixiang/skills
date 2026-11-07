@@ -432,3 +432,12 @@ scripts/agent_cli.py      保留（CLI 适配器，已验证的宿主细节）
 - 上下文修正：上一轮的工具或模型与本次派发不同时开新会话（不跨后端续接）。
 - 账号切换：`front.py launch --account-switch <绝对路径>`（可重复）；白名单只放行该路径加 `-k`、`-n` 和至多一个目标账号（沿用 v1 `account_switch.py` 的规则）。
 - 前端白名单：调整命令的 `--approval` 必须位于 `<base>/answers/`。
+
+## 22. 前端作为运维角色（2026-11-07 用户同意，以 `scripts/test_bf_front.py` 为准）
+
+调整 §6.3 的过度限制：脚本只管“派什么、交付是否算数、额度”；前端（模型）负责运维与沟通；技术判断仍归技术负责人。
+
+1. **权限**：读一切（Read/Grep/Glob/Skill 不限路径）；写只限 `<base>/answers/` 下新文件；Bash 放行 bf 命令（`init`/`revise` 除外）、已配置的账号切换命令、只读 shell（ls、cat、head、tail、grep、rg、wc、find 无 -exec/-delete、git 的 log/status/diff/show），一律不允许管道、重定向、分号；拒绝 Edit/NotebookEdit/Agent/Task、构建、测试与其他写操作。
+2. **运维故障**：同一工单连续 `invalid_retry` 次 CLI 不可用 → 工单标记 `ops: {problem, at}` 并暂停（其余照常推进），不再自动开 decide。前端判断后：`bf retry WO-n --note`（如切换账号后重试，清除标记，不扣额度）或 `bf escalate WO-n --note`（开 decide，trigger `tool_failure`）或问用户。脚本不识别报错特征。
+3. **汇报**：`report` 增加 `roles`、`next`（带 label、角色、模型）、`batches`（标题、状态 done/active/pending/outside、完成数/总数）、`ops`；`budgets` 只含未完成交付目标。label = 交付目标标题，标题缺省或等于 ID 时用批次标题。`report_text()` / `report --text` 生成给人看的中文进展（正在做、下一步、待你决定、角色、批次），不出现工单号。
+4. **前端提示词**：运维职责与判断边界、汇报写法（按批次与标题、不罗列已完成项、不单独抛工单号）、调整与账号切换流程；不改代码、不做技术判断。

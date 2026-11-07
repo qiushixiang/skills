@@ -43,10 +43,11 @@ class ToolFailures(Base):  # §19.3
             api.abandon(self.base, oid, run, 'CLI unusable: auth error')
         runs = api.orders(api.load(self.base), type='implement', target='D1')[0]['runs']
         self.assertEqual([(r['result'], r['exempt']) for r in runs], [('INVALID', True)] * 2)
-        decide = api.orders(api.load(self.base), type='decide', target='D1')
-        self.assertEqual(len(decide), 1)  # policy.rounds.invalid_retry (default 2) consecutive failures → decide
-        self.assertEqual(decide[0]['input']['trigger'], 'tool_failure')
-        self.assertEqual(api.assign(api.load(self.base), oid)['stage'], 'primary')  # no budget consumed
+        st = api.load(self.base)
+        self.assertEqual(api.orders(st, type='decide', target='D1'), [])  # operational, not a technical decision (§22)
+        self.assertEqual(st.orders[oid]['ops']['problem'], 'CLI unusable: auth error')
+        self.assertNotIn(oid, api.runnable(st, parallel=5))  # waits for the front
+        self.assertEqual(api.assign(st, oid)['stage'], 'primary')  # no budget consumed
 
     def test_runner_routes_unusable_cli_result_to_abandon(self):
         fake = FakeAdapter(self.base, {('implement', 'D1'): [dict(text='', invalid=True, problems=['no exit code']), done()],
@@ -100,10 +101,9 @@ class ChatFront(Base):  # §6.3
         for e in ok:
             self.assertEqual(front.hook_decision(e, self.base)['decision'], 'allow', e)
         bad = [self.event('Bash', command='git status'),
-               self.event('Read', file_path=str(self.workspace / 'main.c')),
                self.event('Write', file_path=str(self.base / 'orders.json'), content='{}'),
                self.event('Edit', file_path=str(self.base / 'answers' / 'a1.txt')),
-               self.event('Agent', prompt='fix it'), self.event('Grep', pattern='x', path=str(self.workspace))]
+               self.event('Agent', prompt='fix it')]  # reading anything is allowed since §22
         for e in bad:
             self.assertEqual(front.hook_decision(e, self.base)['decision'], 'deny', e)
 
