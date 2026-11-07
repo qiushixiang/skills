@@ -28,6 +28,7 @@ SCRIPTS = Path(__file__).resolve().parent
 SKILL = SCRIPTS.parent
 sys.path.insert(0, str(SCRIPTS))
 import flow  # noqa: E402
+import handback_registration  # noqa: E402
 
 FORMAT = 'batch-flow-dispatch-card/v1'
 TASK_KINDS = {'DESIGN', 'EXECUTE', 'VERIFY', 'REVIEW', 'THIRD_PARTY_REVIEW', 'COMMIT', 'RELEASE', 'CONFIRM', 'REPAIR'}
@@ -64,7 +65,7 @@ REVIEW_DELIVERY = """结果：RELEASE | FIX_REQUIRED | WAIT_EVIDENCE | ARCH_DECI
 下一责任人：<角色>"""
 LEAD_DELIVERY = """结果：<VERIFIED | WAIT_EVIDENCE | FAILED | ARCH_DECISION_REQUIRED；非任务动作写处理状态>
 结论与依据：<裁决/计划/核验结论及原始证据路径>
-需登记的操作：<flow.py 操作类型、actor、--data 参数文件路径；由派发责任人原样代交>
+需登记的操作：<非任务动作在本卡目录写 registration.json，operations 数组每项含 type/data；next 代登记。纯条件确认 VERIFIED 无需另写文件>
 （登记参数格式可用 flow.py schema --operation <操作类型> 查询。）
 下一责任人：<角色>"""
 
@@ -338,6 +339,7 @@ def render_prompt(card, payload, s, store, task_base, workspace):
 def make(args):
     store = Path(args.store).resolve()
     s = load_json(store); flow.validate_store(s)
+    require_no_pending_handback(store, args.kind, args.target, s)
     spec = runtime_spec(store, args.runtime)
     workspace = Path(args.workspace or (spec or {}).get('workspace') or '').resolve() if (args.workspace or spec) else None
     need(workspace is not None and workspace.is_dir(), 'source workspace unknown: pass --workspace or run inside the launcher')
@@ -653,7 +655,7 @@ def finish_card(store, directory, revision, conversation_arg=None):
             out['revision'] = res['revision']
         st.update(finished=now(), conversation_id=conversation, result=value,
                   progress_marker=flow.progress_marker(load_json(store))); save_state(directory, st)
-        out['note'] = '确认等待已登记时由 status 路由诊断；其余操作按 result.md“需登记的操作”原文代交（actor 为原责任角色）。'
+        out['note'] = '角色交付已回收；next 随后登记结构化请求。缺请求或登记失败时停止派发，不重复诊断。'
         return out
     need(st.get('attempt'), '本卡未登记 start')
     need(value in flow.RESULTS, '交付首行缺少合法“结果：<值>”（%s）；退回原角色补齐，不代填' % sorted(flow.RESULTS))
@@ -760,6 +762,53 @@ def agent_report(path, offset=0):
     return text
 
 
+def agent_stop_evidence(path, card, cache=None):
+    """A child interruption message alone is not proof that its host stopped it."""
+    handle = agent_id(path)
+    parent = path.parent.parent.parent / (path.parent.parent.name + '.jsonl')
+    if not handle or not parent.is_file():
+        return None
+    cache = cache if cache is not None else {}
+    if parent not in cache:
+        calls = {}; stopped = []
+        for line in parent.open(encoding='utf-8'):
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            content = (entry.get('message') or {}).get('content', [])
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get('type') == 'tool_use' and block.get('name') == 'TaskStop':
+                    calls[block.get('id')] = (block.get('input') or {}).get('task_id')
+                elif block.get('type') == 'tool_result' and not block.get('is_error'):
+                    task = calls.get(block.get('tool_use_id'))
+                    try:
+                        result = json.loads(block.get('content', ''))
+                    except (ValueError, TypeError):
+                        continue
+                    message = result.get('message') if isinstance(result, dict) else None
+                    if isinstance(task, str) and task and isinstance(message, str) and result.get('task_id') == task \
+                            and result.get('task_type') == 'local_agent' \
+                            and (message == 'Successfully stopped task: ' + task
+                                 or message.startswith('Successfully stopped task: ' + task + ' ')):
+                        stopped.append(dict(agent=task, at=entry.get('timestamp'), tool_use_id=block['tool_use_id'],
+                                            result=result, parent_transcript=str(parent)))
+        cache[parent] = stopped
+    for proof in reversed(cache[parent]):
+        if proof['agent'] != handle or not proof['at']:
+            continue
+        if flow.timestamp(proof['at']) < flow.timestamp(card['created_at']):
+            continue  # A stop from before this invocation cannot cancel a resume.
+        if card.get('route') != 'send_message' and proof['result'].get('command') != card['id']:
+            continue
+        return proof
+    return None
+
+
 def revision(store):
     return load_json(store)['revision']
 
@@ -836,18 +885,30 @@ def interrupt(store, directory, card, reason, info=None):
                               conversation_id=st.get('handle') or a['call']['conversation_id']))
         res = run_flow(store, 'finish', '--revision', str(revision(store)), '--actor', a.get('performer_role') or card['role'], data=data)
         st['revision'] = res['revision']; result = 'INVALID'
-    st.update(finished=now(), result=result, interrupted=str(lost)); save_state(directory, st)
+    st.update(finished=now(), result=result, interrupted=str(lost))
+    if info and info.get('host_stop'):
+        st['host_stop'] = info['host_stop']
+    save_state(directory, st)
     return result
 
 
 def reconcile(store, spec, started):
     out = dict(collected=[], interrupted=[], running=[], pending=[], problems=[])
+    stop_cache = {}
     claude = spec.get('host') == 'claude' and spec.get('session_id')
     current = [project_dir(spec) / spec['session_id'] / 'subagents'] if claude else []
     every = sorted(project_dir(spec).glob('*/subagents')) if claude else []
     for path in sorted(cards_root(store).glob('*/card.json'), key=lambda p: load_json(p).get('created_at', '')):
         directory = path.parent; card = load_json(path); st = state(directory)
         if st.get('finished'):
+            if st.get('host_stop'):
+                ledger = load_json(store)
+                try:
+                    find_action(ledger, card['kind'], card['target'])
+                    if current_card_goals(card, ledger):
+                        out['problems'].append(dict(card=card['id'], error='代理已由宿主明确停止，不自动重派同一动作；先登记明确的恢复安排。'))
+                except CardError:
+                    pass
             continue
         live = card_live(card, spec, started)
         try:
@@ -897,6 +958,18 @@ def reconcile(store, spec, started):
                 if done:
                     out['collected'].append(done)
                     continue
+                stopped = agent_stop_evidence(agent, card, stop_cache)
+                if stopped:
+                    result = interrupt(store, directory, card, '宿主 TaskStop 已成功停止该代理；保留原始回执并收口',
+                                       dict(host_stop=stopped, transcript=str(agent)))
+                    out['interrupted'].append(dict(card=card['id'], result=result, reason='host_stopped'))
+                    # Preserve explicit stops even if the original action is still READY.
+                    try:
+                        find_action(load_json(store), card['kind'], card['target'])
+                        out['problems'].append(dict(card=card['id'], error='代理已由宿主明确停止，不自动重派同一动作。'))
+                    except CardError:
+                        pass
+                    continue
                 if live:
                     out['running'].append(dict(card=card['id'], agent=agent_id(agent)))
                     continue
@@ -905,6 +978,62 @@ def reconcile(store, spec, started):
         except (CardError, flow.FlowError, OSError, KeyError, ValueError) as error:
             out['problems'].append(dict(card=card['id'], error=str(error)))
     return out
+
+
+def pending_handbacks(store, s=None):
+    """Collected role work is not necessarily a registered ledger outcome."""
+    s = s or load_json(store)
+    actions = {(a['kind'], a['target']): a for a in flow.status(s)['actions']}
+    for path in sorted(cards_root(store).glob('*/card.json'), key=lambda p: load_json(p).get('created_at', '')):
+        card = load_json(path); st = state(path.parent)
+        if card.get('ledger_start') == 'start' or not st.get('finished') or st.get('interrupted') \
+                or st.get('result') in {'SUPERSEDED', 'INTERRUPTED', 'INVALID'}:
+            continue
+        if card['kind'] in TASK_KINDS and card['target'] in s['plan']['tasks']:
+            child = flow.latest(s, card['target'])
+            if child and child.get('result') and child.get('ended_at', '') >= card.get('created_at', ''):
+                continue  # A delegated formal task already has its own finish.
+        action = actions.get((card['kind'], card['target']))
+        active = bool(action and action.get('orchestrator_action', {}).get('mode') == card.get('mode'))
+        registration = st.get('registration') or {}
+        if active or (registration.get('requests') and not registration.get('completed')):
+            yield path.parent, card, st, active
+
+
+def require_no_pending_handback(store, kind, target, s=None):
+    ledger = s or load_json(store)
+    for path in cards_root(store).glob('*/card.json'):
+        old = load_json(path); old_state = state(path.parent)
+        if old['kind'] == kind and old['target'] == target and old_state.get('host_stop') \
+                and current_card_goals(old, ledger):
+            raise CardError('该动作已有宿主明确停止回执，不自动重派；先登记明确的恢复安排。')
+    for directory, card, st, active in pending_handbacks(store, s):
+        if active and card['kind'] == kind and card['target'] == target:
+            raise CardError('已有角色交付尚未完成登记：%s；运行 next 处理原交付，不重派 %s' % (directory, target))
+
+
+def register_handbacks(store):
+    done = []
+    for directory, card, st, active in list(pending_handbacks(store)):
+        # An earlier handback may have resolved this same action. Do not apply
+        # a later duplicate's conflicting proposal to the updated ledger.
+        if not (st.get('registration') or {}).get('requests'):
+            try:
+                find_action(load_json(store), card['kind'], card['target'])
+            except CardError:
+                continue
+        need(not (st.get('registration') or {}).get('completed'),
+             '登记完成后原动作仍未消失：%s；核对原交付，不重复派发' % directory)
+        if not st.get('registration'):
+            need(current_card_goals(card, load_json(store)),
+                 '已交付动作的输入版本已变化：%s；先核对原交付，不直接重派' % directory)
+        try:
+            requests = handback_registration.register(store, directory, card, st,
+                lambda path: run_flow(store, 'apply', '--request', str(path)))
+        except (handback_registration.RegistrationError, flow.FlowError, OSError, ValueError, KeyError) as error:
+            raise CardError('角色交付登记失败 %s：%s；保留原报告，不重复派发' % (directory, error)) from error
+        done.append(dict(card=card['id'], requests=len(requests)))
+    return done
 
 
 def coordinator_context(s, action):
@@ -1108,8 +1237,15 @@ def next_step(args):
     need(spec is not None, 'next 只在编排启动器（Claude Code / AGY）会话中运行')
     runtime = spec['runtime']
     migrate_confirmation_waits(store)
+    try:
+        prior_registrations = register_handbacks(store)
+    except (CardError, flow.FlowError) as error:
+        return dict(do='report', problems=[dict(category='handback_registration_failed', error=str(error))],
+                    say='已有角色交付未登记：报告原错误并修复登记，不再派发同一动作。')
     report = reconcile(store, spec, launch_started(spec, runtime))
     try:
+        report['handback_registered'] = prior_registrations + register_handbacks(store)
+        need(not report.get('problems'), '回收存在错误：先修复原交付或回执，不启动新派发')
         report['registered'] = mechanical_registrations(store, spec)
     except (CardError, flow.FlowError) as error:
         report['registered'] = []
@@ -1123,6 +1259,12 @@ def next_step(args):
     supersede = []
     for card in report['pending']:
         if state(card['dir']).get('started'):
+            if card.get('ledger_start') != 'start':
+                try:
+                    find_action(s, card['kind'], card['target'])
+                except CardError:
+                    return dict(base, do='attention', card=card['id'],
+                                todo='原非任务动作已生效，旧卡不得再次调用；核对原句柄并保留其交付后收口，不重新派发。')
             if not current_card_goals(card, s):
                 return dict(base, do='attention', card=card['id'],
                             todo='已登记但尚未调用的派发卡目标已变化；由责任人保留原记录并处理交接，不发送旧提示词或重置预算')

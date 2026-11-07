@@ -64,3 +64,5 @@
 ```
 
 派发责任人据此 finish（含 subject_versions）、必要时 change_subject 或 signal；字段缺失或证据路径不存在时退回执行者补齐，不代填技术内容。
+
+非任务类负责人交付将待登记操作写入本卡 `registration.json`：唯一字段 `operations` 是数组，每项含 `type` 和 `data`，参数沿用 `flow.py schema`，不提供 actor。`next` 绑定实际角色会话与原始交付，完整预检后按归属代登记；纯条件确认的 VERIFIED 可直接确认该条件，WAIT_EVIDENCE 仍走等待诊断。缺文件、参数越界或登记失败时保留交付并停止派发，不重复派同一动作；已提交步骤幂等恢复。旧 DECIDE 卡兼容本卡内的 `resolve_<裁决ID>.json`、`confirm_<裁决ID>.json`，不解析正文里的命令或任意路径。

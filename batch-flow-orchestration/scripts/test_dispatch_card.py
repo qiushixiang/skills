@@ -635,6 +635,331 @@ class CardTests(unittest.TestCase):
         with self.assertRaises(dispatch_card.CardError): dispatch_card.prior_run(self.store, cid)
 
 
+    def handback_fixture(self):
+        def configure(p):
+            p['roles']['architect'].update(tool='claude', model='claude-opus-5-5', effort='default')
+        self.build(configure)
+        s = json.loads(self.store.read_text()); proof = str(self.store.parent/'proof.txt')
+        s, _ = flow.apply_request(s, dict(request_id='handback-decision', expected_revision=s['revision'],
+            actor='architect', operations=[dict(type='signal', data=dict(id='D1', signal='technical_decision',
+                reason='diagnose', blocks=['execute'], evidence=[proof]))]), self.store.parent)
+        self.store.write_text(json.dumps(s))
+        out = self.next(); directory = self.store.parent/'records/dispatch'/out['card']
+        self.assertEqual(json.loads((directory/'card.json').read_text())['kind'], 'DECIDE')
+        return out['card'], directory
+
+    def handback_operations(self, owner='architect'):
+        proof = str(self.store.parent/'proof.txt')
+        return [dict(type='resolve', data=dict(id='D1', summary='environment fixed', evidence=[proof],
+                    user_evidence=[], requirements=[dict(id='D1.ready', kind='confirmation', owner=owner,
+                    depends_on=[], instruction='verify environment')])),
+                dict(type='decision_progress', data=dict(id='D1', status='confirmed', requirement='D1.ready'))]
+
+    def test_decision_delivery_is_registered_before_next_dispatch(self):
+        cid, directory = self.handback_fixture()
+        (directory/'registration.json').write_text(json.dumps(dict(operations=self.handback_operations())))
+        self.agent('s1', 'decision-agent', cid, report='结果：VERIFIED\n结论与依据：fixed\n')
+        out = self.next(); ledger = json.loads(self.store.read_text())
+        self.assertEqual(ledger['decisions']['D1']['status'], 'closed')
+        self.assertEqual(ledger['decisions']['D1']['resolution']['context']['conversation_id'], 'decision-agent')
+        self.assertEqual(out['do'], 'call')
+        self.assertEqual(json.loads((self.store.parent/'records/dispatch'/out['card']/'card.json').read_text())['target'], 'execute')
+        self.assertEqual(len(list((self.store.parent/'records/dispatch').glob('D1-DECIDE-*'))), 1)
+        self.next()
+        self.assertEqual(sum(op['type']=='resolve' for h in json.loads(self.store.read_text())['history'] for op in h['operations']), 1)
+
+    def test_missing_registration_reports_and_never_redispatches(self):
+        cid, directory = self.handback_fixture()
+        self.agent('s1', 'decision-agent', cid, report='结果：VERIFIED\n需登记的操作：see prose\n')
+        for _ in range(3):
+            out = self.next(); self.assertEqual(out['do'], 'report')
+        self.assertEqual(len(list((self.store.parent/'records/dispatch').glob('D1-DECIDE-*'))), 1)
+        error = self.card('make', '--store', str(self.store), '--kind', 'DECIDE', '--target', 'D1',
+                          '--runtime', str(self.runtime), ok=False)
+        self.assertIn('已有角色交付', error['error'])
+        # Fixing the structured handback is enough; no new model is needed.
+        (directory/'registration.json').write_text(json.dumps(dict(operations=self.handback_operations())))
+        self.assertEqual(self.next()['do'], 'call')
+        self.assertEqual(json.loads(self.store.read_text())['decisions']['D1']['status'], 'closed')
+
+    def test_legacy_exact_parameter_files_are_registered_without_prose_parsing(self):
+        cid, directory = self.handback_fixture(); operations = self.handback_operations()
+        (directory/'resolve_D1.json').write_text(json.dumps(operations[0]['data']))
+        (directory/'confirm_D1.json').write_text(json.dumps(operations[1]['data']))
+        self.agent('s1', 'decision-agent', cid, report='结果：VERIFIED\n')
+        self.next()
+        self.assertEqual(json.loads(self.store.read_text())['decisions']['D1']['status'], 'closed')
+
+    def test_later_invalid_confirmation_writes_nothing_and_cannot_approve_user(self):
+        cid, directory = self.handback_fixture(); before = self.store.read_bytes()
+        (directory/'registration.json').write_text(json.dumps(dict(operations=self.handback_operations(owner='user'))))
+        self.agent('s1', 'decision-agent', cid, report='结果：VERIFIED\n')
+        out = self.next(); self.assertEqual(out['do'], 'report')
+        self.assertEqual(self.store.read_bytes(), before)
+        self.assertEqual(len(list((self.store.parent/'records/dispatch').glob('D1-DECIDE-*'))), 1)
+
+    def test_self_blocking_recovery_is_rejected_before_registration(self):
+        cid, directory = self.handback_fixture(); before = self.store.read_bytes()
+        op = self.handback_operations()[0]
+        op['data']['requirements'] = [dict(id='D1.repair', kind='task', target='execute',
+            versions={'code':'v1'}, depends_on=[], instruction='repair blocked task')]
+        (directory/'registration.json').write_text(json.dumps(dict(operations=[op])))
+        self.agent('s1', 'decision-agent', cid, report='结果：ARCH_DECISION_REQUIRED\n')
+        self.assertEqual(self.next()['do'], 'report'); self.assertEqual(self.store.read_bytes(), before)
+
+    def test_handback_cannot_target_another_decision_or_supply_an_actor(self):
+        cid, directory = self.handback_fixture(); before = self.store.read_bytes()
+        operations = self.handback_operations(); operations[0]['data']['id']='another-decision'
+        (directory/'registration.json').write_text(json.dumps(dict(operations=operations)))
+        self.agent('s1', 'decision-agent', cid, report='结果：VERIFIED\n')
+        self.assertEqual(self.next()['do'], 'report'); self.assertEqual(self.store.read_bytes(), before)
+        operations = self.handback_operations(); operations[0]['actor']='orchestrator'
+        (directory/'registration.json').write_text(json.dumps(dict(operations=operations)))
+        self.assertEqual(self.next()['do'], 'report'); self.assertEqual(self.store.read_bytes(), before)
+        operations = self.handback_operations(); operations[0]['type'] = {}
+        (directory/'registration.json').write_text(json.dumps(dict(operations=operations)))
+        self.assertEqual(self.next()['do'], 'report'); self.assertEqual(self.store.read_bytes(), before)
+
+    def test_handback_manifest_symlink_escape_is_rejected(self):
+        import handback_registration as hr
+        _, directory = self.handback_fixture()
+        outside = self.task/'outside.json'; outside.write_text('{"operations": []}')
+        (directory/'registration.json').symlink_to(outside)
+        with self.assertRaisesRegex(hr.RegistrationError, 'escapes'):
+            hr.read_operations(directory, json.loads((directory/'card.json').read_text()), {})
+
+    def test_verified_condition_registers_only_its_dispatched_owner(self):
+        self.handback_fixture()
+        s = json.loads(self.store.read_text()); op = self.handback_operations()[0]
+        op['data']['context'] = dict(conversation_id='original-planner', mode='fresh', reason='fixture')
+        s, _ = flow.apply_request(s, dict(request_id='condition-fixture', expected_revision=s['revision'],
+            actor='architect', operations=[op]), self.store.parent); self.store.write_text(json.dumps(s))
+        made = self.card('make', '--store', str(self.store), '--kind', 'CONFIRM_CONDITION', '--target', 'D1.ready',
+                         '--runtime', str(self.runtime))
+        self.agent('s1', 'condition-agent', made['card'], report='结果：VERIFIED\n结论与依据：ready\n')
+        self.next()
+        self.assertEqual(json.loads(self.store.read_text())['decisions']['D1']['status'], 'closed')
+
+    def test_interrupted_multi_actor_registration_resumes_without_duplicate_resolve(self):
+        import handback_registration as hr
+        cid, directory = self.handback_fixture()
+        (directory/'registration.json').write_text(json.dumps(dict(operations=self.handback_operations())))
+        (directory/'result.md').write_text('结果：VERIFIED\n')
+        (directory/'receipt.txt').write_text('decision-agent')
+        card = json.loads((directory/'card.json').read_text())
+        st = json.loads((directory/'state.json').read_text()); st.update(result='VERIFIED', conversation_id='decision-agent')
+        counter = []
+        def commit(path):
+            req = json.loads(path.read_text())
+            if len(counter)==1: raise OSError('simulated interruption before second commit')
+            ledger = json.loads(self.store.read_text())
+            ledger, _ = flow.apply_request(ledger, req, self.store.parent); self.store.write_text(json.dumps(ledger))
+            counter.append(req['request_id'])
+        with self.assertRaises(OSError): hr.register(self.store, directory, card, st, commit)
+        def resume(path):
+            ledger, _ = flow.apply_request(json.loads(self.store.read_text()), json.loads(path.read_text()), self.store.parent)
+            self.store.write_text(json.dumps(ledger))
+        hr.register(self.store, directory, card, json.loads((directory/'state.json').read_text()), resume)
+        ledger = json.loads(self.store.read_text())
+        self.assertEqual(sum(op['type']=='resolve' for h in ledger['history'] for op in h['operations']), 1)
+        self.assertIn('D1.ready', ledger['state']['confirmations'])
+
+    def test_interrupted_registration_does_not_silently_rebase_over_other_writes(self):
+        import handback_registration as hr
+        _, directory=self.handback_fixture()
+        (directory/'registration.json').write_text(json.dumps(dict(operations=self.handback_operations())))
+        (directory/'result.md').write_text('结果：VERIFIED\n');(directory/'receipt.txt').write_text('decision-agent')
+        card=json.loads((directory/'card.json').read_text());st=json.loads((directory/'state.json').read_text())
+        st.update(result='VERIFIED',conversation_id='decision-agent');committed=[]
+        def commit(path):
+            if committed: raise OSError('interrupted')
+            ledger,_=flow.apply_request(json.loads(self.store.read_text()),json.loads(path.read_text()),self.store.parent)
+            self.store.write_text(json.dumps(ledger));committed.append(True)
+        with self.assertRaises(OSError):hr.register(self.store,directory,card,st,commit)
+        ledger=json.loads(self.store.read_text())
+        ledger,_=flow.apply_request(ledger,dict(request_id='another-writer',expected_revision=ledger['revision'],
+            actor='orchestrator',operations=[dict(type='observe',data={})]),self.store.parent)
+        self.store.write_text(json.dumps(ledger));before=self.store.read_bytes()
+        callback=unittest.mock.Mock()
+        with self.assertRaisesRegex(hr.RegistrationError,'explicitly rebase'):
+            hr.register(self.store,directory,card,json.loads((directory/'state.json').read_text()),callback)
+        callback.assert_not_called();self.assertEqual(self.store.read_bytes(),before)
+
+    def test_plan_repair_delivery_without_registration_cannot_loop(self):
+        def configure(p): p['roles']['architect'].update(tool='claude', model='opus', effort='default')
+        self.build(configure)
+        s = json.loads(self.store.read_text()); s['plan']['budgets']['R']['limit']=1
+        self.store.write_text(json.dumps(s))  # Legacy plan lacking review coverage.
+        out = self.next(); cid = out['card']
+        card = json.loads((self.store.parent/'records/dispatch'/cid/'card.json').read_text())
+        self.assertEqual(card['kind'], 'PLAN_REPAIR')
+        self.agent('s1', 'plan-agent', cid, report='结果：VERIFIED\n需登记的操作：not registered\n')
+        self.assertEqual(self.next()['do'], 'report'); self.assertEqual(self.next()['do'], 'report')
+        self.assertEqual(len(list((self.store.parent/'records/dispatch').glob('*PLAN_REPAIR-*'))), 1)
+
+    def test_plan_repair_registers_approved_plan_before_dispatch(self):
+        def configure(p): p['roles']['architect'].update(tool='claude', model='opus', effort='default')
+        self.build(configure)
+        s = json.loads(self.store.read_text()); s['plan']['budgets']['R']['limit']=1
+        self.store.write_text(json.dumps(s)); out = self.next(); cid = out['card']
+        directory = self.store.parent/'records/dispatch'/cid; proof = str(self.store.parent/'proof.txt')
+        revised = json.loads(json.dumps(s['plan'])); revised['budgets']['R']['limit']=2
+        operations = [dict(type='signal', data=dict(id='D2', signal='technical_decision', reason='repair coverage',
+                          blocks=['execute'], evidence=[proof])),
+            dict(type='resolve', data=dict(id='D2', summary='approved repair', evidence=[proof], user_evidence=[proof],
+                 requirements=[dict(id='D2.ready',kind='confirmation',owner='architect',depends_on=[],instruction='plan fixed')])),
+            dict(type='plan_update', data=dict(plan=revised, decision_id='D2')),
+            dict(type='decision_progress', data=dict(id='D2',status='confirmed',requirement='D2.ready'))]
+        (directory/'registration.json').write_text(json.dumps(dict(operations=operations)))
+        self.agent('s1', 'plan-agent', cid, report='结果：VERIFIED\n')
+        out = self.next(); self.assertEqual(out['do'], 'call')
+        ledger = json.loads(self.store.read_text())
+        self.assertEqual(ledger['decisions']['D2']['status'], 'closed')
+        self.assertEqual(ledger['plan']['budgets']['R']['limit'], 2)
+        self.assertEqual(len(list((self.store.parent/'records/dispatch').glob('*PLAN_REPAIR-*'))), 1)
+
+    def test_lead_user_condition_is_asked_without_duplicate_decision_or_auto_approval(self):
+        cid, directory = self.handback_fixture()
+        (directory/'registration.json').write_text(json.dumps(dict(operations=[self.handback_operations(owner='user')[0]])))
+        self.agent('s1', 'decision-agent', cid, report='结果：VERIFIED\n')
+        out = self.next(); self.assertEqual(out['do'], 'ask_user')
+        self.assertEqual(out['items'][0]['target'], 'D1.ready')
+        ledger = json.loads(self.store.read_text()); self.assertNotIn('D1.ready', ledger['state']['confirmations'])
+        self.assertEqual(len(list((self.store.parent/'records/dispatch').glob('D1-DECIDE-*'))), 1)
+
+    def test_prepare_resumption_registers_permission_before_executor_continues(self):
+        def configure(p): p['roles']['architect'].update(tool='claude', model='opus', effort='default')
+        self.build(configure)
+        s = json.loads(self.store.read_text()); proof = str(self.store.parent/'proof.txt')
+        operations = [('orchestrator', dict(type='start',data=dict(task='execute',
+                      call=dict(s['plan']['roles']['executor'],conversation_id='original-executor')))),
+            ('executor',dict(type='finish',data=dict(attempt='A0001',result='WAIT_EVIDENCE',evidence=[proof]))),
+            ('architect',dict(type='classify_attempt',data=dict(attempt='A0001',kind='environment',work_performed=False,
+                                                             reason='startup failed only',evidence=[proof])))]
+        for i,(actor,op) in enumerate(operations):
+            s,_=flow.apply_request(s,dict(request_id='resume-fixture-'+str(i),expected_revision=s['revision'],actor=actor,operations=[op]),self.store.parent)
+        self.store.write_text(json.dumps(s)); out=self.next(); cid=out['card']
+        directory=self.store.parent/'records/dispatch'/cid
+        self.assertEqual(json.loads((directory/'card.json').read_text())['kind'],'PREPARE_RESUMPTION')
+        ready=self.store.parent/'ready.txt';ready.write_text('actual environment readiness verified')
+        registration = {'operations': [{'type':'resume_attempt', 'data':
+                        {'attempt':'A0001', 'reason':'environment restored', 'evidence':[str(ready)]}}]}
+        (directory/'registration.json').write_text(json.dumps(registration))
+        self.agent('s1','resume-agent',cid,report='结果：VERIFIED\n')
+        out=self.next();self.assertEqual(out['do'],'call')
+        ledger=json.loads(self.store.read_text());self.assertEqual(len(ledger['state']['resumptions']),1)
+        self.assertEqual(self.attempt('execute')['continuation_of'],'A0001')
+
+    def test_design_sync_registers_refresh_without_repeating_planning(self):
+        def configure(p): p['roles']['architect'].update(tool='claude',model='opus',effort='default')
+        self.build(configure)
+        s=json.loads(self.store.read_text());design=self.task/'design.md';design.write_text('# scope\nold\n')
+        s['plan']['tasks']['execute']['instruction']='test action scope'
+        s['design']=flow.design_link(dict(path=str(design),version='v1',plan_version=s['plan_version'],sections={'execute':'scope'}),
+                                     s['plan'],self.store.parent,s['plan_version'])
+        self.store.write_text(json.dumps(s));design.write_text('# scope\ncorrected text\n')
+        out=self.next();cid=out['card'];directory=self.store.parent/'records/dispatch'/cid
+        self.assertEqual(json.loads((directory/'card.json').read_text())['kind'],'SYNC_DESIGN')
+        (directory/'registration.json').write_text(json.dumps(dict(operations=[dict(type='design_refresh',
+            data=dict(version='v2',reason='verified textual correction'))])))
+        self.agent('s1','sync-agent',cid,report='结果：VERIFIED\n')
+        self.assertEqual(self.next()['do'],'call')
+        self.assertEqual(json.loads(self.store.read_text())['design']['version'],'v2')
+        self.assertEqual(len(list((self.store.parent/'records/dispatch').glob('*SYNC_DESIGN-*'))),1)
+
+    def test_collection_error_does_not_start_any_other_action(self):
+        import dispatch_card as dc
+        import argparse
+        error = dict(collected=[], interrupted=[], running=[], pending=[], problems=[dict(error='bad receipt')])
+        with unittest.mock.patch.object(dc, 'reconcile', return_value=error):
+            out = dc.next_step(argparse.Namespace(store=str(self.store), runtime=str(self.runtime)))
+        self.assertEqual(out['do'], 'report')
+        self.assertEqual(json.loads(self.store.read_text())['state']['attempts'], [])
+
+    def test_started_pending_decision_is_not_emitted_after_resolution(self):
+        cid, _ = self.handback_fixture()
+        s=json.loads(self.store.read_text())
+        s,_=flow.apply_request(s,dict(request_id='already-resolved',expected_revision=s['revision'],actor='architect',
+            operations=[dict(type='resolve',data=dict(id='D1',summary='already satisfied',requirements=[],clarification=True,
+                        evidence=[str(self.store.parent/'proof.txt')],user_evidence=[]))]),self.store.parent)
+        self.store.write_text(json.dumps(s))
+        out=self.next()
+        self.assertEqual(out['do'],'attention');self.assertNotIn('tool',out);self.assertEqual(out['card'],cid)
+        self.assertEqual(len(list((self.store.parent/'records/dispatch').glob('D1-DECIDE-*'))),1)
+
+    def test_cli_decision_handback_uses_actual_session_and_registers(self):
+        def configure(p): p['roles']['architect'].update(tool='codex',model='gpt-6.1-terra',effort='medium')
+        self.build(configure)
+        profile=self.runtime/'codex-profile.json';profile.write_text(json.dumps(dict(backend='codex',binary='/bin/codex',version='fake')))
+        spec_path=self.runtime/'spec.json';spec=json.loads(spec_path.read_text());spec['profiles'].append(str(profile));spec_path.write_text(json.dumps(spec))
+        s=json.loads(self.store.read_text());proof=str(self.store.parent/'proof.txt')
+        s,_=flow.apply_request(s,dict(request_id='cli-decision',expected_revision=s['revision'],actor='architect',
+            operations=[dict(type='signal',data=dict(id='D1',signal='technical_decision',reason='diagnose',
+                        blocks=['execute'],evidence=[proof]))]),self.store.parent);self.store.write_text(json.dumps(s))
+        out=self.next();directory=self.store.parent/'records/dispatch'/out['card'];run=directory/'run';run.mkdir()
+        (directory/'registration.json').write_text(json.dumps(dict(operations=self.handback_operations())))
+        cid='10000000-0000-4000-8000-000000000009'
+        (run/'request.json').write_text(json.dumps(dict(backend='codex',conversation=None,task='D1',cwd=str(self.workspace),started_at=flow.now())))
+        (run/'receipt.json').write_text(json.dumps(dict(event='CLI_STARTED',pid=12345,task='D1')))
+        events=[dict(type='thread.started',thread_id=cid),dict(type='item.completed',item=dict(type='agent_message',text='结果：VERIFIED\n')),dict(type='turn.completed')]
+        (run/'stdout').write_text(''.join(json.dumps(x)+'\n' for x in events));(run/'stderr').write_text('')
+        (run/'exit.json').write_text(json.dumps(dict(returncode=0,ended_at=flow.now())))
+        self.next();ledger=json.loads(self.store.read_text())
+        self.assertEqual(ledger['decisions']['D1']['status'],'closed')
+        self.assertEqual(ledger['decisions']['D1']['resolution']['context']['conversation_id'],cid)
+
+    def host_stop_fixture(self, closed=False, valid=True, old=False):
+        cid,directory=self.handback_fixture();self.agent('s1','stopped-agent',cid)
+        project=self.home/'.claude/projects'/__import__('re').sub(r'[^A-Za-z0-9]','-',str(self.workspace))
+        at='2000-01-01T00:00:00+00:00' if old else flow.now()
+        result=dict(message='Successfully stopped task: stopped-agent ('+cid+')' if valid else 'Task was not stopped',
+                    task_id='stopped-agent',task_type='local_agent',command=cid)
+        entries=[dict(type='assistant',timestamp=at,message=dict(content=[dict(type='tool_use',id='stop-call',name='TaskStop',input=dict(task_id='stopped-agent'))])),
+                 dict(type='user',timestamp=at,message=dict(content=[dict(type='tool_result',tool_use_id='stop-call',content=json.dumps(result))]))]
+        (project/'s1.jsonl').write_text(''.join(json.dumps(x)+'\n' for x in entries))
+        if closed:
+            s=json.loads(self.store.read_text())
+            s,_=flow.apply_request(s,dict(request_id='obsolete-decision',expected_revision=s['revision'],actor='architect',
+                operations=[dict(type='resolve',data=dict(id='D1',summary='already resolved',requirements=[],clarification=True,
+                            evidence=[str(self.store.parent/'proof.txt')],user_evidence=[]))]),self.store.parent)
+            self.store.write_text(json.dumps(s))
+        return cid,directory
+
+    def test_successful_host_stop_clears_obsolete_running_agent(self):
+        cid,directory=self.host_stop_fixture(closed=True)
+        out=self.next();st=json.loads((directory/'state.json').read_text())
+        self.assertTrue(st['finished']);self.assertEqual(st['result'],'INTERRUPTED')
+        self.assertEqual(st['host_stop']['agent'],'stopped-agent')
+        self.assertNotIn(cid,[r['card'] for r in out.get('running',[])])
+        self.assertEqual(json.loads(self.store.read_text())['decisions']['D1']['status'],'closed')
+        self.assertEqual(len(list((self.store.parent/'records/dispatch').glob('D1-DECIDE-*'))),1)
+
+    def test_explicit_host_stop_never_automatically_redispatches_pending_action(self):
+        cid,directory=self.host_stop_fixture()
+        self.assertEqual(self.next()['do'],'report');self.assertEqual(self.next()['do'],'report')
+        error=self.card('make','--store',str(self.store),'--kind','DECIDE','--target','D1','--runtime',str(self.runtime),ok=False)
+        self.assertIn('宿主明确停止',error['error'])
+        self.assertEqual(len(list((self.store.parent/'records/dispatch').glob('D1-DECIDE-*'))),1)
+
+    def test_failed_or_stale_host_stop_does_not_clear_a_running_agent(self):
+        for valid,old in [(False,False),(True,True)]:
+            with self.subTest(valid=valid,old=old):
+                cid,directory=self.host_stop_fixture(valid=valid,old=old)
+                out=self.next();self.assertEqual(out['do'],'wait')
+                self.assertIn(cid,[r['card'] for r in out['running']])
+                self.assertFalse(json.loads((directory/'state.json').read_text()).get('finished'))
+                # Clear this fixture's artifacts before resetting its ledger.
+                import shutil
+                shutil.rmtree(self.store.parent/'records/dispatch')
+
+    def test_final_handback_is_preserved_even_if_host_stop_is_also_present(self):
+        cid,directory=self.host_stop_fixture()
+        (directory/'registration.json').write_text(json.dumps(dict(operations=self.handback_operations())))
+        self.agent('s1','stopped-agent',cid,report='结果：VERIFIED\n')
+        self.next();st=json.loads((directory/'state.json').read_text())
+        self.assertEqual(st['result'],'VERIFIED');self.assertNotIn('host_stop',st)
+        self.assertEqual(json.loads(self.store.read_text())['decisions']['D1']['status'],'closed')
+
     def test_decision_card_reuses_pending_registration_without_starting_twice(self):
         s = json.loads(self.store.read_text())
         proof = str(self.task / '.batch-flow' / 'proof.txt')
