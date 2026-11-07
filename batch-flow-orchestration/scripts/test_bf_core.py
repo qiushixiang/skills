@@ -49,6 +49,12 @@ def make_plan(**over):
     return p
 
 
+def record_json(n=0, exit_code=0):
+    """A raw evidence record in the bf record schema (design §23); hand-written files are not evidence."""
+    return json.dumps({'command': ['true', str(n)], 'cwd': '/', 'started_at': '2026-11-07T00:00:00Z',
+                       'ended_at': '2026-11-07T00:00:01Z', 'exit_code': exit_code, 'stdout': 'n=%d' % n, 'stderr': ''})
+
+
 UNFINISHED = '结果：FAILED\n停止原因：未完成\n上升问题：无\n'
 INFEASIBLE = '结果：FAILED\n停止原因：技术不可行\n上升问题：试过方案 A、B 均失败\n'
 NEEDS_DECISION = '结果：ARCH_DECISION_REQUIRED\n停止原因：待裁决\n上升问题：验收与冻结资产冲突\n'
@@ -95,7 +101,7 @@ class Base(unittest.TestCase):
     def evidence(self):
         self.counter += 1
         path = self.base / 'records' / ('%032x.json' % self.counter)
-        path.write_text(json.dumps({'exit_code': 0, 'n': self.counter}))
+        path.write_text(record_json(self.counter))
         return str(path)
 
     def done(self, extra=''):

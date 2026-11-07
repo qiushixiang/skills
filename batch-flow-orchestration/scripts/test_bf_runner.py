@@ -14,7 +14,7 @@ import unittest
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from bf import api, cards, runner, front  # noqa: E402
-from test_bf_core import make_plan, EDIT, NEEDS_DECISION, UNFINISHED  # noqa: E402
+from test_bf_core import make_plan, record_json, EDIT, NEEDS_DECISION, UNFINISHED  # noqa: E402
 
 
 class FakeAdapter:
@@ -25,6 +25,7 @@ class FakeAdapter:
         self.script = script          # {(type, target): [response, ...]} consumed in order
         self.launches = []            # (order_id, assignment, card_text, resume_conversation)
         self.pending = {}
+        self.killed = []
         self.n = 0
 
     def launch(self, order, assignment, card_path, run_dir, resume=None):
@@ -37,13 +38,18 @@ class FakeAdapter:
         response.setdefault('conversation_id', resume or 'conv-%d' % self.n)
         if response.get('evidence'):
             path = Path(self.base) / 'records' / ('%032x.json' % (1000 + self.n))
-            path.write_text('{}')
+            path.write_text(record_json(self.n))
             response['text'] = response['text'].replace('{EV}', str(path))
-        self.pending[handle] = response
+        if not response.get('hang'):  # a hanging call never finishes on its own
+            self.pending[handle] = response
         return handle
 
     def poll(self, handle):
         return self.pending.pop(handle, None)
+
+    def kill(self, handle):
+        self.killed.append(handle)
+        self.pending.pop(handle, None)
 
 
 def done(extra=''):

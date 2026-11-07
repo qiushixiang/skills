@@ -10,7 +10,7 @@ import unittest
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from bf import api, front  # noqa: E402
-from test_bf_core import make_plan  # noqa: E402
+from test_bf_core import make_plan, record_json  # noqa: E402
 
 CLI = str(HERE / 'bf' / 'cli.py')
 SWAP = '/home/u/.local/bin/codex-swap'
@@ -135,7 +135,7 @@ class Report(Base):  # §22.3
     def test_done_deliverables_leave_budgets(self):
         oid = self.impl('D1')
         ev = self.base / 'records' / ('%032x.json' % 7)
-        ev.write_text('{}')
+        ev.write_text(record_json(7))
         api.deliver(self.base, oid, api.start(self.base, oid), '结果：VERIFIED\n停止原因：完成\n验证证据：%s\n' % ev, conversation_id='c')
         self.assertNotIn('D1', api.report(self.base)['budgets'])
 

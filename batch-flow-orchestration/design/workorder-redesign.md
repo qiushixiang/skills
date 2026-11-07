@@ -441,3 +441,13 @@ scripts/agent_cli.py      保留（CLI 适配器，已验证的宿主细节）
 2. **运维故障**：同一工单连续 `invalid_retry` 次 CLI 不可用 → 工单标记 `ops: {problem, at}` 并暂停（其余照常推进），不再自动开 decide。前端判断后：`bf retry WO-n --note`（如切换账号后重试，清除标记，不扣额度）或 `bf escalate WO-n --note`（开 decide，trigger `tool_failure`）或问用户。脚本不识别报错特征。
 3. **汇报**：`report` 增加 `roles`、`next`（带 label、角色、模型）、`batches`（标题、状态 done/active/pending/outside、完成数/总数）、`ops`；`budgets` 只含未完成交付目标。label = 交付目标标题，标题缺省或等于 ID 时用批次标题。`report_text()` / `report --text` 生成给人看的中文进展（正在做、下一步、待你决定、角色、批次），不出现工单号。
 4. **前端提示词**：运维职责与判断边界、汇报写法（按批次与标题、不罗列已完成项、不单独抛工单号）、调整与账号切换流程；不改代码、不做技术判断。
+
+## 23. 证据、通知与停止（2026-11-07 S16 阻塞复盘后，以 `scripts/test_bf_evidence.py` 为准）
+
+根因：v2 设计把证据只定义为“交付引用 records/ 下的文件”，遗漏了 v1 由 `flow.py record` 承担的**证据生产契约**（项目受控入口调用它、项目验收脚本解析它的字段、角色规则要求用它）；切换时只盘点了技能内部机制，没有盘点外部使用方。另两处是设计缺陷：前端被设计为被动轮询（无推送通道）；“停止”被弱化为只停新派发。用户决定不保留 `flow.py` 兼容入口，项目侧改用 `bf record`。
+
+1. **证据组件（技能对外契约，写入 SKILL.md）**：`bf record [--cwd D] -- 命令 …` 运行命令并写 `records/<随机>.json`：`command`(list)、`cwd`、`started_at`、`ended_at`、`exit_code`(int)、`stdout`、`stderr`；标准输出一行 `{"ok","evidence","exit_code"}`；退出码透传（0..125，否则 1）；不改工单状态；子进程为直接子进程（入口可按 PID 转发信号）。`bf snapshot --repo R --paths …`：`repository`、`base_commit`、`paths`、`diff`、`untracked_base64`。门禁只接受符合这两种结构的证据文件；卡片“环境”节写明留证命令。
+2. **`bf doctor`**：扫描任务目录（不含 `.batch-flow/records`、日志）中形如 `batch-flow-orchestration/scripts/<路径>` 的引用，列出技能中不存在的脚本。切换或升级技能前运行。
+3. **推送通道**：驱动器启动与退出各记一条事件（`driver_start` / `driver_exit`），并维护心跳文件 `driver.json`（pid、最近一步时间）；`report` 增加 `driver.alive`。`bf watch [--since REV] [--once]` 把值得关注的事件（驱动器启停、待你决定、运维暂停、交付结果、批次放行、停止）逐条输出为一行中文；前端用 Monitor 工具挂着它，被事件唤醒后告诉用户。定时汇报用 CronCreate 每 10 分钟重复，不用一次性 ScheduleWakeup。
+4. **停止**：`stop` 同时阻止续跑（不合法交付暂存为待续跑，`resume` 后继续）；`stop --now` 立即终止在途调用（适配器 `kill`，按进程组），登记为无效、免扣（原因含“用户”），驱动器退出。
+5. **前端 shell**：允许由只读段组成的管道与 `&&`（每段都须是允许的只读命令或 bf 命令），允许 `cd <目录>`、`ps`、`pgrep`；仍拒绝重定向、分号、`$()`、反引号、`xargs`、`sh`、`kill` 等。
