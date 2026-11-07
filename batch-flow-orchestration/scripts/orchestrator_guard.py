@@ -15,6 +15,8 @@ import re
 import shlex
 import sys
 
+import account_switch
+
 SCRIPTS = Path(__file__).resolve().parent
 MANAGEMENT_SCRIPTS = {'flow.py', 'agent_cli.py', 'progress_timer.py', 'workflow_metrics.py', 'dispatch_card.py'}
 # Same set role_audit certifies, so an allowed call never makes the Stop audit unavailable.
@@ -65,7 +67,7 @@ def matches_card(tool, inputs, card_root, keys, lead=False):
     return False
 
 
-def check_bash(inputs, cwd, read_roots, card_root=None):
+def check_bash(inputs, cwd, read_roots, card_root=None, switch_paths=()):
     command = inputs.get('command')
     if not isinstance(command, str) or not command.strip():
         return 'empty shell command'
@@ -75,6 +77,10 @@ def check_bash(inputs, cwd, read_roots, card_root=None):
         words = shlex.split(command)
     except ValueError:
         return 'unparsable shell command'
+    if switch_paths and Path(words[0]).name in {Path(p).name for p in switch_paths}:
+        if account_switch.allowed(words, switch_paths):
+            return None
+        return 'account switch must be the configured absolute path with only -k/-n and at most one target account'
     exe = Path(words[0]).name
     if re.fullmatch(r'python(3(\.\d+)?)?', exe):
         if len(words) < 2 or words[1].startswith('-'):
@@ -135,7 +141,7 @@ def decide_subagent(event, lead_types, worker_types, card_root):
 
 
 def decide(event, conversation, management_roots, read_roots, agent_types, agent_models, skills, card_root=None,
-           lead_types=frozenset(), worker_types=frozenset()):
+           lead_types=frozenset(), worker_types=frozenset(), switch_paths=()):
     """Return a deny reason, or None to fall through to normal Claude Code permissions."""
     if event.get('session_id') != conversation:
         return None
@@ -147,7 +153,7 @@ def decide(event, conversation, management_roots, read_roots, agent_types, agent
     if tool in PASS_TOOLS:
         return None
     if tool == 'Bash':
-        return check_bash(inputs, cwd, read_roots, card_root)
+        return check_bash(inputs, cwd, read_roots, card_root, switch_paths)
     if tool == 'SendMessage':
         if card_root is not None and not matches_card('SendMessage', inputs, card_root, ['to', 'message']):
             return 'SendMessage continuation must be copied verbatim from a dispatch card'
@@ -197,6 +203,7 @@ def main():
     parser.add_argument('--skill', action='append', default=['batch-flow-orchestration'])
     parser.add_argument('--lead-agent-type', action='append', default=[], help='subagent type that may dispatch workers')
     parser.add_argument('--worker-agent-type', action='append', default=[], help='types a lead subagent may dispatch')
+    parser.add_argument('--account-switch', action='append', default=[], help='user-configured account switch command (absolute path)')
     args = parser.parse_args()
     management = [Path(p).resolve() for p in args.management_root]
     reads = [Path(p).resolve() for p in args.read_root] + management + [SCRIPTS.parent]
@@ -208,7 +215,7 @@ def main():
     reason = decide(event, args.conversation, management, reads,
                     set(args.agent_type or ['general-purpose']), set(args.agent_model), set(args.skill),
                     Path(args.card_root).resolve() if args.card_root else None,
-                    set(args.lead_agent_type), set(args.worker_agent_type))
+                    set(args.lead_agent_type), set(args.worker_agent_type), tuple(args.account_switch))
     if reason:
         print(json.dumps({'hookSpecificOutput': {
             'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',

@@ -182,6 +182,15 @@ class LauncherTests(unittest.TestCase):
         self.assertNotIn('现在运行 next', dry['argv'][-1])
         self.assertFalse((self.root/'.agents').exists())
 
+    def test_account_switch_gate_and_audit(self):
+        swap=self.root/'codex-swap';swap.write_text('#!/bin/sh\n');swap.chmod(0o700)
+        spec=dict(self.spec,account_switch=[str(swap)])
+        self.assertFalse(launcher.gate('run_command',dict(CommandLine=str(swap)+' -k'),self.spec)[0])
+        self.assertTrue(launcher.gate('run_command',dict(CommandLine=str(swap)+' -k'),spec)[0])
+        for command in [str(swap)+' -K',str(swap)+' -k; make','codex-swap -k']:
+            self.assertFalse(launcher.gate('run_command',dict(CommandLine=command),spec)[0])
+        self.assertIn(str(swap),launcher.loop_text(spec))
+
     def test_version_floor_and_newer_versions(self):
         binary=self.root/'agy'
         args=argparse.Namespace(workspace=str(self.root),task_base=str(self.root),store=None,model='user-model',effort='medium',binary=str(binary),dry_run=True)

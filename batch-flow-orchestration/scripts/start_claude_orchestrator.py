@@ -21,6 +21,8 @@ import sys
 import tempfile
 import uuid
 
+import account_switch
+
 SCRIPTS = Path(__file__).resolve().parent
 SKILL = SCRIPTS.parent
 ENV_KEY = 'BATCH_FLOW_CLAUDE_LAUNCH'
@@ -72,6 +74,8 @@ def capabilities(spec):
     return '\n'.join([
         'Claude Code batch-flow 编排者（受限启动，会话 %s）' % spec['session_id'],
         '任务目录：' + spec['task_base'], '台账：' + spec['store'], '源码工作目录：' + spec['workspace'], '技能目录：' + str(SKILL),
+        *(['账号切换命令（用户配置，何时使用听用户指示）：' + ' / '.join(spec['account_switch'])
+           + '；只能用该绝对路径，参数仅限 -k、-n 和至多一个目标账号。'] if spec.get('account_switch') else []),
         '',
         '启动及上下文压缩后，先用 Skill 工具加载 batch-flow-orchestration（不可用时 Read ' + str(SKILL / 'SKILL.md')
         + '），再 Read ' + str(SKILL / 'references' / 'roles' / 'orchestrator.md') + '；只读这两份，其他文档按需。',
@@ -100,12 +104,14 @@ def settings(spec):
                 '--agent-type', 'bf-executor', '--agent-type', 'bf-architect', '--agent-type', 'bf-reviewer',
                 '--card-root', str(Path(spec['records']) / 'dispatch'),
                 *[x for a in LEAD_TYPES for x in ('--lead-agent-type', a)],
-                *[x for a in WORKER_TYPES for x in ('--worker-agent-type', a)])
+                *[x for a in WORKER_TYPES for x in ('--worker-agent-type', a)],
+                *[x for p in spec.get('account_switch', []) for x in ('--account-switch', p)])
     return {'hooks': {
         'SessionStart': [{'hooks': [cmd(str(Path(__file__).resolve()), 'context', '--runtime', str(runtime))]}],
         'UserPromptSubmit': [{'hooks': [cmd(str(SCRIPTS / 'role_audit.py'), 'begin', '--host', 'claude', '--conversation', sid, '--log', log)]}],
         'PreToolUse': [{'matcher': '*', 'hooks': [guard]}],
-        'PostToolUse': [{'matcher': '*', 'hooks': [cmd(str(SCRIPTS / 'role_audit.py'), 'record', '--host', 'claude', '--conversation', sid, '--log', log)]}],
+        'PostToolUse': [{'matcher': '*', 'hooks': [cmd(str(SCRIPTS / 'role_audit.py'), 'record', '--host', 'claude', '--conversation', sid, '--log', log,
+                                                       *[x for p in spec.get('account_switch', []) for x in ('--account-switch', p)])]}],
         'Stop': [{'hooks': [cmd(str(SCRIPTS / 'stop_hook_pre_yield.py'), '--host', 'claude', '--store', store, '--role', 'orchestrator',
                                 '--conversation', sid, '--audit-log', log, '--inspect-until-next', '--next-command', next_command(spec))]}],
     }}
@@ -141,7 +147,8 @@ def build(args):
     runtime = store.parent / '.claude-launch' / launch_id
     spec = dict(launch_id=launch_id, session_id=str(uuid.uuid4()), python=sys.executable, workspace=str(workspace),
                 task_base=str(task_base), store=str(store), records=str(store.parent / 'records'), runtime=str(runtime),
-                profiles=[], model=args.model, effort=args.effort)
+                profiles=[], model=args.model, effort=args.effort,
+                account_switch=[account_switch.configured(p) for p in (args.account_switch or [])])
     return spec, runtime
 
 
@@ -225,6 +232,7 @@ def main():
     parser.add_argument('--model', default='haiku', help='orchestrator model (default haiku)')
     parser.add_argument('--effort', choices=['low', 'medium', 'high', 'xhigh', 'max'], help='omit to inherit CLI config')
     parser.add_argument('--binary', default='claude')
+    parser.add_argument('--account-switch', action='append', help='absolute path of a user account switch command the orchestrator may run (repeatable)')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
     try:

@@ -45,6 +45,15 @@ class AuditTests(unittest.TestCase):
             self.assertEqual(audit.shell_check(command,str(self.root),[])[0],'unavailable')
         self.assertEqual(audit.shell_check('python3 '+str(audit.SCRIPTS/'flow.py')+' record -- make',str(self.root),[])[0],'violation')
 
+    def test_configured_account_switch(self):
+        swap=str(self.root/'codex-swap')
+        row=lambda command,switch:dict(tool='Bash',inputs=dict(command=command),cwd=str(self.root),**({'account_switch':switch} if switch else {}))
+        self.assertEqual(audit.tool_check(row(swap+' -k',[swap]),[])[0],'clean')
+        self.assertEqual(audit.tool_check(row(swap+' -k user@example.com',[swap]),[])[0],'clean')
+        self.assertEqual(audit.tool_check(row(swap+' -k',None),[])[0],'unavailable')
+        for command in [swap+' -K',swap+' -k; make','codex-swap -k']:
+            self.assertNotEqual(audit.tool_check(row(command,[swap]),[])[0],'clean')
+
     def test_product_edits_and_management_records(self):
         self.tool('Write',dict(file_path=str(self.management/'receipt.json')))
         self.assertEqual(self.report()['status'],'clean')

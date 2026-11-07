@@ -24,6 +24,8 @@ Shell 入口实际位于 `<技能目录>/scripts/start-claude-orchestrator.sh`�
 
 **技术负责人嵌套派发**：`delegate_to_lead` 动作由 next 拉起 `bf-architect`。载荷角色是执行者/审阅者时，技术负责人子代理运行 `dispatch_card.py make --as-lead` 生成子卡（ID 以 `-lead` 结尾），按其 steps：`start`（actor architect）→ 前台 Agent 拉起 `bf-executor`/`bf-reviewer` → 保存 receipt/result → `finish`（actor 为执行角色）。编排者 pre_yield 不要求技术负责人持有的 attempt 有派发计时；next 在本次启动内不碰 `-lead` 卡，启动之前的 `-lead` 卡随编排会话终止，按中断登记。`--as-lead` 只用于台账正式任务；CONFIRM_CONDITION 等条件只由技术负责人核对，不另派执行者。条件确认返回 WAIT_EVIDENCE 后台账无进展时不重复派发，pre_yield 列为 WAITING_CONDITION。启动器只给 `bf-architect` Agent 工具，并设 `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=2`（2.1.318：调用者深度达到上限时 Agent 被收回）。guard 对子代理只加窄规则：任何子代理不得 Write/Edit flow.json；只有 `--lead-agent-type` 可调 Agent，且只能拉起 `--worker-agent-type` 并逐字匹配 `-lead` 卡。
 
+**账号切换命令（可选门禁放行）**：启动器 `--account-switch <绝对路径>`（可重复）登记用户自己的账号切换命令；启动时校验为可执行文件并写入 spec。编排者门禁、AGY run_command 门禁与角色审计只放行该绝对路径，参数仅限 `-k`、`-n` 和至多一个目标账号（`scripts/account_switch.py`），其他参数（如 `-K`）、管道或相对路径一律拒绝。何时切换由用户在会话中指示，技能不规定使用时机。
+
 **上下文续接（Claude 宿主）**：session_policy / context_groups / context_hint 由 flow.py 决定，与宿主无关；续接由卡生成 `SendMessage(to=<agent ID>)`，只在同一编排会话内有效（2.1.318：已结束的子代理收到 SendMessage 会从其记录恢复；新会话够不到旧子代理）。续接只是优化，台账和交付文件承载全部状态：续接目标不在本会话时自动改为新上下文，并把原因写入 start 的 replacement_reason。执行者原子代理记录超过 300KB 时也改为新上下文（长上下文分散注意力、锚定旧方案、压缩丢细节）；审阅者 R2 续 R1 不设此限。flow.py 只把同一后端创建的上下文提示为 resume。
 
 ## 1. 两种方式与登记口径

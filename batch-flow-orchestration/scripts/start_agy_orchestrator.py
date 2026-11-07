@@ -15,6 +15,8 @@ import tempfile
 import time
 import uuid
 
+import account_switch
+
 SCRIPTS=Path(__file__).resolve().parent
 SKILL=SCRIPTS.parent
 AGENT='batch_flow_orchestrator'
@@ -73,7 +75,9 @@ def next_command(spec):
 
 def loop_text(spec):
     status=shlex.join([spec['python'],str(SCRIPTS/'flow.py'),'--store',spec['store'],'status'])
-    return ('\n启动时先运行 '+status+'，展示状态后结束本轮，等用户明确要求继续；不要自动运行 next。'
+    switch=spec.get('account_switch') or []
+    return (('\n账号切换命令（用户配置，何时使用听用户指示）：'+' / '.join(switch)+'；只能用该绝对路径，参数仅限 -k、-n 和至多一个目标账号。' if switch else '')+
+            '\n启动时先运行 '+status+'，展示状态后结束本轮，等用户明确要求继续；不要自动运行 next。'
             '\n用户口语指定角色模型时，先按 linux-cli.md 使用 agent_cli.py models 查询指定后端，再用 resolve-model 校验映射；唯一匹配直接 set_models，真实多候选才确认变体。未指定 effort 沿用 default，不重复询问。'
             '\n用户要求继续后，运行 '+next_command(spec)+'，按输出的 do 字段办：'
             'do=call 时逐字照抄 tool 与 input 发起这一个调用（字段一个不改），返回后立即再运行 next；'
@@ -115,6 +119,7 @@ def safe_command(command,spec):
     # Canonical shell quoting ensures substitutions/operators cannot be smuggled
     # through double quotes or command separators. Quoted JSON stays literal.
     if not argv or command!=shlex.join(argv):return False
+    if account_switch.allowed(argv,spec.get('account_switch',[])):return True
     if len(argv)<3 or argv[0]!=spec['python']:return False
     script=Path(argv[1])
     if not script.is_absolute():return False
@@ -253,7 +258,7 @@ def hook(event_name,runtime,event,environ=None):
         return {'decision':decision,'reason':reason}
     if event_name=='PostToolUse':
         import role_audit
-        role_audit.append_event(Path(runtime)/'audit.jsonl','agy',owner,event)
+        role_audit.append_event(Path(runtime)/'audit.jsonl','agy',owner,event,account_switch=spec.get('account_switch',[]))
     if event_name=='Stop':
         if not Path(spec['store']).is_file():
             from stop_hook_pre_yield import explicit_stop
@@ -334,7 +339,8 @@ def launch(args):
     version=result.stdout.strip().split()[0] if result.stdout.strip() else ''
     if version_key(version)<version_key(MIN_VERSION):raise ValueError('AGY %s is older than the minimum supported %s (hook/tool interfaces unverified)'%(version,MIN_VERSION))
     if not args.model or not args.effort:raise ValueError('model and effort must not be empty')
-    spec=dict(launch_id=uuid.uuid4().hex,python=sys.executable,workspace=str(workspace),task_base=str(task_base),store=str(store),records=str(store.parent/'records'),profiles=[],model=args.model,effort=args.effort,terminal_sandbox=False,agy_version=version)
+    spec=dict(launch_id=uuid.uuid4().hex,python=sys.executable,workspace=str(workspace),task_base=str(task_base),store=str(store),records=str(store.parent/'records'),profiles=[],model=args.model,effort=args.effort,terminal_sandbox=False,agy_version=version,
+              account_switch=[account_switch.configured(p) for p in (getattr(args,'account_switch',None) or [])])
     runtime=store.parent/'.agy-launch'/spec['launch_id']
     spec['runtime']=str(runtime)
     argv=[binary,'--agent',AGENT,'--model',args.model,'--effort',args.effort,'--mode','accept-edits',
@@ -412,6 +418,7 @@ def main():
     parser.add_argument('--model',default='gemini-3.8-flash-medium',help='main model (default: gemini-3.8-flash-medium)')
     parser.add_argument('--effort',default='medium',choices=['low','medium','high','xhigh','max'],help='reasoning effort (default: medium)')
     parser.add_argument('--binary',default='agy');parser.add_argument('--dry-run',action='store_true')
+    parser.add_argument('--account-switch',action='append',help='absolute path of a user account switch command the orchestrator may run (repeatable)')
     args=parser.parse_args()
     try:return launch(args)
     except KeyboardInterrupt:

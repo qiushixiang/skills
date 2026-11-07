@@ -35,7 +35,8 @@ class GuardTests(unittest.TestCase):
                                '--agent-model', 'sonnet', '--agent-model', 'opus',
                                '--agent-type', 'bf-executor', '--agent-type', 'general-purpose',
                                '--lead-agent-type', 'bf-architect', '--worker-agent-type', 'bf-executor', '--worker-agent-type', 'bf-reviewer']
-                              + (['--card-root', str(self.mgmt / 'records' / 'dispatch')] if cards else []),
+                              + (['--card-root', str(self.mgmt / 'records' / 'dispatch')] if cards else [])
+                              + [x for p in getattr(self, 'switch', []) for x in ('--account-switch', p)],
                               input=json.dumps(event), capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         if not proc.stdout.strip():
@@ -54,6 +55,19 @@ class GuardTests(unittest.TestCase):
         self.assertAllowed('Bash', {'command': 'python3 %s --store %s status' % (HERE / 'flow.py', self.mgmt / 'flow.json')})
         self.assertAllowed('Bash', {'command': 'python3 %s wait --ticket /x --goal "S3 (repair)"' % (HERE / 'progress_timer.py'),
                                     'run_in_background': True})
+
+    def test_configured_account_switch(self):
+        swap = Path(self.tmp.name) / 'bin' / 'codex-swap'
+        command = lambda *a: {'command': ' '.join([str(swap), *a])}
+        self.assertDenied('Bash', command('-k'))  # not configured for this launch
+        self.switch = [str(swap)]
+        for args in [(), ('-k',), ('-n',), ('-k', 'user@example.com'), ('user@example.com', '-k')]:
+            self.assertAllowed('Bash', command(*args))
+        for args in [('-K',), ('-k', '-k'), ('--foo',), ('a@b.c', 'd@e.f'), ('not-an-account',), ('-k', '../x')]:
+            self.assertDenied('Bash', command(*args))
+        for raw in ['codex-swap -k', '%s -k; make' % swap, '%s -k | tee x' % swap, 'bash %s -k' % swap,
+                    str(swap.parent / 'other') + ' -k']:
+            self.assertDenied('Bash', {'command': raw})
 
     def test_product_and_dynamic_shell_denied(self):
         for command in ['make -j8', 'bash tests/run_board_test.sh s1', 'git commit -m x',

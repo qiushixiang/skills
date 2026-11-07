@@ -96,6 +96,17 @@ class LauncherTests(unittest.TestCase):
         (self.bin / 'claude').write_text('#!/bin/sh\necho "2.1.300 (Claude Code)"\n')
         proc = self.launch('--dry-run'); self.assertEqual(proc.returncode, 2); self.assertIn('older than the minimum', proc.stderr)
 
+    def test_account_switch_reaches_guard_audit_and_prompt(self):
+        swap = self.bin / 'codex-swap'; swap.write_text('#!/bin/sh\n'); swap.chmod(0o755)
+        proc = self.launch('--dry-run', '--account-switch', str(swap)); self.assertEqual(proc.returncode, 0, proc.stderr)
+        dry = json.loads(proc.stdout); hooks = dry['settings']['hooks']
+        self.assertEqual(dry['spec']['account_switch'], [str(swap.resolve())])
+        self.assertIn('--account-switch', hooks['PreToolUse'][0]['hooks'][0]['command'])
+        self.assertIn('--account-switch', hooks['PostToolUse'][0]['hooks'][0]['command'])
+        self.assertIn(str(swap.resolve()), ' '.join(dry['argv']))
+        for bad in ['codex-swap', str(self.bin / 'missing')]:
+            proc = self.launch('--dry-run', '--account-switch', bad); self.assertEqual(proc.returncode, 2); self.assertIn('--account-switch', proc.stderr)
+
     def test_newer_version_is_accepted(self):
         for version in ['2.1.319', '2.10.0', '3.0.0']:
             (self.bin / 'claude').write_text('#!/bin/sh\necho "%s (Claude Code)"\n' % version)

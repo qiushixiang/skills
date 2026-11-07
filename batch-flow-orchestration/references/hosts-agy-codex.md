@@ -23,6 +23,8 @@ python3 <技能目录>/scripts/start_agy_orchestrator.py --workspace <源码项�
 
 `--dry-run` 只显示所选任务、能力、启动参数和自定义 agent 内容，不安装 hooks、不调用模型。接口在 AGY 1.4.12～1.5.1 上实测验证；启动器只拒绝低于 1.4.12 的版本，更新版本默认向下兼容、直接放行，并把实际版本写入 spec 的 `agy_version`；若新版本使门禁失效（例如 120 秒内未见 SessionStart 绑定即结束会话），按实际问题处理。1.5.0 本次验证主会话 hooks 与 CLI 版本检查，不据此声称所有原生子代理接口均已重新验收。用户已明确指定本启动器默认主模型为 `gemini-3.8-flash-medium`、effort 为 `medium`，不填即可使用；显式参数可覆盖，启动时显示实际值。此默认只用于编排者启动，不自动覆盖计划中的其他角色配置。
 
+**账号切换命令（可选门禁放行）**：启动器 `--account-switch <绝对路径>`（可重复）登记用户自己的账号切换命令；启动时校验为可执行文件并写入 spec。编排者门禁、AGY run_command 门禁与角色审计只放行该绝对路径，参数仅限 `-k`、`-n` 和至多一个目标账号（`scripts/account_switch.py`），其他参数（如 `-K`）、管道或相对路径一律拒绝。何时切换由用户在会话中指示，技能不规定使用时机。
+
 终端先显示能力清单，再用 `--agent batch_flow_orchestrator` 新建交互主会话。自定义主代理声明协调工具名单，但本机 1.4.12 的真实 init 回执仍返回包含编辑/MCP 的完整工具集，不能宣称工具已隐藏或裁剪。实际限制由独立的 PreToolUse 会话门禁执行：只允许原生协调工具、受限 view_file/write_to_file/run_command，其他工具（含编辑替换、源码搜索、MCP、权限扩张）均拒绝。SessionStart 将能力、固定脚本路径、台账及记录目录注入主会话，PreToolUse 在实际执行前拒绝不合法操作：
 
 - view_file 只读技能 Markdown、绑定台账、管理 records 和启动器记录的子会话宿主元数据。

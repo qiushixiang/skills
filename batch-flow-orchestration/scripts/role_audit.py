@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shlex
 import sys
+import account_switch
 
 FORMAT='batch-flow-role-audit/v1'
 SCRIPTS=Path(__file__).resolve().parent
@@ -26,7 +27,7 @@ AGENT_TOOLS.update({'taskstop','taskoutput','toolsearch','askuserquestion','list
 MANAGEMENT=['flow.py','agent_cli.py','progress_timer.py','dispatch_card.py','workflow_metrics.py']
 
 
-def append_event(log, host, conversation, event, begin=False):
+def append_event(log, host, conversation, event, begin=False, account_switch=()):
     actual=event.get('conversationId') if host=='agy' else event.get('session_id')
     if not conversation or actual!=conversation:
         return False
@@ -43,6 +44,7 @@ def append_event(log, host, conversation, event, begin=False):
             except ValueError:inputs=None
         # Persist unsupported events too; never silently treat them as audited.
         row.update(tool=name,inputs=inputs,cwd=event.get('cwd') or next(iter(event.get('workspacePaths') or []),None))
+        if account_switch:row['account_switch']=list(account_switch)
     with Path(log).open('a',encoding='utf-8') as stream:
         fcntl.flock(stream,fcntl.LOCK_EX)
         stream.write(json.dumps(row,ensure_ascii=False)+'\n')
@@ -59,7 +61,7 @@ def inside(path, roots, cwd):
     return any(path==root or root in path.parents for root in roots)
 
 
-def shell_check(command, cwd, roots):
+def shell_check(command, cwd, roots, switch_paths=()):
     """Conservative literal shell subset, never execute inspected commands."""
     if not isinstance(command,str) or not command.strip():
         return 'unavailable','missing shell command'
@@ -69,6 +71,8 @@ def shell_check(command, cwd, roots):
         if Path(literal[1]).name=='flow.py' and ('--' in literal[2:] or 'snapshot' in literal[2:] or 'record' in literal[2:]):
             return 'violation','orchestrator used a management helper for product command/diff capture'
         return 'clean','canonical literal management command'
+    if literal and command==shlex.join(literal) and account_switch.allowed(literal,switch_paths):
+        return 'clean','user-configured account switch command'
     # Dynamic shell/code wrappers require a stronger host audit, not guessed intent.
     if any(marker in command for marker in ['$(', '`', '${', '\\']) or re.search(r'<<|\n',command):
         return 'unavailable','dynamic or multiline shell cannot be verified by this auditor'
@@ -120,7 +124,8 @@ def tool_check(row, roots):
     name=name.rsplit('.',1)[-1].lower()
     cwd=inputs.get('workdir') or inputs.get('cwd') or inputs.get('Cwd') or row.get('cwd')
     if name in SHELL_TOOLS:
-        return shell_check(inputs.get('command') or inputs.get('cmd') or inputs.get('CommandLine'),cwd,roots)
+        switch=row.get('account_switch') if isinstance(row.get('account_switch'),list) else []
+        return shell_check(inputs.get('command') or inputs.get('cmd') or inputs.get('CommandLine'),cwd,roots,switch)
     if name in EDIT_TOOLS:
         paths=[]
         for key in ['file_path','path','TargetFile','AbsolutePath']:
@@ -174,6 +179,7 @@ def main():
     parser.add_argument('--conversation',required=True)
     parser.add_argument('--log',type=Path,required=True)
     parser.add_argument('--management-root',action='append',default=[])
+    parser.add_argument('--account-switch',action='append',default=[],help='user-configured account switch command recorded with each tool row')
     args=parser.parse_args()
     try:
         if args.command=='check':
@@ -182,7 +188,7 @@ def main():
         if not args.host:raise ValueError('begin/record require --host')
         event=json.load(sys.stdin)
         if not isinstance(event,dict):raise ValueError('invalid hook input')
-        append_event(args.log,args.host,args.conversation,event,begin=args.command=='begin')
+        append_event(args.log,args.host,args.conversation,event,begin=args.command=='begin',account_switch=args.account_switch)
         print('{}');return 0
     except (OSError,ValueError) as error:
         print('{}');print('role audit unavailable: '+str(error),file=sys.stderr);return 1
