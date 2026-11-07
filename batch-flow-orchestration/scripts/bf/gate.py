@@ -4,7 +4,7 @@ import re
 import shlex
 from pathlib import Path
 
-from . import model
+from . import evidence as evidence_mod, model
 
 _LEAD = r'^[ \t*#>-]*'
 _SEP = r'[ \t]*[:：][ \t]*\**[ \t]*'
@@ -44,7 +44,7 @@ def cited_evidence(base, text):
     for name in ('验证证据', '复跑与证据'):
         for tok in re.findall(r'(?:/|records/)[^\s,;，；、"\'`()（）|<>]+', field(text, name)):
             path = os.path.normpath(tok.rstrip('.。') if tok.startswith('/') else str(Path(base) / tok.rstrip('.。')))
-            if path.startswith(records + os.sep) and os.path.isfile(path) and path not in out:
+            if path.startswith(records + os.sep) and os.path.isfile(path) and path not in out and evidence_mod.is_evidence(path):
                 out.append(path)
     return out
 
@@ -138,7 +138,7 @@ def judge(state, order, run, p, decision, text):
     if res in SUCCESS.get(t, ()):
         reason = ''
         if t in ('implement', 'repair') or (t == 'review' and res == 'RELEASE'):
-            reason = '' if p['evidence'] else '须引用 records/ 下存在的证据文件'
+            reason = '' if p['evidence'] else '须引用 bf record / bf snapshot 生成的 records/ 证据文件（手写文件不算证据）'
         if not reason and t == 'repair':
             tail = text[text.find('阻断关闭'):] if '阻断关闭' in text else ''
             missing = [f['id'] for f in order['input'].get('findings', [])

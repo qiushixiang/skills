@@ -1,5 +1,7 @@
 """Card rendering (design 10.1): fixed sections, rendered from the order; the gate parses only the fixed delivery lines."""
 import json
+import os
+import sys
 
 from . import model
 
@@ -46,6 +48,9 @@ def _environment(state, assignment, run_dir):
     out = ['证据与记录文件写入 %s，并在交付中引用绝对路径。' % (state.base / 'records')]
     if run_dir:
         out.append('本次运行目录：%s' % run_dir)
+    cli = '%s %s --base %s' % (sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cli.py'), state.base)
+    ws = state.plan.get('workspace') or '<工作目录>'
+    out.append('留证（只有它生成的文件算证据，手写文件无效）：%s record --cwd %s -- <命令>；代码快照：%s snapshot --repo %s --paths <文件>...' % (cli, ws, cli, ws))
     if env.get('entry'):
         out.append('受控入口（直接调用，不组合命令、不另套 shell）：%s' % '、'.join(env['entry']))
     for key, label in (('preflight', '前检'), ('guide', '说明')):

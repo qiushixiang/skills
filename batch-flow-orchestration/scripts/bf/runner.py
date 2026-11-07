@@ -1,5 +1,6 @@
 """Driver loop (design 6.1): select, render, launch, wait, collect, gate, route. State lives in files only (I7)."""
 import json
+import os
 import time
 
 from . import api, cards
@@ -11,6 +12,26 @@ class Runner(object):
         self.base, self.adapter, self.parallel, self.poll_interval = api.load(base).base, adapter, parallel, poll_interval
         self.inflight = {}  # run_id -> {handle, order, assignment, n}
         self.recovered = False
+        self.started = None
+        self.exit_now = False
+
+    def _beat(self, exited=False):
+        data = {'pid': os.getpid(), 'started': self.started, 'last_step': now(), 'exited': exited}
+        tmp = self.base / 'driver.json.tmp'
+        tmp.write_text(json.dumps(data), encoding='utf-8')
+        os.replace(str(tmp), str(self.base / 'driver.json'))
+
+    def _begin(self):
+        if self.started is None:
+            self.started = now()
+            api.driver_event(self.base, 'driver_start')
+
+    def close(self):
+        if self.started is not None:
+            self.started = self.started
+            self._beat(exited=True)
+            api.driver_event(self.base, 'driver_exit')
+            self.started = None
 
     def _dir(self, run_id):
         path = self.base / 'records' / 'runs' / run_id
@@ -20,6 +41,24 @@ class Runner(object):
     def _persist(self, run_id):
         info = self.inflight[run_id]
         (self._dir(run_id) / 'inflight.json').write_text(json.dumps(info, ensure_ascii=False), encoding='utf-8')
+
+    def _pend(self, run_id, order_id, assignment, text, resume, n):
+        """Stopped: keep the continuation for a later driver (resume) instead of launching it."""
+        self.inflight[run_id] = {'handle': None, 'order': order_id, 'assignment': assignment, 'n': n,
+                                 'pending': {'text': text, 'resume': resume}}
+        self._persist(run_id)
+
+    def _launch_pending(self):
+        st = api.load(self.base)
+        if st.stopped:
+            return False
+        went = False
+        for run_id, info in list(self.inflight.items()):
+            if info.get('handle') is None and info.get('pending'):
+                p = info['pending']
+                self._launch(st, info['order'], run_id, info['assignment'], p['text'], p['resume'], info['n'])
+                went = True
+        return went
 
     def _launch(self, st, order_id, run_id, assignment, text, resume, n):
         rd = self._dir(run_id)
@@ -44,6 +83,8 @@ class Runner(object):
     def _collect(self):
         progress = False
         for run_id, info in list(self.inflight.items()):
+            if info.get('handle') is None:
+                continue
             res = self.adapter.poll(info['handle'])
             if res is None:
                 continue
@@ -62,7 +103,10 @@ class Runner(object):
             if out['outcome'] == 'continue':
                 k = next(r for r in st.orders[info['order']]['runs'] if r['run_id'] == run_id)['continuations']
                 text = cards.continue_prompt(info['order'], out['reason'], k, st.plan['policy']['continue_limit'])
-                self._launch(st, info['order'], run_id, info['assignment'], text, res.get('conversation_id'), info['n'] + 1)
+                if st.stopped:
+                    self._pend(run_id, info['order'], info['assignment'], text, res.get('conversation_id'), info['n'] + 1)
+                else:
+                    self._launch(st, info['order'], run_id, info['assignment'], text, res.get('conversation_id'), info['n'] + 1)
             else:
                 del self.inflight[run_id]
                 saved = self._dir(run_id) / 'inflight.json'
@@ -98,18 +142,43 @@ class Runner(object):
         if (path.read_text(encoding='utf-8') if path.exists() else '') != text:
             path.write_text(text, encoding='utf-8')
 
+    def _stop_now(self):
+        """stop --now: kill every in-flight call, register the runs as INVALID (free) and leave."""
+        for run_id, info in list(self.inflight.items()):
+            if info.get('handle') is not None:
+                self.adapter.kill(info['handle'])
+            api.abandon(self.base, info['order'], run_id, '用户要求立即停止，调用已终止')
+            del self.inflight[run_id]
+            saved = self._dir(run_id) / 'inflight.json'
+            if saved.exists():
+                saved.unlink()
+        self.exit_now = True
+
     def step(self):
+        self._begin()
         if not self.recovered:
             self.recovered = True
             self._recover(api.load(self.base))
+        if api.load(self.base).kill:
+            self._stop_now()
+            self._beat()
+            return True
         progress = self._collect()
+        progress = self._launch_pending() or progress
         progress = self._dispatch() or progress
         self._attention()
+        self._beat()
         return progress
 
     def run_until_idle(self):
-        while True:
-            if not self.step():
-                if not self.inflight:
+        try:
+            while True:
+                progress = self.step()
+                if self.exit_now:
                     return
-                time.sleep(self.poll_interval)
+                if not progress:
+                    if not any(i.get('handle') is not None for i in self.inflight.values()):
+                        return
+                    time.sleep(self.poll_interval)
+        finally:
+            self.close()
