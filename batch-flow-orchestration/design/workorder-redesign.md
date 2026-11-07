@@ -451,3 +451,14 @@ scripts/agent_cli.py      保留（CLI 适配器，已验证的宿主细节）
 3. **推送通道**：驱动器启动与退出各记一条事件（`driver_start` / `driver_exit`），并维护心跳文件 `driver.json`（pid、最近一步时间）；`report` 增加 `driver.alive`。`bf watch [--since REV] [--once]` 把值得关注的事件（驱动器启停、待你决定、运维暂停、交付结果、批次放行、停止）逐条输出为一行中文；前端用 Monitor 工具挂着它，被事件唤醒后告诉用户。定时汇报用 CronCreate 每 10 分钟重复，不用一次性 ScheduleWakeup。
 4. **停止**：`stop` 同时阻止续跑（不合法交付暂存为待续跑，`resume` 后继续）；`stop --now` 立即终止在途调用（适配器 `kill`，按进程组），登记为无效、免扣（原因含“用户”），驱动器退出。
 5. **前端 shell**：允许由只读段组成的管道与 `&&`（每段都须是允许的只读命令或 bf 命令），允许 `cd <目录>`、`ps`、`pgrep`；仍拒绝重定向、分号、`$()`、反引号、`xargs`、`sh`、`kill` 等。
+
+## 24. 完整性：自动快照、受保护路径、计划与审阅检查（2026-11-07 用户同意，以 `scripts/test_bf_integrity.py` 为准）
+
+来源：S16 复盘与 `design/v1-rules-audit.md` 的 10 条机械检查。机制由技能提供；**受保护清单、提交节奏、仓库列表等内容由技术负责人在计划中定义**。
+
+1. **自动快照**：`plan.repos`（绝对路径列表）存在时，`start` 记录各仓库脏文件及其哈希作基线；登记交付时算出本次运行改动的文件（不含运行前已脏且未变的文件），自动 `snapshot`，写入 `run.changed {repo: [相对路径]}` 与 `run.version`（快照记录路径）。审阅卡片列出被审交付目标最近一次实施/返修的快照；审阅的“固定版本”行必须包含这些快照路径。
+2. **受保护路径**：`plan.protected`（相对仓库根的 glob）。运行改动命中受保护路径而工单 `input.allow_protected` 未覆盖 → 交付不合法，直接按 FAILED 登记（不续跑），开 decide（trigger `protected_change`，附路径与快照）。decide 的 `open` 动作带 `allow_protected` 视为超出授权包络 → 问用户，批准后写入新工单。审阅运行改动 `records/` 以外的任何文件 → 同样处理（trigger `review_modified`）。有 `plan.repos` 时审阅以可写模式运行（为写 record），否则只读。
+3. **计划校验**：每个交付目标至少属于一个审阅组，或写 `no_review: <理由>`；`instruction`、`acceptance` 非空；有 `plan.design` 时设计文件必须存在，记录 `sha256` 与每个 `design_ref` 所指章节（以标题行匹配，至下一个同级或更高级标题为止）的哈希，`design_ref` 必须存在；`rounds.review < 1 + 返修链长度` 时在 `plan.warnings` 中提示。
+4. **设计漂移**：`design_ref` 所指章节哈希变化 → 该章节的交付目标暂停派发；`check_design`（驱动器每次派发前调用）为漂移开一张 decide（trigger `design_drift`，列出受影响交付目标）。负责人处置：`refresh_design`（措辞调整，重钉哈希，授权包络内）或 `plan_revision`（实质变化，问用户）。
+5. **审阅完整性**：某审阅组已 RELEASE 后，组内交付目标又开立实施或返修 → 为该组新开审阅，批次放行等待它（第三方组同理）。decide 的 `supersede` 指向审阅、放行或有依赖方的工单 → 问用户。审阅 RELEASE 须至少引用一份本次运行内生成、退出码 0 的 record，否则须写“未复跑原因”。审阅的“非阻断建议”逐条进入本批分诊。
+6. **证据时效**：实施/返修 VERIFIED 与审阅 RELEASE 须至少引用一份本次运行开始之后（允许 2 秒时钟粒度）生成、退出码 0 的 record。

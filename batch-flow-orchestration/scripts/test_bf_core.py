@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = Path(__file__).resolve().parent
@@ -51,8 +52,9 @@ def make_plan(**over):
 
 def record_json(n=0, exit_code=0):
     """A raw evidence record in the bf record schema (design §23); hand-written files are not evidence."""
-    return json.dumps({'command': ['true', str(n)], 'cwd': '/', 'started_at': '2026-11-07T00:00:00Z',
-                       'ended_at': '2026-11-07T00:00:01Z', 'exit_code': exit_code, 'stdout': 'n=%d' % n, 'stderr': ''})
+    at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())  # produced now, i.e. within the current run (§24)
+    return json.dumps({'command': ['true', str(n)], 'cwd': '/', 'started_at': at,
+                       'ended_at': at, 'exit_code': exit_code, 'stdout': 'n=%d' % n, 'stderr': ''})
 
 
 UNFINISHED = '结果：FAILED\n停止原因：未完成\n上升问题：无\n'
