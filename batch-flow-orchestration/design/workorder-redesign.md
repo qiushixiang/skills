@@ -414,3 +414,21 @@ scripts/agent_cli.py      保留（CLI 适配器，已验证的宿主细节）
 - EtherCAT 台账已导入为 v2（同一 `.batch-flow` 目录，`records/` 原地沿用）；导入报告 `import-report.json`：38 个交付目标、22 个审阅组、45 项已完成、15 项开立、证据哈希全部完好。v1 `flow.json` 设为只读留作审计。
 - 按用户决定修订计划：授权包络覆盖全部批次；`policy.rounds.implement = 1`（返修走独立返修链，不占实施轮次）；用户原话存于 `.batch-flow/approvals/cutover-20261107.txt`。
 - v1 代码与文档已删除，可从 git 标签 `v1-final` 取回；一次性导入器随之删除（同一标签内保留）。
+
+## 21. 用户调整（2026-11-07 用户同意，以 `scripts/test_bf_adjust.py` 为准）
+
+结构化调整命令，每条都必须带用户原话文件（approval），一次调整 = 一次修订 + 一条事件；前端把用户的自然语言复述成命令、确认后执行。
+
+| 命令（`bf/cli.py`） | `bf/adjust.py` | 说明 |
+|---|---|---|
+| `models <backend>` | — | 只读：用该后端 profile 查询模型目录（复用 `model_catalog.query`），存到 `<base>/catalogs/` |
+| `set-role <role> --backend B --name '<用户说法>' [--effort E] --approval F` | `set_role` | 复用 `model_catalog.query/resolve`：唯一结果才写入 `roles[role]`；多个候选或未找到时不改动，返回 candidates/status 由前端问用户 |
+| `envelope --add/--remove <batch>... --approval F` | `envelope` | 调整自动推进范围 |
+| `grant <deliverable> --implement/--backup/--lead/--repair/--review N --approval F` | `grant` | 只增不减 |
+| `hold <deliverable或batch>... --approval F` / `unhold ...` | `hold` / `unhold` | 只暂停这一部分；`plan.holds` 列表，runnable 跳过 |
+| `supersede <WO-n> --reason R --approval F` | `supersede` | 用户作废开立中的工单；依赖方视为已满足 |
+
+- 新增或改写交付目标仍由技术负责人起草计划修订（`revise`），前端不得运行 `init`/`revise`。
+- 上下文修正：上一轮的工具或模型与本次派发不同时开新会话（不跨后端续接）。
+- 账号切换：`front.py launch --account-switch <绝对路径>`（可重复）；白名单只放行该路径加 `-k`、`-n` 和至多一个目标账号（沿用 v1 `account_switch.py` 的规则）。
+- 前端白名单：调整命令的 `--approval` 必须位于 `<base>/answers/`。
