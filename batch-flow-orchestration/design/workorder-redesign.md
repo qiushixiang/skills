@@ -39,7 +39,7 @@
 | ID | 不变式 |
 |---|---|
 | I1 | 状态只经管理脚本写入；排他锁、CAS、请求幂等、原子替换 |
-| I2 | 预算只按策略消耗，不重置、不因重建增加；增加须用户批准 |
+| I2 | 预算按稳定归属汇总全部工单的消耗，不重置、不因换单或换契约增加；增加须用户批准 |
 | I3 | 实施阶梯：主执行轮次用尽 → 备用一次 → 负责人兜底（用户 2026-11-07 裁定） |
 | I4 | 审阅独立：工单作者的上下文不得审该工单的交付 |
 | I5 | 交付成功须引用存在且哈希完好的证据，并绑定固定版本 |
@@ -77,7 +77,9 @@ design:      {path, sha256}
 revision:    计划修订号
 ```
 
-交付目标取代现行“任务”：只描述要交付什么、如何验收、依赖谁。审阅、放行不再是计划里的独立任务，而是由规则自动开立的工单（§5.3）。
+交付目标取代现行“任务”：只描述要交付什么、如何验收、依赖谁。审阅节点仍在计划的 review_groups 中设计，审阅、返修、放行的具体执行由脚本自动开立工单（§5.3）。
+
+每个交付目标的 contract_version 由脚本维护。实质修订使受影响目标及其下游获得新契约版本；实施/返修单绑定该版本，审阅绑定组定义及成员契约版本。历史交付不改写，新契约重新实施和审阅，预算继续累计。运行中的受影响工单必须先回收，再修订。
 
 ### 4.2 orders.json 中的工单
 
@@ -147,7 +149,7 @@ revision:    计划修订号
 
 ### 6.1 方案
 
-`bf run` 是一个普通进程，循环执行：读状态 → 选出可派发工单 → 渲染卡片 → 经 agent_cli 启动角色 CLI → 等待 → 回收、门禁、登记 → 按路由开立后续工单。没有可派发工单时：若有 ask_user 则通知用户并等待；若全部完成则退出。
+`bf run` 是一个普通进程，循环执行：读状态 → 选出可派发工单 → 渲染卡片 → 经 agent_cli 启动角色 CLI → 等待 → 回收、门禁、登记 → 按路由开立后续工单。没有可派发或在途工作时退出，包括等待用户时。前端在回答、恢复及运维调整后统一运行 ensure-run，按上次显式 run 配置在必要时后台重启；它不会解除用户 stop。驱动器持有生命周期排他锁，只有一个实例能派发。
 
 - 所有角色都经 CLI 适配器调用（codex、claude -p、opencode、agy），模型与额度由 plan.roles 指定。
 - 并发：同一交付目标同时只有一张工单在运行；哪些目标可以并行在计划阶段确定（§6.4），运行时 `bf run --parallel N` 决定是否使用，默认 1。
@@ -166,9 +168,11 @@ revision:    计划修订号
 2. 每 10 分钟（及用户询问时）汇报进展：运行 `bf report` 取结构化摘要（在途工单、各运行耗时与最后动作、新完成/新开立的工单、ask_user、额度余量），再用自然语言转述；
 3. 转交用户回答：用户口述的决定由前端写成原话文件，经 `bf answer` 登记。
 
-前端不选择、不派发、不回收工单，也不读写状态文件；它只能运行 bf 的查询与上述三类命令。因为调度不在它手里，旧版为约束编排者而设的 guard、stop hook 门禁、角色审计都不再需要；前端只保留“命令白名单”这一项限制。驱动器不依赖前端：前端会话结束或上下文压缩，`bf run` 照常推进。
+回答、恢复与能解除阻塞的调整后，前端运行 `bf ensure-run`，避免只改状态而未恢复驱动器。首次运行仍显式 `bf run`。
 
 前端支持 Claude、Codex、agy、OpenCode V2，共用白名单与运维职责，用 `bf run --background` 独立启动驱动器。宿主只适配交互启动、工具门禁和通知：Claude 使用原生 Monitor/CronCreate；Codex/agy 由启动器将事件与定时报告写入 notifications.log，不唤醒闲置模型。OpenCode 使用 mini 私有服务和原生插件，插件定时只读查询 report/watch，经会话 API 主动请求汇报，忙时合并、排队并限制重试，不向 TUI 终端直接插入文字；通知不是用户授权。插件仅由本次启动器环境加载，并在派生终端环境中清除前端叠加配置，防止影响执行角色。具体配置与信任要求见 references/operations.md。
+
+前端不选择、不派发、不回收工单，也不读写状态文件；它只能运行 bf 的查询与上述三类命令。因为调度不在它手里，旧版为约束编排者而设的 guard、stop hook 门禁、角色审计都不再需要；前端只保留“命令白名单”这一项限制。驱动器不依赖前端：前端会话结束或上下文压缩，`bf run` 照常推进。
 
 角色仍全部经 CLI 调用；失去的是宿主原生子代理（Claude Agent 工具、AGY 原生子代理），Claude 角色经 `claude -p` 使用同一订阅。
 
@@ -196,8 +200,10 @@ revision:    计划修订号
 
 规则：
 - 处置在 envelope 内（不加额度、不改验收与范围）→ 脚本直接执行，decide 完成，任务继续推进。
-- 含 plan_revision、grant 或超出 envelope → 自动开立 ask_user，用户批准后执行（I6）。
-- decide 自身用尽负责人额度或处置无效 → ask_user。
+- grant、实质计划变更或超出 envelope → 自动开立 ask_user，用户批准后执行（I6）；包络内技术指令调整经 within_authorization 的保守结构检查后直接修订。
+- decide 自身重试用尽或连续无进展 → ops 暂停和报告，不自动产生用户待办。技术暂时无法恢复用 blocked；只有六类新增用户决定才 ask_user。
+
+decide 合法交付表示处置方案已登记，不表示前置处置已完成。其 open 动作默认成为被裁决工单的前置依赖；原工单等处置与必要用户批准完成后恢复。门禁拒绝反向依赖原工单形成的等待环。作废有依赖方的工单一律转用户，不因依赖方是审阅或放行而豁免。
 
 由此删除：signal 的多种类型与 decision_points、恢复条件（requirements）与 confirm/close 双步、clarification、repin、supersede_decision、confirmation_waits、classify_attempt / resume_attempt 的独立操作、用户离开模式（自主推进是默认，envelope 即授权边界）。
 
@@ -209,10 +215,12 @@ revision:    计划修订号
 |---|---|---|
 | implement | primary（rounds.implement）→ backup（1）→ lead（1） | 按交付目标计 |
 | repair | primary 新会话（rounds.repair）→ backup → lead；“方案级”阻断项直接 lead | 按 review 周期计，不继承 implement 已升阶段 |
-| review | reviewer；第三方按 policy | rounds.review |
-| decide / triage | lead | 不计技术轮次；同一触发源重复 decide 有上限（默认 2），超出 → ask_user |
+| review | reviewer；第三方按 policy | 按审阅组累计 rounds.review，重开不重置 |
+| decide / triage | lead | 不计技术轮次；每单 coordination_attempts（默认 2）；同一问题在相同相关状态下重复 decide 有上限（默认 2），超出 → ops 暂停并报告 |
 
-额度用尽的唯一出口是 decide；decide 的唯一升级出口是 ask_user。
+技术额度用尽先交 decide；负责人诊断后只有新增用户决定才 ask_user，其他不可恢复问题保留阻塞并报告。具体以 references/user-decisions.md 六类边界为准。
+
+实施按交付目标、返修按审阅周期与目标汇总所有相关工单的 runs（含已作废工单）。额度不在新单上重新发放；剩余额度与修订校验使用同一归属计算。审阅组可经用户批准 grant review 轮次。
 
 ## 9. 上下文策略（一等设计）
 
@@ -230,7 +238,7 @@ revision:    计划修订号
 | triage | 新会话 |
 | 跨批次 | 新会话 |
 
-每次派发在 run 里记录 `session` 与选择理由（规则编号），便于事后分析上下文切换是否合适。
+每次派发在 run 里记录 `session` 与选择理由（规则编号），便于事后分析上下文切换是否合适。300 KB 阈值按同一会话全部调用的输出记录大小累计估算，含同一 run 的续作，不只看最后一次调用。新上下文同时获得完整指令、已批准约束、来源交付、版本和证据引用；不复制完整对话。
 
 ## 10. 卡片、交付与门禁
 
@@ -459,11 +467,17 @@ scripts/agent_cli.py      保留（CLI 适配器，已验证的宿主细节）
 来源：S16 复盘与 `design/v1-rules-audit.md` 的 10 条机械检查。机制由技能提供；**受保护清单、提交节奏、仓库列表等内容由技术负责人在计划中定义**。
 
 1. **自动快照**：`plan.repos`（绝对路径列表）存在时，`start` 记录各仓库脏文件及其哈希作基线；登记交付时算出本次运行改动的文件（不含运行前已脏且未变的文件），自动 `snapshot`，写入 `run.changed {repo: [相对路径]}` 与 `run.version`（快照记录路径）。审阅卡片列出被审交付目标最近一次实施/返修的快照；审阅的“固定版本”行必须包含这些快照路径。
-2. **受保护路径**：`plan.protected`（相对仓库根的 glob）。运行改动命中受保护路径而工单 `input.allow_protected` 未覆盖 → 交付不合法，直接按 FAILED 登记（不续跑），开 decide（trigger `protected_change`，附路径与快照）。decide 的 `open` 动作带 `allow_protected` 视为超出授权包络 → 问用户，批准后写入新工单。审阅运行改动 `records/` 以外的任何文件 → 同样处理（trigger `review_modified`）。有 `plan.repos` 时审阅以可写模式运行（为写 record），否则只读。
+2. **受保护路径**：`plan.protected`（相对仓库根的 glob）。运行改动命中受保护路径而工单 `input.allow_protected` 未覆盖 → 交付不合法，直接按 FAILED 登记（不续跑），开 decide（trigger `protected_change`，附路径与快照）。decide 的 `open` 动作带 `allow_protected` 视为超出授权包络 → 问用户，批准后写入新工单。审阅运行改动源码仓库 → 同样处理（trigger `review_modified`），完整改动与快照保留。技能不按项目日志路径豁免仓库变化；验证方案及副作用边界归批次设计与设计审阅。有 `plan.repos` 时审阅以可写模式运行（为写 record），否则只读。
 3. **计划校验**：每个交付目标至少属于一个审阅组，或写 `no_review: <理由>`；`instruction`、`acceptance` 非空；有 `plan.design` 时设计文件必须存在，记录 `sha256` 与每个 `design_ref` 所指章节（以标题行匹配，至下一个同级或更高级标题为止）的哈希，`design_ref` 必须存在；`rounds.review < 1 + 返修链长度` 时在 `plan.warnings` 中提示。
 4. **设计漂移**：`design_ref` 所指章节哈希变化 → 该章节的交付目标暂停派发；`check_design`（驱动器每次派发前调用）为漂移开一张 decide（trigger `design_drift`，列出受影响交付目标）。负责人处置：`refresh_design`（措辞调整，重钉哈希，授权包络内）或 `plan_revision`（实质变化，问用户）。
-5. **审阅完整性**：某审阅组已 RELEASE 后，组内交付目标又开立实施或返修 → 为该组新开审阅，批次放行等待它（第三方组同理）。decide 的 `supersede` 指向审阅、放行或有依赖方的工单 → 问用户。审阅 RELEASE 须至少引用一份本次运行内生成、退出码 0 的 record，否则须写“未复跑原因”。审阅的“非阻断建议”逐条进入本批分诊。
+5. **审阅完整性**：所有后续实施与返修统一联入覆盖该目标的每个审阅组；已 RELEASE 的组重新开审阅，相关放行恢复等待（第三方及跨批组同理）。已有历史结论保留，不能代替当前工作通过。自动版本快照与验证记录统一登记哈希，变更后阻断依赖方及放行。decide 的 `supersede` 指向审阅、放行或有依赖方的工单 → 问用户。审阅 RELEASE 须至少引用一份本次运行内生成、退出码 0 的 record，否则须写“未复跑原因”。审阅的“非阻断建议”逐条进入本批分诊。
 6. **证据时效**：实施/返修 VERIFIED 与审阅 RELEASE 须至少引用一份本次运行开始之后（允许 2 秒时钟粒度）生成、退出码 0 的 record。
+
+## 26. 自主推进修复（2026-11-08）
+
+以 test_bf_autonomy.py 为回归规格：协调与技术额度分离；保护路径需求派发前检查；原单 authorize；整组处置批准、重新校验和结果门禁；纯文字答复回协调；裁决不能以 ARCH 或空动作跳过处置；重复裁决按问题及相关进展判定；历史误记通过 reconcile 审计冲正，保留原运行且不自动启动项目。计划 envelope.protected 可预授目标限定路径权限，required_protected 只声明需求。所有权限仍受设计内容边界及独立审阅约束。
+
+本节更新 §24.2 的原单授权流程：authorize 给原单补登记精确权限，open.allow_protected 给新单登记；超出计划预授权则整包问用户，批准后一起落实。§7 的环境免扣仍适用；另增基于工具事件的纯只读诊断免扣，不把“无源码改动”单独作为免扣依据。
 
 ## 25. 卡片链接角色规范（以 `scripts/test_bf_cards.py` 为准）
 

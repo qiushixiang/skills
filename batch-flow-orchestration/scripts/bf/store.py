@@ -114,6 +114,22 @@ def _find_request(base, request_id):
     return None
 
 
+def _write_attention(state):
+    """Derived view of current open questions; callers hold the store lock."""
+    asks = [o for o in state.orders.values() if o['type'] == 'ask_user' and o['state'] == 'open']
+    text = ('# 需要用户回答\n\n' + ''.join('- %s（%s）：%s\n' %
+            (o['id'], o['target'] or '-', o['input'].get('question', '').replace('\n', '\n  ')) for o in asks)) if asks else ''
+    path = state.base / 'attention.md'
+    if (path.read_text(encoding='utf-8') if path.exists() else '') != text:
+        _atomic_write(path, text.encode('utf-8'))
+
+
+def refresh_attention(base):
+    """Refresh a derived report without changing state, revisions, budgets or driver status."""
+    with _locked(base):
+        _write_attention(_read(base))
+
+
 def transact(base, op, actor, fn, expected_revision=None, request_id=None, init=False):
     """Run fn(state) under the exclusive lock and commit it as exactly one revision and one event line."""
     base = Path(base)
@@ -122,6 +138,7 @@ def transact(base, op, actor, fn, expected_revision=None, request_id=None, init=
         if request_id:
             prior = _find_request(base, request_id)
             if prior is not None:
+                _write_attention(_read(base))
                 return prior.get('result')
         if init:
             need(not (base / 'plan.json').exists(), 'already initialised: %s' % base)
@@ -146,4 +163,5 @@ def transact(base, op, actor, fn, expected_revision=None, request_id=None, init=
             f.write((json.dumps(event, ensure_ascii=False) + '\n').encode('utf-8'))
             f.flush()
             os.fsync(f.fileno())
+        _write_attention(state)
         return result

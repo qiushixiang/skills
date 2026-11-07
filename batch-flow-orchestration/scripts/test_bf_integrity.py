@@ -168,6 +168,82 @@ class Snapshots(Base):  # §24.1
 
 
 class Protected(Base):  # §24.2
+    def prepare_review(self, protected=None):
+        p = self.plan()
+        if protected:
+            p['protected'] += protected
+        self.init(p)
+        for d in ('D1', 'D2'):
+            self.run_order(self.one('implement', d)['id'], self.done())
+        return self.one('review', 'R12')['id']
+
+    def test_generated_logs_in_source_repo_require_disposition(self):
+        oid = self.prepare_review()
+        def preflight():
+            logs = self.repo/'tests/logs'
+            (logs/'preflight-1').mkdir(parents=True)
+            (logs/'preflight-1/output.txt').write_text('PASS')
+            (logs/'latest').symlink_to('preflight-1')
+        text = lambda: ('结果：FIX_REQUIRED\n复跑与证据：%s\n'
+                        '阻断：B1 | 返修:D1 | 方案级:否 | 关闭条件:使用 bf record\n' % self.ev())
+        out = self.run_order(oid, text, edit=preflight)
+        self.assertFalse(out['legal'], out)
+        self.assertEqual(self.one('decide', 'R12')['input']['trigger'], 'review_modified')
+        run = self.st().orders[oid]['runs'][-1]
+        self.assertIn('tests/logs/latest', run['changed'][str(self.repo)])
+        self.assertTrue(run['snapshot'])
+        self.assertFalse(api.orders(self.st(), type='repair', target='D1'))
+
+    def test_run_artifacts_outside_source_repo_preserve_review_findings(self):
+        oid = self.prepare_review()
+        def preflight():
+            runtime = self.base/'records/run-artifacts'
+            runtime.mkdir()
+            (runtime/'output.txt').write_text('PASS')
+        text = lambda: ('结果：FIX_REQUIRED\n复跑与证据：%s\n'
+                        '阻断：B1 | 返修:D1 | 方案级:否 | 关闭条件:修正镜像身份\n' % self.ev())
+        out = self.run_order(oid, text, edit=preflight)
+        self.assertTrue(out['legal'], out)
+        self.assertEqual(self.one('repair','D1')['input']['findings'][0]['closure'],'修正镜像身份')
+        self.assertEqual(self.st().orders[oid]['runs'][-1]['changed'], {})
+
+    def test_log_and_source_changes_both_block_review(self):
+        oid = self.prepare_review()
+        def edit():
+            (self.repo/'tests/output.txt').write_text('log')
+            (self.repo/'app.c').write_text('changed')
+        out = self.run_order(oid, self.release_text(), edit=edit)
+        self.assertFalse(out['legal'])
+        self.assertIn('app.c', out['reason'])
+        self.assertIn('tests/output.txt', out['reason'])
+
+    def test_tracked_and_protected_files_are_checked_regardless_of_log_names(self):
+        (self.repo/'tests/logs').mkdir()
+        (self.repo/'tests/logs/tracked.txt').write_text('original')
+        git(self.repo, 'add', '.')
+        git(self.repo, 'commit', '-qm', 'tracked log')
+        oid = self.prepare_review(['tests/logs/protected.txt'])
+        def edit():
+            (self.repo/'tests/logs/tracked.txt').write_text('modified')
+            (self.repo/'tests/logs/protected.txt').write_text('modified')
+        out = self.run_order(oid, self.release_text(), edit=edit)
+        self.assertFalse(out['legal'])
+        self.assertIn('tests/logs/tracked.txt', out['reason'])
+        self.assertIn('tests/logs/protected.txt', out['reason'])
+
+    def test_committing_deletion_of_tracked_log_is_still_a_review_change(self):
+        (self.repo/'tests/logs').mkdir()
+        (self.repo/'tests/logs/tracked.txt').write_text('original')
+        git(self.repo, 'add', '.')
+        git(self.repo, 'commit', '-qm', 'tracked log')
+        oid = self.prepare_review()
+        def edit():
+            git(self.repo, 'rm', 'tests/logs/tracked.txt')
+            git(self.repo, 'commit', '-qm', 'delete log')
+        out = self.run_order(oid, self.release_text(), edit=edit)
+        self.assertFalse(out['legal'])
+        self.assertIn('tests/logs/tracked.txt', out['reason'])
+
     def test_touching_a_protected_path_is_refused_and_goes_to_lead(self):
         self.init()
         oid = self.one('implement', 'D1')['id']

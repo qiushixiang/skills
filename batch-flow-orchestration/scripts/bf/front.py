@@ -23,6 +23,7 @@ ADJUST = {
 }
 ADJUST['retry'] = ADJUST['escalate'] = {'pos': 'one', 'flags': {'--note': 1}, 'need': ('--note',), 'order': True}
 ADJUST['snapshot'] = {'pos': None, 'flags': {'--repo': 1, '--paths': -1}, 'need': ('--repo', '--paths')}
+ADJUST['reconcile'] = {'pos': None, 'flags': {'--file': 1, '--approval': 1, '--dry-run': 0}, 'need': ('--file', '--approval')}
 FLAGS = {'doctor': {}, 'watch': {'--since': 1, '--once': 0}, 'stop': {'--now': 0}, 'report': {'--text': 0}, 'run': {'--background': 0, '--parallel': 1, '--profile': 1}, 'answer': {'--file': 1, '--approve': 0, '--reject': 0}}
 SHELL_META = r'[;&|<>`$()\n\\]'
 SWITCH_FLAGS = ('-k', '-n')
@@ -78,6 +79,8 @@ def _adjust_allowed(spec, base, rest):
     if not all(f in values for f in spec['need']) or (spec.get('any') and not any(f in values for f in spec['any'])):
         return False
     if '--approval' in values and not _inside(values['--approval'][0], os.path.join(base, 'answers')):
+        return False
+    if '--file' in values and not _inside(values['--file'][0], os.path.join(base, 'answers')):
         return False
     return True
 
@@ -225,6 +228,7 @@ def prompt(base, account_switch=(), backend='claude', runtime=None):
                  '不要调用 Claude 专有的 Monitor/CronCreate。用户询问时也运行 CLI report --text。')
     lines = [
         '你是 batch-flow v2 的运维与沟通角色（聊天前端）。脚本负责派发、交付判定与额度；技术负责人负责技术判断；你负责运维、汇报和转达用户的决定。',
+        '用户问题只允许六类新增决定；report.ops 是受阻待处理，不是用户确认。次数用尽、工具故障或技术暂时无解只报告，不追加“是否继续”的问题。边界见 %s。' % (Path(__file__).resolve().parents[2] / 'references/user-decisions.md'),
         '下文 CLI 指：%s' % cli,
         '职责：',
         '1. 启动、停止、查看驱动器：CLI run --background 后台启动并立即返回；按 plan.env.require_host 要求使用宿主执行并保留原有权限审批。CLI stop / CLI resume（stop 阻止新派发与续跑，在途调用自行结束；用户说“立刻停”“全部停掉”时用 CLI stop --now，终止在途调用，登记为免扣无效）；CLI status。',
@@ -239,8 +243,9 @@ def prompt(base, account_switch=(), backend='claude', runtime=None):
         '4. 转达用户的回答与调整，全部带用户原话文件 --approval %s/answers/<n>.txt：' % base,
         '   - 回答问题：CLI answer WO-n --file %s/answers/<n>.txt --approve|--reject；' % base,
         '   - 换模型：CLI models <后端>；CLI set-role <角色> --backend <后端> --name \'<用户的说法>\' [--effort E] --approval F（角色：executor backup_executor lead reviewer third_party）；多个候选或未找到时把候选展示给用户，绝不自己挑；',
-        '   - CLI envelope --add|--remove <批次>... --approval F；CLI grant <交付目标> --implement|--backup|--lead|--repair|--review N --approval F（只增不减）；CLI hold|unhold <交付目标或批次>... --approval F；CLI supersede WO-n --reason R --approval F。',
-        '   用户用自然语言提出调整时，先复述成确切命令请用户确认；确认后把用户的话原样写入新文件 %s/answers/<n>.txt（不改写），再运行命令。' % base,
+        '   - CLI envelope --add|--remove <批次>... --approval F；CLI grant <交付目标> --implement|--backup|--lead|--repair|--review N --approval F（审阅组只用 --review，只增不减）；CLI hold|unhold <交付目标或批次>... --approval F；CLI supersede WO-n --reason R --approval F。',
+        '   - 已获批准的历史登记修复用 CLI reconcile --file answers/清单.json --approval answers/原话.txt，先加 --dry-run 核对；不改写历史运行、不启动项目编排。详情见 operations.md。',
+        '   用户已明确提出或批准的调整，直接把原话保存到新文件 %s/answers/<n>.txt 后执行并复述结果，不重复请示同一授权。只有缺少不可替代的信息或真实新增授权边界才请求决定。' % base,
         '边界：不改代码或状态文件，不运行构建或测试，不做技术判断；新增或改写交付目标、验收、依赖是计划修订，由技术负责人起草，你不运行 init/revise。可以读取任何文件和运行只读命令（ls cat head tail grep rg wc find、git -C <目录> log status diff show）。被拦截时不要换方式绕过，向用户报告。',
         '汇报写法：按批次与标题描述工作（如“S15「旧帧不发布」实施”），不要单独抛工单号，不罗列已完成项，只说正在做、下一步、需要用户决定的事和风险；简短。']
     for p in account_switch:

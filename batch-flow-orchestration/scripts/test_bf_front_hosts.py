@@ -11,7 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bf import api, front, front_hosts
 from test_bf_front import Base
-FAKE_CLI = '\nimport json, sys\nfrom pathlib import Path\nsys.path.insert(0, SCRIPTS)\nfrom bf import api, evidence\na = sys.argv[1:]\ndef opt(n):\n    return a[a.index(n)+1] if n in a else None\nif a[0] == \'probe\':\n    Path(opt(\'--profile\')).write_text(\'{}\')\nelif a[0] == \'run\':\n    rd = Path(opt(\'--run-dir\')); rd.mkdir()\n    base = rd.parents[3]\n    order = api.load(base).orders[opt(\'--task\')]\n    kind = order[\'type\']\n    if kind == \'implement\' and order[\'target\'] == \'D1\' and len(order[\'runs\']) == 1:\n        text = \'结果：ARCH_DECISION_REQUIRED\\n停止原因：待裁决\\n上升问题：需批准继续\'\n    elif kind == \'decide\':\n        actions = ([{\'retry\':order[\'input\'][\'subject\']}] if order[\'input\'][\'trigger\'] == \'user_answer\'\n                   else [{\'ask_user\':\'选择测试设备?\'}])\n        (rd.parent/\'decision.json\').write_text(json.dumps({\'diagnosis\':\'环境已核实，按答复处置\', \'actions\':actions}))\n        text = \'结果：VERIFIED\\n停止原因：完成\'\n    else:\n        record, code = evidence.record(base, [sys.executable, \'-c\', \'print("actual validation")\'])\n        text = (\'结果：RELEASE\\n复跑与证据：\' if kind == \'review\' else \'结果：VERIFIED\\n停止原因：完成\\n验证证据：\') + record[\'evidence\']\n    (rd/\'response\').write_text(text)\n    (rd/\'stdout\').write_text(\'\')\n    (rd/\'exit.json\').write_text(\'{"returncode":0}\')\nelse:\n    rd = Path(opt(\'--run-dir\'))\n    print(json.dumps({\'usable\':True, \'conversation_id\': str(rd.parent.name), \'response\':(rd/\'response\').read_text()}))\n'
+from test_bf_workflow import FAKE_CLI
 
 HERE = Path(__file__).resolve().parent
 

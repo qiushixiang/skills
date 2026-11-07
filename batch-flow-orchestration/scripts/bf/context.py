@@ -21,7 +21,7 @@ def author_sessions(state, order):
                and o['target'] in targets for r in o['runs'] if r.get('session'))
 
 
-def _last_session(runs, kb, cfg):
+def _last_session(runs, kb, cfg, samples=None):
     """(session, rule-if-unusable) of the latest finished run."""
     if not runs:
         return None, 'first'
@@ -30,7 +30,9 @@ def _last_session(runs, kb, cfg):
         return None, 'no-session'
     if cfg and (last['tool'], last['model']) != (cfg['tool'], cfg['model']):
         return None, 'tool-change'
-    if (last.get('session_kb') or 0) > kb:
+    size = sum(r.get('session_kb') or 0 for r in (samples if samples is not None else runs)
+               if r.get('session') == last['session'])
+    if size > kb:
         return None, 'size-limit'
     return last['session'], None
 
@@ -39,6 +41,7 @@ def session_for(state, order, stage, cfg=None):
     t = order['type']
     kb = state.plan['policy']['context']['max_session_kb']
     runs = [r for r in order['runs'] if r['ended'] and r['result'] != 'INVALID']
+    samples = [r for o in state.orders.values() for r in o['runs'] if r['ended'] and r['result'] != 'INVALID']
     if order.get('fresh_next'):
         return _fresh('fresh-requested')
     if t == 'implement':
@@ -48,18 +51,18 @@ def session_for(state, order, stage, cfg=None):
             return _fresh('stage-change')
         if runs[-1].get('env_rejected'):
             return _fresh('env-misjudged')
-        cid, why = _last_session(runs, kb, cfg)
+        cid, why = _last_session(runs, kb, cfg, samples)
         return _resume(cid, 'implement-continue') if cid else _fresh(why)
     if t == 'review':
-        cid, why = _last_session(runs, kb, cfg)
+        cid, why = _last_session(runs, kb, cfg, samples)
         if cid and cid in author_sessions(state, order):
             return _fresh('review-author-session')
         return _resume(cid, 'review-resume') if cid else _fresh('review-first' if why == 'first' else why)
     if t == 'decide':
-        prior = [o for o in state.orders.values() if o['type'] == 'decide' and o['target'] == order['target']
-                 and o['id'] != order['id']]
+        prior = [o for o in state.orders.values() if o['type'] == 'decide' and o['target'] == order['target']]
         finished = [r for o in prior for r in o['runs'] if r['ended'] and r['result'] != 'INVALID']
-        cid, why = _last_session(finished, kb, cfg)
+        finished.sort(key=lambda r: r.get('ended_ts', r['started_ts']))
+        cid, why = _last_session(finished, kb, cfg, samples)
         if cid and cid in author_sessions(state, order):
             return _fresh('decide-author-session')
         return _resume(cid, 'decide-resume') if cid else _fresh('decide-first' if why == 'first' else why)

@@ -85,9 +85,10 @@ def grant(base, target, approval, **rounds):
     asked = dict((k, v) for k, v in rounds.items() if v is not None)
 
     def fn(st):
-        need(target in st.plan['deliverables'], 'unknown deliverable %s' % target)
+        need(target in st.plan['deliverables'] or target in st.plan['review_groups'], 'unknown target %s' % target)
         need(asked and all(k in ROUND_KEYS and isinstance(v, int) and v > 0 for k, v in asked.items()),
              'grant needs positive integer rounds for: %s' % ', '.join(ROUND_KEYS))
+        need(target not in st.plan['review_groups'] or set(asked) == {'review'}, 'review group grants only accept review rounds')
         ov = st.plan['policy']['overrides'].setdefault(target, {})
         for k, v in asked.items():
             ov[k] = policy.rounds(st.plan, target, k) + v

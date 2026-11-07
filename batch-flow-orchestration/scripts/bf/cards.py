@@ -3,7 +3,7 @@ import json
 import os
 import sys
 
-from . import model, routing
+from . import model, routing, permissions
 
 STOP_RULES = ('停止原因规则：完成=结果 VERIFIED 并引用 records/ 下存在的证据；范围内仍有可试路径=未完成；'
               '技术不可行=FAILED 且上升问题写明已试方案；外部阻塞=WAIT_EVIDENCE，仅当直接调用受控入口出现环境失败。')
@@ -13,6 +13,7 @@ EXECUTOR = ['结果：VERIFIED | FAILED | ARCH_DECISION_REQUIRED | WAIT_EVIDENCE
             '停止原因：完成 | 未完成 | 技术不可行 | 待裁决 | 外部阻塞',
             '改动与版本：<提交或快照>', '验证证据：<records/ 下证据文件的绝对路径>', '未运行/失败：...',
             '上升问题：...（没有写“无”）', '候选新项：（可选，下接逐行“- ”）', '限制：...']
+EXECUTOR.insert(-2, '问题标识：<待裁决时可选；同一问题保持稳定，例如 permission:tests/runner.sh；更换标识不绕过总无进展上限>')
 REVIEWER = ['结果：RELEASE | FIX_REQUIRED', '固定版本：<被审版本>', '复跑与证据：<records/ 下证据文件的绝对路径>', '未复跑原因：（沿用执行者记录而未亲自复跑时必填）',
             '阻断：B1 | 返修:<交付目标> | 方案级:是/否 | 关闭条件:...（FIX_REQUIRED 时每项一行）',
             '非阻断建议：...', '候选新项：（可选）']
@@ -31,9 +32,13 @@ SCHEMA = (
     '- {"supersede": "WO-n", "reason": "..."}  作废工单；对象是审阅、放行或有依赖方的工单 → 转用户\n'
     '- {"retry": "WO-n", "reason": "...", "fresh_session": false}  重新开放失败/开立中的工单\n'
     '- {"grant": {"<目标>": {"implement": 1}}}  追加额度 → 转用户\n'
-    '- {"plan_revision": "<草案路径>"}  修订计划 → 转用户\n'
-    '- {"ask_user": "<问题>", "options": [...]}  向用户提问\n'
+    '- {"authorize": "WO-n", "paths": ["<精确仓库相对路径>"]}  给原实施/返修单登记限定权限；超出现有授权 → 转用户\n'
+    '- {"plan_revision": "<草案路径>", "within_authorization": true}  负责人声明包络内技术调整并经结构核对后直接执行；实质改变承诺时省略该标记，转用户\n'
+    '- {"ask_user": "<问题>", "user_request": {"category": "commitment|authority|budget|risk|information|checkpoint", '
+    '"decision": "<需要用户决定什么>", "recommendation": "<推荐方案>", "impact": "<代价及不决定的影响>"}, "options": [...]}  只问六类新增用户决定，不能只问继续吗\n'
+    '- {"blocked": "WO-n", "reason": "<技术阻塞原因>", "missing": "<最小缺项>"}  保留阻塞并报告，不生成用户待办\n'
     '- {"refresh_design": true}  设计文档措辞调整、方案不变时重新固定章节哈希（design_drift 触发用）\n'
+    'open 默认成为被裁决工单的前置处置，完成后原工单才恢复；不得反向依赖原工单。新单不增加额度。\n'
     '其余动作在授权包络内由脚本直接执行。')
 
 
@@ -49,11 +54,36 @@ def _lines(xs):
 
 
 def _last_done(state, deliverable):
-    for o in reversed([o for o in state.orders.values() if o['type'] in ('implement', 'repair') and o['target'] == deliverable]):
-        for r in reversed(o['runs']):
-            if r['ended'] and r['result'] == 'VERIFIED':
-                return r
-    return None
+    runs = [r for o in routing.work_for(state, deliverable) for r in o['runs']
+            if r['ended'] and r['result'] == 'VERIFIED']
+    return max(runs, key=lambda r: r.get('ended_ts', r['started_ts'])) if runs else None
+
+
+def _handoff(state, o):
+    """Bounded artifact hand-off, never author conversations or other reviewers' verdicts."""
+    out = []
+    if o['type'] == 'review':
+        return ''
+    ref = state.orders.get(o['origin'].get('ref'))
+    for d in model.deliverables_of(state.plan, o['target']):
+        instruction = state.plan['deliverables'][d]['instruction']
+        if o['type'] == 'implement' and o['origin'].get('by') == 'plan':
+            continue  # The body already renders the current plan, not its old cached input.
+        if instruction not in (o['input'].get('instruction'), (ref or {}).get('input', {}).get('instruction')):
+            out.append('当前完整指令 %s：%s' % (d, instruction))
+    if ref:
+        out.append('来源工单 %s 输入：%s' % (ref['id'], json.dumps(ref['input'], ensure_ascii=False)))
+        out.append('来源约束：%s' % _constraints(state, ref))
+        subject = state.orders.get(ref['input'].get('subject')) if ref['type'] == 'decide' else None
+        if subject:
+            out.append('被裁决工单的已批准约束：%s' % _constraints(state, subject))
+        if ref['output']:
+            out.append('来源结论：%s' % json.dumps(ref['output'], ensure_ascii=False))
+        last = next((r for r in reversed(ref['runs']) if r['ended']), None)
+        if last:
+            out.append('来源最近交付：%s' % (last.get('delivery') or last['stop_reason']))
+            out.append('来源版本与证据：%s；%s' % (last.get('version') or '无', '、'.join(last['evidence']) or '无'))
+    return '\n'.join(out)
 
 
 def _goal(state, o):
@@ -86,12 +116,30 @@ def _environment(state, assignment, run_dir):
 
 def _constraints(state, o):
     out = list(o['input'].get('constraints') or []) + list(o['input'].get('answers') or [])
+    out.append('当前生效的受保护路径权限（历史诊断不代表当前状态）：%s' %
+               json.dumps(permissions.allowed(state.plan, o), ensure_ascii=False))
+    out.append('权限登记来源：%s' % json.dumps(o['input'].get('authorization_sources', []), ensure_ascii=False))
+    if state.plan['envelope'].get('protected', {}).get(o['target']):
+        out.append('计划预授权来源：%s' % json.dumps(state.plan.get('approval'), ensure_ascii=False))
     for n in o['needs']:
         dep = state.orders.get(n)
         if dep and dep['state'] == 'done' and dep['type'] == 'decide' and dep['output']:
-            out.append('裁决：%s' % (dep['output'].get('decision') or {}).get('diagnosis', ''))
-        if dep and dep['state'] == 'done' and dep['type'] == 'ask_user' and dep['output']:
-            out.append('用户答复：%s' % dep['output']['answer'])
+            out.append('历史裁决（权限以当前登记为准）：%s' % (dep['output'].get('decision') or {}).get('diagnosis', ''))
+    # User authorization crosses causal dependencies even when an intermediate order was retired.
+    # Do not pass author conversations or other reviewers' verdicts through this traversal.
+    seen, todo, answers = set(), list(o['needs']) + [o['origin'].get('ref')], []
+    while todo:
+        n = todo.pop()
+        if n in seen or n not in state.orders:
+            continue
+        seen.add(n)
+        dep = state.orders[n]
+        todo.extend(dep['needs'])
+        todo.append(dep['origin'].get('ref'))
+        if dep['type'] == 'ask_user' and dep['state'] == 'done' and dep['output'] and routing.current_work(state, dep):
+            answers.append(dep)
+    for dep in sorted(answers, key=routing.seqno):
+        out.append('用户答复：[%s / %s] %s' % (dep['id'], dep['target'] or '-', dep['output']['answer']))
     return _lines(out)
 
 
@@ -99,7 +147,8 @@ def _body(state, o, run_dir):
     plan, t, inp = state.plan, o['type'], o['input']
     if t == 'implement':
         spec = plan['deliverables'].get(o['target'], {})
-        out = [inp.get('instruction') or spec.get('instruction', '')]
+        out = [spec.get('instruction', '') if o['origin'].get('by') == 'plan'
+               else inp.get('instruction') or spec.get('instruction', '')]
         if spec.get('design_ref'):
             out.append('设计依据：%s' % spec['design_ref'])
         last = next((r for r in reversed(o['runs']) if r['ended']), None)
@@ -134,8 +183,12 @@ def _body(state, o, run_dir):
     if t == 'decide':
         out = ['触发：%s；对象工单 %s，运行 %s。' % (inp.get('trigger'), inp.get('subject'), inp.get('run')),
                '问题：%s' % (inp.get('issue') or inp.get('answer') or ''), '证据：%s' % (', '.join(inp.get('evidence', [])) or '无')]
+        facts = {k: v for k, v in inp.items() if k != 'subject_input'}
+        out.append('触发事实：%s' % json.dumps(facts, ensure_ascii=False))
+        if not state.orders.get(o['origin'].get('ref')) and inp.get('subject_input'):
+            out.append('来源输入：%s' % json.dumps(inp['subject_input'], ensure_ascii=False))
         out.append('把处置写入 %s/decision.json，格式：%s' % (run_dir or '<运行目录>', SCHEMA))
-        out.append('不加额度、不改验收与范围的处置直接执行；含 grant、plan_revision 或超出授权包络的由脚本转交用户。')
+        out.append('包络内技术处置直接执行；只有六类新增用户决定才提问。次数用尽或暂时无解不是用户问题；用 blocked 保留原因和最小缺项。')
         return '\n'.join(out)
     if t == 'triage':
         out = ['为每个候选项给出去向：merge（须给 target 交付目标）、defer、drop。', '候选项：']
@@ -161,6 +214,9 @@ def render(state, order_id, assignment, run_dir=None):
     o = state.orders[order_id]
     parts = [('目标', _goal(state, o)), ('环境', _environment(state, assignment, run_dir)),
              ('本单', _body(state, o, run_dir)), ('约束', _constraints(state, o)), ('交付', _delivery(o))]
+    handoff = _handoff(state, o)
+    if handoff:
+        parts[2] = ('本单', parts[2][1] + '\n\n交接材料：\n' + handoff)
     if _norms(o):
         parts.insert(4, ('规范', '按下列文件的对应章节工作：\n' + _norms(o)))
     head = '# 工单 %s（%s，%s）' % (o['id'], o['type'], o['target'] or '-')

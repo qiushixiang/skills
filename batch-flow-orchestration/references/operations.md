@@ -59,7 +59,13 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow run [--background
 
 ## 回答问题
 
-`attention.md` 列出待回答的问题。把用户原话写入 `<任务>/.batch-flow/answers/<n>.txt`，然后：
+`attention.md` 是当前开立问题的派生报告，每次状态事务同步刷新，包括停止期间的答复和计划修订；不依赖驱动器运行。前端以 `report.ask_user` 为当前待决依据，不把旧通知或历史对话重复解释为待批准事项。
+
+ask_user 只用于[六类新增用户决定](user-decisions.md)。report.ops 中的技术阻塞、协调次数用尽和工具故障属于“受阻待处理”，不归入“待你决定”，不因驱动器退出而自动改为用户问题。先处理已有授权内的运维和技术处置。
+
+协调单的运维 retry/escalate 在记录具体处理说明后开放新的有界协调尝试；技术预算保持累计。连续无进展路径的显式 retry 会重新交负责人诊断，不直接派实施。不得无实际处置循环调用这些入口；相关权限或预算已变化时仍应核对真实恢复条件。
+
+把用户原话写入 `<任务>/.batch-flow/answers/<n>.txt`，然后：
 
 ```text
 python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow answer WO-0012 --file answers/<n>.txt --approve|--reject
@@ -67,13 +73,14 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow answer WO-0012 --
 
 只有依赖该问题的工单会等待，其余工作照常推进。
 
+拒绝或改变处置方向的答复须交给技术负责人，不因原对象已完成或作废而仅保存文本。脚本新开裁决并阻塞仍在等待原对象的工单，保留原单历史；不从自然语言直接开实施或扩大授权。有效契约内的已回答用户约束沿依赖链进入后续卡片，即使中间单已作废；不会因此传递作者会话或其他审阅者结论。
+
 ## 停止、恢复、重启
 
-- 驱动器没有可派发或在途工作时退出，包括等待用户时。前端在 `answer / resume / retry / escalate / unhold / grant / envelope / set-role / supersede` 成功后统一运行 `ensure-run`：复用上次 `run` 保存的配置，在需要时后台启动；不会解除用户 stop，单实例锁防止重复派发。首次运行仍用 `run`。直接使用 CLI 的用户也应在这些操作后运行 `ensure-run`。
-
 - `stop`：不再派发新工单，已在运行的调用结束后照常回收。`resume` 恢复。
+- 驱动器没有可派发或在途工作时退出，包括等待用户时。前端在 `answer / resume / retry / escalate / unhold / grant / envelope / set-role / supersede` 成功后统一运行 `ensure-run`：复用上次 `run` 保存的配置，在需要时后台启动；不会解除用户 stop，单实例锁防止重复派发。首次运行仍用 `run`。直接使用 CLI 的用户也应在这些操作后运行 `ensure-run`。
 - 驱动器随时可以重启：状态全部在文件里；上次未回收的调用会被接管或登记为无效（免扣）后重派。
-- CLI 工具失败（无结果、认证错误）登记为无效、免扣；同一工单连续失败达到上限会转技术负责人诊断。
+- CLI 工具失败（无结果、认证错误）登记为无效、免扣；同一工单连续失败达到上限标记 ops，由前端运维处理或上升技术负责人。
 - profile 缺失时 `run` 自动 probe（不调用模型），见 [CLI 适配器](cli-adapter.md)。
 
 ## 调整
@@ -81,15 +88,34 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow answer WO-0012 --
 用户随时可以调整，每条都带 `--approval <base>/answers/<n>.txt`（用户原话，一次调整 = 一次修订 + 一条事件）。命令均为 `bf/cli.py --base <任务>/.batch-flow ...`：
 
 - `models <后端>`：只读，查询模型目录；`set-role <角色> --backend B --name '<说法>' [--effort E]`：换角色模型，见 [CLI 适配器](cli-adapter.md)。
-- `envelope --add|--remove <批次>...`：自动推进范围；`grant <交付目标> --implement|--backup|--lead|--repair|--review N`：只增不减。
+- `envelope --add|--remove <批次>...`：自动推进范围；`grant <交付目标> --implement|--backup|--lead|--repair|--review N` 或 `grant <审阅组> --review N`：只增不减。
 - `hold <交付目标或批次>...` / `unhold ...`：只暂停这一部分；`supersede WO-n --reason R`：作废开立中的工单。
 - 新增或改写交付目标属于计划修订，由技术负责人起草（`revise`），聊天前端不运行 `init`/`revise`。
 
 ## 运维（聊天前端）
 
 - `report --text`：给人看的中文进展（正在做、下一步、待你决定、角色、批次），不含工单号；`report` 输出完整 JSON（含 roles、next、batches、ops）。
+- 计划来源的实施卡采用当前计划指令；裁决新开的实施卡保留专用指令，并附当前计划作为上下文。验证副作用触发门禁时，将证据交技术负责人修订批次方案；前端不维护项目路径豁免。
+- 所有入口创建的审阅均等待审阅组覆盖目标的当前实施/返修；校验、开单和派发使用相同依赖。需要实施前设计审阅时，由负责人在计划中建立独立设计交付与设计审阅组。
 - 同一工单连续 CLI 不可用达到 `invalid_retry` 次，工单被标记 `ops` 并暂停（其余照常推进），不再自动开裁决。前端读故障原文后：`retry WO-n --note T`（如切换 codex 账号后重试，免扣额度）、`escalate WO-n --note T`（交技术负责人，trigger `tool_failure`），或告诉用户。
 - 前端可读任何文件、运行只读命令和已配置的账号切换命令；写入只限 `answers/` 下的新文件；不改代码、不做技术判断。
+
+## 修复历史登记（reconcile）
+
+协调调用不占技术轮次；report.recent 的 budget_charge 区分 technical、coordination、exempt、credited。调用记录仍保留。当前有在途工作时禁止迁移。
+
+只有已获用户授权的历史修复才使用：
+
+```text
+bf/cli.py --base <任务>/.batch-flow reconcile --file <base>/answers/repair.json --approval <base>/answers/user.txt --dry-run
+bf/cli.py --base <任务>/.batch-flow reconcile --file <base>/answers/repair.json --approval <base>/answers/user.txt
+```
+
+清单包含 revision（当前状态修订）、order、paths（精确路径）、prior_approvals（已批准同目标问题）、credits（每项 run 与 reason）、resolve_asks（原单的空动作升级问题）。原话文件须包含用户对本次修复的授权，操作人核对先前批准确实覆盖这些路径和内容，不能从 approve=true 猜测任意路径授权。
+
+脚本同时检查当前契约、已有批准、运行证据完整性、冲正轮次没有源码变化或受控入口执行、修复后权限和执行余额均成立。原运行不改写，冲正另存 budget_credits；清单和批准记录哈希，精确重复请求幂等，dry-run 不修改状态。不能用于冲正真实实施或测试、跳过审阅、增加总预算或扩大验收。迁移不会启动任务，也不会解除 stop；技能维护结束不自动恢复项目编排。
+
+新问题不再使用这种迁移方式。计划声明 required_protected，裁决用 authorize 给原单登记权限；关联 grant、retry 与 authorize 整包批准执行。纯文字答复转协调解释，不能充当结构化权限登记。
 
 ## 通知、体检与立即停止
 

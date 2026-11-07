@@ -101,6 +101,7 @@ class Record(Base):  # §23.1 — the public contract used by roles and project 
         card = fake.launches[0]['card']
         self.assertIn('record --cwd', card)
         self.assertIn(str(self.base), card)
+        r.close()
 
 
 class Doctor(Base):  # §23.2

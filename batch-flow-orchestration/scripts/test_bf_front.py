@@ -2,6 +2,7 @@
 """batch-flow v2 chat front as the operations role (design §22): read-everything permissions, operational failures
 handled by the front, and a human-readable report. Written before the implementation. Python 3.8 stdlib only."""
 import json
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -156,6 +157,46 @@ class Prompt(unittest.TestCase):  # §22.4
         for piece in ['运维', 'report --text', 'retry', 'escalate', SWAP, '标题', 'answers', 'set-role', '技术负责人', '不改代码']:
             self.assertIn(piece, p)
         self.assertLess(len(p), 5000)
+
+
+class Launcher(Base):
+    def setUp(self):
+        super().setUp()
+        self.shortcut = self.root / 'start-batch-flow.sh'
+        self.shortcut.symlink_to(HERE / 'start-batch-flow.sh')
+        self.capture = self.root / 'launch.json'
+        self.binary = self.root / 'fake claude'
+        self.binary.write_text('#!%s\nimport json, os, sys\nfrom pathlib import Path\n'
+                               'Path(%r).write_text(json.dumps({"argv":sys.argv[1:], "cwd":os.getcwd()}))\n'
+                               'sys.exit(23)\n' % (sys.executable, str(self.capture)))
+        self.binary.chmod(0o755)
+
+    def test_project_symlink_launches_selected_task_and_preserves_exit_code(self):
+        run = subprocess.run([str(self.shortcut), str(self.base.parent), '--binary', str(self.binary), '--model', 'front-model'],
+                             cwd=str(self.root), capture_output=True, text=True)
+        self.assertEqual(run.returncode, 23, run.stderr)
+        call = json.loads(self.capture.read_text())
+        self.assertEqual(call['cwd'], str(self.base.parent))
+        argv = call['argv']
+        self.assertEqual(argv[argv.index('--model') + 1], 'front-model')
+        settings = json.loads(Path(argv[argv.index('--settings') + 1]).read_text())
+        self.assertIn('PreToolUse', settings['hooks'])
+        self.assertIn(str(self.base), argv[argv.index('--append-system-prompt') + 1])
+        self.assertIn('等用户指示', argv[-1])
+
+    def test_explicit_base_with_spaces_is_passed_without_splitting(self):
+        base = self.root / 'another task' / '.batch-flow'
+        base.mkdir(parents=True)
+        run = subprocess.run([str(self.shortcut), '--base', str(base), '--binary', str(self.binary)],
+                             cwd=str(self.root), capture_output=True, text=True)
+        self.assertEqual(run.returncode, 23, run.stderr)
+        self.assertEqual(json.loads(self.capture.read_text())['cwd'], str(base.parent))
+
+    def test_no_task_shows_help_without_starting_a_front(self):
+        run = subprocess.run([str(self.shortcut)], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn('Claude Code', run.stdout)
+        self.assertFalse(self.capture.exists())
 
 
 if __name__ == '__main__':

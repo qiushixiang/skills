@@ -3,6 +3,7 @@ import fnmatch
 import hashlib
 import os
 import subprocess
+from . import permissions
 
 
 def _git(repo, *args):
@@ -59,7 +60,7 @@ def changed(plan, base):
 
 
 def protected_hits(plan, order, changes):
-    allow = list(order['input'].get('allow_protected') or [])
+    allow = permissions.allowed(plan, order)
     hits = []
     for repo, rels in changes.items():
         for rel in rels:

@@ -1,5 +1,5 @@
 """Registering finished runs and executing decisions: routing table of design 5.2 and decide mechanism of design 7."""
-from . import model, policy, routing
+from . import model, policy, routing, permissions, questions
 from .store import need, sha256_file
 
 
@@ -11,7 +11,7 @@ def on_registered(state, order, run, p, legal, decision):
         if res == 'VERIFIED':
             order['state'] = 'done'
         elif res in ('ARCH_DECISION_REQUIRED', 'WAIT_EVIDENCE'):
-            routing.open_decide(state, order, res.lower(), {'issue': p['issue']})
+            routing.open_decide(state, order, res.lower(), {'issue': p['issue'], 'blocker': p.get('blocker')})
     elif t == 'review' and legal:
         if res == 'RELEASE':
             order['state'] = 'done'
@@ -26,47 +26,81 @@ def on_registered(state, order, run, p, legal, decision):
         apply_triage(state, order, decision)
     if legal:
         routing.add_candidates(state, order, p['candidates'] + p['suggestions'])
-    routing.check_exhausted(state, order)
+    # A completed child may unblock another order that shares an exhausted budget.
+    for pending in list(state.orders.values()):
+        routing.check_exhausted(state, pending)
 
 
 def _needs_user(state, a):
     plan = state.plan
-    if 'grant' in a or 'plan_revision' in a:
+    if 'plan_revision' in a:
+        from . import changes
+        return not (a.get('within_authorization') is True and changes.internal_revision(plan, a['plan_revision']))
+    if 'grant' in a:
         return True
+    if 'authorize' in a:
+        obj = state.orders[a['authorize']]
+        return any(p not in permissions.allowed(plan, obj) for p in a['paths'])
     if 'supersede' in a and a['supersede'] in state.orders:
         victim = state.orders[a['supersede']]
+        if not routing.current_work(state, victim):
+            return False  # Retiring an obsolete contract cannot discharge current work or its reviews.
         if victim['type'] in ('review', 'release') or any(
-                victim['id'] in o['needs'] and o['state'] not in routing.SATISFIED and o['type'] not in ('review', 'release')
+                victim['id'] in o['needs']
                 for o in state.orders.values()):
             return True
-    if a.get('allow_protected'):
-        return True
+    requested = a.get('allow_protected') or (a.get('input') or {}).get('allow_protected')
+    if requested:
+        permitted = plan['envelope'].get('protected', {}).get(a.get('target'), [])
+        if any(p not in permitted for p in requested):
+            return True
     return 'open' in a and model.batch_of(plan, a['target']) not in plan['envelope']['batches']
 
 
 def apply_actions(state, source, actions, waiter, forced=False, diagnosis=''):
     """Execute decision actions; those beyond the envelope (grant, plan revision, out-of-envelope open) wait for the user (I6)."""
-    deferred = []
+    from .gate import validate_decision
+    need(not validate_decision(state, {'diagnosis': diagnosis or '处置', 'actions': actions}, source),
+         'invalid decision action bundle')
+    # Approval is for the entire disposition, not a partially executed subset.
+    if not forced and any(_needs_user(state, a) for a in actions):
+        explanation = diagnosis or (source.get('output') or {}).get('decision', {}).get('diagnosis', '')
+        routing.open_ask(state, source, waiter, '处置超出授权包络，需用户批准：%s' % explanation,
+                         pending=actions, request=questions.for_actions([a for a in actions if _needs_user(state, a)], explanation))
+        return
     for a in actions:
-        if _needs_user(state, a) and not forced:
-            deferred.append(a)
-        else:
-            _execute(state, source, a, waiter)
-    if deferred:
-        routing.open_ask(state, source, waiter, '处置超出授权包络，需用户批准：%s' % (diagnosis or source['output'] and
-                                                    source['output'].get('decision', {}).get('diagnosis', '')), pending=deferred)
+        _execute(state, source, a, waiter)
+    for a in actions:
+        if 'authorize' in a:
+            obj = state.orders[a['authorize']]
+            need(all(p in permissions.allowed(state.plan, obj) for p in a['paths']), 'authorization postcondition failed')
+        if 'retry' in a:
+            obj = state.orders[a['retry']]
+            need(not permissions.missing(state.plan, obj), 'retry still lacks required protected permissions')
+            need(policy.stage(state.plan, obj, state) is not None, 'retry still has no execution allowance')
+    for obj in list(state.orders.values()):
+        routing.check_exhausted(state, obj)
 
 
 def _execute(state, source, a, waiter):
     plan = state.plan
-    if 'open' in a:
+    if 'authorize' in a:
+        permissions.install(state, routing.get(state, a['authorize']), a['paths'], source['id'])
+    elif 'blocked' in a:
+        routing.pause(state, routing.get(state, a['blocked']), a['reason'], missing=a['missing'])
+    elif 'open' in a:
         inp = dict(a.get('input') or {})
         if a.get('allow_protected'):
             inp['allow_protected'] = list(a['allow_protected'])
+        needs = list(a.get('needs') or [])
+        if a['open'] == 'review':
+            needs = list(dict.fromkeys(needs + routing.review_needs(state, a['target'])))
         o = routing.new_order(state, a['open'], a.get('target'), {'by': 'order', 'ref': source['id'], 'reason': 'decision'},
-                              inp, a.get('needs'))
+                              inp, needs)
         if a.get('fresh_session'):
             o['fresh_next'] = True
+        if waiter in state.orders:
+            state.orders[waiter]['needs'].append(o['id'])
         routing.link(state, o)
     elif 'supersede' in a:
         o = routing.get(state, a['supersede'])
@@ -85,16 +119,20 @@ def _execute(state, source, a, waiter):
     elif 'grant' in a:
         for key, spec in a['grant'].items():
             target = state.orders[key]['target'] if key in state.orders else key
-            need(target in plan['deliverables'], 'grant: unknown target %s' % key)
+            need(target in plan['deliverables'] or target in plan['review_groups'], 'grant: unknown target %s' % key)
             ov = plan['policy']['overrides'].setdefault(target, {})
             for rkey, n in spec.items():
                 ov[rkey] = ov.get(rkey, plan['policy']['rounds'].get(rkey, 0)) + int(n)
         plan['revision'] += 1
         state.plan_dirty = True
     elif 'plan_revision' in a:
-        revise(state, model.load_plan_file(a['plan_revision']), None, 'user answer')
+        from . import changes
+        candidate = model.load_plan_file(a['plan_revision'])
+        if a.get('within_authorization'):
+            need(changes.internal_revision(plan, candidate), 'internal plan changed outside the authorized boundary')
+        revise(state, candidate, None, 'internal technical decision' if a.get('within_authorization') else 'user answer')
     elif 'ask_user' in a:
-        routing.open_ask(state, source, waiter, a['ask_user'], options=a.get('options'))
+        routing.open_ask(state, source, waiter, a['ask_user'], options=a.get('options'), request=a['user_request'])
 
 
 def apply_triage(state, order, decision):
@@ -117,23 +155,68 @@ def answer(state, order_id, text, approve, at):
         ref['extra'] = ref.get('extra', 0) + 1
         ref['input'].setdefault('answers', []).append(text)
     elif approve:
-        apply_actions(state, ref or ask, ask['input']['pending'], ask['input'].get('subject'), forced=True)
+        if ask['input']['pending']:
+            apply_actions(state, ask, ask['input']['pending'], ask['input'].get('subject'), forced=True)
+        else:
+            # A directional answer needs interpretation; it is not a successful implementation retry.
+            anchor = state.orders.get(ask['input'].get('subject')) or ref or ask
+            routing.open_decide(state, anchor, 'user_answer',
+                                {'answer': text, 'question': ask['input']['question']}, force=True)
     else:
         subject = state.orders.get(ask['input'].get('subject') or '')
-        if subject and subject['state'] in ('open', 'running'):
-            routing.open_decide(state, subject, 'user_rejected', {'answer': text, 'question': ask['input']['question']}, force=True)
+        # A superseded/completed subject must not swallow a user's changed direction.
+        # Keep its history intact; let the lead interpret the answer and hold its live consumers.
+        anchor = subject or ref or ask
+        waiters = [o for o in state.orders.values() if o['state'] == 'open' and anchor['id'] in o['needs']]
+        decision = routing.open_decide(state, anchor, 'user_rejected',
+                                       {'answer': text, 'question': ask['input']['question']}, force=True)
+        for waiter in waiters:
+            if decision['id'] not in waiter['needs']:
+                waiter['needs'].append(decision['id'])
 
 
 def revise(state, new_plan, approval, source='user'):
     """Install a revised plan: budgets never shrink below what was used (I2); orders for new items are opened."""
     old = state.plan
+    # Freeze the pre-revision review basis, including stores created before this field existed.
+    for o in state.orders.values():
+        if o['target'] in old['review_groups']:
+            o.setdefault('contract', model.review_contract(old, o['target']))
     plan = model.normalize(new_plan)
     plan['revision'] = old['revision'] + 1
     plan['approval'] = approval or old.get('approval')
+    fields = ('batch', 'instruction', 'acceptance', 'depends_on', 'resources', 'design_ref', 'non_goals', 'no_review', 'required_protected')
+    changed = set(d for d, spec in plan['deliverables'].items() if d not in old['deliverables'] or any(
+        spec.get(k) != old['deliverables'][d].get(k) for k in fields))
+    if any(old.get(k) != plan.get(k) for k in ('goal', 'protected', 'repos', 'workspace')):
+        changed.update(plan['deliverables'])
+    old_sections = (old.get('design') or {}).get('sections', {})
+    sections = (plan.get('design') or {}).get('sections', {})
+    changed.update(d for d, spec in plan['deliverables'].items() if spec.get('design_ref') and
+                   old_sections.get(spec['design_ref']) != sections.get(spec['design_ref']))
+    changed.update(g for g, spec in plan['review_groups'].items() if old['review_groups'].get(g) != spec)
+    changed.update(set(old['deliverables']) - set(plan['deliverables']))
+    changed.update(set(old['review_groups']) - set(plan['review_groups']))
+    # Propagate through the approved dependency graph, including review nodes.
+    graph = {d: spec['depends_on'] for d, spec in plan['deliverables'].items()}
+    graph.update({g: spec['deliverables'] for g, spec in plan['review_groups'].items()})
+    while True:
+        more = {x for x, deps in graph.items() if changed.intersection(deps)} - changed
+        if not more:
+            break
+        changed.update(more)
+    for o in state.orders.values():
+        need(o['state'] != 'running' or o['target'] not in changed,
+             'revision affects running order %s; stop and collect it before revising' % o['id'])
+    for d, spec in plan['deliverables'].items():
+        spec['contract_version'] = (plan['revision'] if d in changed else
+                                    old['deliverables'].get(d, {}).get('contract_version', 1))
     state.plan = plan
     for o in state.orders.values():
         if o['type'] in policy.STAFFED:
-            over = policy.over_budget(plan, o)
+            over = policy.over_budget(plan, o, state)
             need(not over, 'revision would take back used budget of %s (%s)' % (o['id'], ', '.join(over)))
     state.plan_dirty = True
     routing.sync_plan(state)
+    for pending in list(state.orders.values()):
+        routing.check_exhausted(state, pending)

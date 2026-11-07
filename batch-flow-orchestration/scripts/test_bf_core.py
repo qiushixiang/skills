@@ -60,6 +60,10 @@ def record_json(n=0, exit_code=0):
 UNFINISHED = '结果：FAILED\n停止原因：未完成\n上升问题：无\n'
 INFEASIBLE = '结果：FAILED\n停止原因：技术不可行\n上升问题：试过方案 A、B 均失败\n'
 NEEDS_DECISION = '结果：ARCH_DECISION_REQUIRED\n停止原因：待裁决\n上升问题：验收与冻结资产冲突\n'
+def user_question(text):
+    return {'ask_user': text, 'user_request': {
+        'category': 'information', 'decision': '选择待测试的设备A或设备B',
+        'recommendation': '推荐使用已有设备A', 'impact': '设备选择决定实板目标；未决定时只阻塞相关路径'}}
 ENV_BLOCK = '结果：WAIT_EVIDENCE\n停止原因：外部阻塞\n上升问题：入口前检失败\n'
 EDIT = {'type': 'file_change'}
 
@@ -389,6 +393,9 @@ class Routing(Base):
         self.assertTrue(out['legal'])
         self.assertEqual(self.one('decide', 'D1')['state'], 'done')
         self.assertEqual(len(api.orders(self.st(), type='implement', target='D2')), 2)
+        self.assertNotIn(self.impl('D1'), api.runnable(self.st(), parallel=5))
+        child = api.orders(self.st(), type='implement', target='D2')[-1]
+        self.go(child['id'], self.done())
         self.assertIn(self.impl('D1'), api.runnable(self.st(), parallel=5))
         self.assertEqual(api.assign(self.st(), self.impl('D1'))['session']['mode'], 'fresh')
 
@@ -397,6 +404,8 @@ class Routing(Base):
         decide = self.one('decide', 'D1')['id']
         self.go(decide, '结果：VERIFIED\n停止原因：完成\n',
                  decision={'diagnosis': 'd', 'actions': [{'supersede': self.impl('D1'), 'reason': '目标已由 D2 覆盖'}]})
+        self.assertEqual(self.one('implement', 'D1')['state'], 'open')
+        api.answer(self.base, self.one('ask_user', 'D1')['id'], '批准作废', approve=True)
         self.assertEqual(api.orders(self.st(), type='implement', target='D1')[0]['state'], 'superseded')
 
     def test_grant_or_plan_change_asks_user(self):  # §7, I2, I6
@@ -427,7 +436,9 @@ class Routing(Base):
     def test_open_outside_envelope_asks_user(self):  # I6
         other = Path(self.tmp.name) / 'env2'
         (other / 'records').mkdir(parents=True)
-        api.init(other, make_plan(envelope={'batches': ['B1']}), self.approval)
+        plan = make_plan(envelope={'batches': ['B1']})
+        plan['deliverables']['D3']['depends_on'] = []  # independent work, not a dependency cycle
+        api.init(other, plan, self.approval)
         oid = api.orders(api.load(other), type='implement', target='D1')[0]['id']
         rid = api.start(other, oid)
         api.deliver(other, oid, rid, NEEDS_DECISION, conversation_id='c')
@@ -438,16 +449,17 @@ class Routing(Base):
         self.assertEqual(len(api.orders(api.load(other), type='ask_user')), 1)
         self.assertEqual(len(api.orders(api.load(other), type='implement', target='D3')), 1)
 
-    def test_decide_limit_per_source_then_ask_user(self):  # §8
+    def test_decide_limit_per_source_pauses_without_asking_user(self):
         oid = self.impl('D1')
         self.go(oid, NEEDS_DECISION)
         for _ in range(2):
             decide = self.one('decide', 'D1', state_='open')['id']
-            self.go(decide, '结果：VERIFIED\n停止原因：完成\n', decision={'diagnosis': 'still unclear', 'actions': []})
+            self.go(decide, '结果：VERIFIED\n停止原因：完成\n', decision={'diagnosis': 'retry made no progress', 'actions': [{'retry': oid}]})
             self.go(oid, NEEDS_DECISION)
         self.assertEqual(len(api.orders(self.st(), type='decide', target='D1')), 2)
         self.assertEqual(api.orders(self.st(), type='decide', target='D1', state_='open'), [])
-        self.assertEqual(self.one('ask_user', 'D1')['state'], 'open')
+        self.assertEqual(api.orders(self.st(), type='ask_user'), [])
+        self.assertEqual(self.st().orders[oid]['ops']['kind'], 'no_progress')
 
     def test_candidates_go_to_batch_triage_and_gate_release(self):  # §5.2, decision 3
         self.go(self.impl('D1'), self.done('候选新项：\n- CAN 自测偶发超时（records/x）\n- SII 偶发读失败\n'))
@@ -462,12 +474,15 @@ class Routing(Base):
         partial = {'diagnosis': 't', 'items': {ids[0]: {'disposition': 'merge', 'target': 'D3', 'reason': '同属 D3'}}}
         rid = api.start(self.base, triage['id'])
         self.assertFalse(api.deliver(self.base, triage['id'], rid, '结果：VERIFIED\n停止原因：完成\n', decision=partial, events=[EDIT])['legal'])
-        full = {'diagnosis': 't', 'items': {ids[0]: {'disposition': 'merge', 'target': 'D3', 'reason': '同属 D3'},
+        full = {'diagnosis': 't', 'items': {ids[0]: {'disposition': 'merge', 'target': 'D1', 'reason': '本批修复'},
                                             ids[1]: {'disposition': 'defer', 'reason': '待实物从站'}}}
         self.assertTrue(api.deliver(self.base, triage['id'], rid, '结果：VERIFIED\n停止原因：完成\n', decision=full)['legal'])
-        self.assertIn(release, api.runnable(self.st(), parallel=5))
-        merged = [o for o in api.orders(self.st(), type='implement', target='D3') if o['origin']['by'] == 'order']
+        self.assertNotIn(release, api.runnable(self.st(), parallel=5))
+        merged = [o for o in api.orders(self.st(), type='implement', target='D1') if o['origin']['by'] == 'order']
         self.assertEqual(len(merged), 1)
+        self.go(merged[0]['id'], self.done())
+        self.go(self.one('review', 'R12', state_='open')['id'], self.release_text())
+        self.assertIn(release, api.runnable(self.st(), parallel=5))
 
     def test_budget_never_reset_and_revision_needs_approval(self):  # I2
         oid = self.impl('D1')
@@ -534,7 +549,7 @@ class Context(Base):  # §9
         self.go(review, self.release_text(), conversation_id='rev-1')
         self.go(self.impl('D3'), NEEDS_DECISION, conversation_id='impl-3')
         decide = self.one('decide', 'D3')['id']
-        self.go(decide, '结果：VERIFIED\n停止原因：完成\n', decision={'diagnosis': 'd', 'actions': []}, conversation_id='lead-1')
+        self.go(decide, '结果：VERIFIED\n停止原因：完成\n', decision={'diagnosis': 'd', 'actions': [{'retry': self.impl('D3')}]}, conversation_id='lead-1')
         self.go(self.impl('D3'), NEEDS_DECISION, conversation_id='impl-3')
         second = api.orders(self.st(), type='decide', target='D3', state_='open')[0]['id']
         a = api.assign(self.st(), second)
@@ -556,7 +571,7 @@ class Context(Base):  # §9
         oid = self.impl('D1')
         self.go(oid, NEEDS_DECISION, conversation_id='e0')
         self.go(self.one('decide', 'D1', state_='open')['id'], '结果：VERIFIED\n停止原因：完成\n',
-                 decision={'diagnosis': 'd', 'actions': []}, conversation_id='L')
+                 decision={'diagnosis': 'd', 'actions': [{'retry': oid}]}, conversation_id='L')
         self.go(oid, INFEASIBLE, conversation_id='e1')
         self.go(oid, INFEASIBLE, conversation_id='e2')
         self.go(oid, INFEASIBLE, conversation_id='e3')  # backup

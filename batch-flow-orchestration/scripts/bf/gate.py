@@ -4,7 +4,7 @@ import re
 import shlex
 from pathlib import Path
 
-from . import evidence as evidence_mod, model, routing
+from . import evidence as evidence_mod, model, routing, permissions, questions
 
 _LEAD = r'^[ \t*#>-]*'
 _SEP = r'[ \t]*[:：][ \t]*\**[ \t]*'
@@ -12,8 +12,15 @@ FINDING = re.compile(_LEAD + r'阻断' + _SEP + r'(\S+?)[ \t]*[|｜][ \t]*返修
                      r'方案级[ \t]*[:：][ \t]*(是|否)[ \t]*[|｜][ \t]*关闭条件[ \t]*[:：][ \t]*(.+?)\s*$', re.M)
 SUCCESS = {'implement': ('VERIFIED',), 'repair': ('VERIFIED',), 'review': ('RELEASE', 'FIX_REQUIRED'),
            'decide': ('VERIFIED',), 'triage': ('VERIFIED',)}
-ACTIONS = ('open', 'supersede', 'retry', 'plan_revision', 'grant', 'ask_user', 'refresh_design')
+ACTIONS = ('open', 'supersede', 'retry', 'plan_revision', 'grant', 'ask_user', 'refresh_design', 'authorize', 'blocked')
 OPENABLE = ('implement', 'repair', 'review', 'triage')
+ACTION_FIELDS = {
+    'open': {'open', 'target', 'input', 'needs', 'allow_protected', 'fresh_session'},
+    'authorize': {'authorize', 'paths'}, 'retry': {'retry', 'reason', 'fresh_session'},
+    'supersede': {'supersede', 'reason'}, 'grant': {'grant'}, 'ask_user': {'ask_user', 'options', 'user_request'},
+    'blocked': {'blocked', 'reason', 'missing'},
+    'plan_revision': {'plan_revision', 'within_authorization'}, 'refresh_design': {'refresh_design'},
+}
 
 
 def field(text, name):
@@ -53,6 +60,7 @@ def parse(text, base):
     m = re.search(_LEAD + r'结果' + _SEP + r'([A-Z_]+)', text or '', re.M)
     issue = field(text, '上升问题')
     return {'result': m.group(1) if m else None, 'why': field(text, '停止原因'), 'issue': issue,
+            'blocker': field(text, '问题标识')[:200],
             'has_issue': bool(issue) and not issue.startswith('无'),
             'findings': [{'id': a, 'target': b, 'plan_level': c == '是', 'closure': d}
                          for a, b, c, d in FINDING.findall(text or '')],
@@ -85,12 +93,44 @@ def scan(run, events, env):
         if item.get('type') == 'file_change':
             edited = True
         elif item.get('type') == 'command_execution' and item.get('exit_code') is not None:
+            run['commands_seen'] = run.get('commands_seen', 0) + 1
+            if not readonly_command(item.get('command') or ''):
+                run['non_readonly_command'] = True
             if item['exit_code'] != 0:
                 run['failed'] = True
             if env and direct_entry(item.get('command') or '', env.get('entry') or []):
                 run['entry'] = {'exit_code': item['exit_code'], 'output': (item.get('aggregated_output') or '')[-4000:]}
     run['edited'] = run.get('edited', False) or edited
     return edited
+
+
+def readonly_command(command):
+    """Conservative proof of diagnostic-only activity; opaque scripts remain chargeable."""
+    try:
+        words = shlex.split(command)
+        if len(words) == 3 and Path(words[0]).name in ('bash', 'sh') and words[1] in ('-c', '-lc'):
+            command = words[2]
+            words = shlex.split(command)
+        if (len(words) > 5 and Path(words[0]).name in ('python', 'python3', 'python3.8')
+                and Path(words[1]).is_absolute() and Path(words[1]).resolve() == Path(__file__).with_name('cli.py').resolve()
+                and words[2] == '--base' and words[4] == 'record' and '--' in words[5:]):
+            split = words.index('--', 5)
+            options = words[5:split]
+            if options and (len(options) != 2 or options[0] != '--cwd'):
+                return False
+            # Writing the raw diagnostic record does not turn a read-only child into implementation.
+            return readonly_command(shlex.join(words[split + 1:]))
+        if re.search(r'[;&|<>`$()\n]', command) or not words:
+            return False
+        name = Path(words[0]).name
+        if name == 'rg' and any(w == '--pre' or w.startswith('--pre=') for w in words[1:]):
+            return False
+        if name == 'git':
+            return len(words) > 1 and words[1] in ('status', 'diff', 'show', 'rev-parse', 'log') and not any(
+                w.startswith(('--output', '--ext-diff', '--textconv')) for w in words[2:])
+        return name in ('cat', 'rg', 'ls', 'pwd', 'sha256sum', 'head', 'tail', 'wc', 'stat')
+    except ValueError:
+        return False
 
 
 def new_records(base, since):
@@ -112,26 +152,99 @@ def environment_blocked(env, run):
 
 # ---- legality -------------------------------------------------------------------------------------
 
-def validate_decision(state, decision):
+def validate_decision(state, decision, order=None):
     plan = state.plan
     if not isinstance(decision, dict) or not isinstance(decision.get('actions'), list) or not decision.get('diagnosis'):
         return 'decision.json 需要 diagnosis 与 actions'
+    if order and order.get('input', {}).get('subject') and not decision['actions']:
+        return '解除阻塞的裁决须有结构化处置；空动作不能宣布恢复'
+    if len(decision['actions']) > 1 and any(isinstance(a, dict) and 'ask_user' in a for a in decision['actions']):
+        return 'ask_user 用于独立方向问题；状态变更用结构化动作整包自动请求批准，不能混合重复提问'
     for a in decision['actions']:
         kinds = [k for k in ACTIONS if isinstance(a, dict) and k in a]
         if len(kinds) != 1:
             return '每个处置动作须恰有一种动作键: %s' % '/'.join(ACTIONS)
         k = kinds[0]
+        if set(a) - ACTION_FIELDS[k]:
+            return '%s 含不支持的动作字段，不能静默忽略处置要求' % k
+        if k == 'ask_user':
+            reason = questions.validate(a.get('user_request'))
+            if reason:
+                return reason
+            if not isinstance(a['ask_user'], str) or not a['ask_user'].strip():
+                return 'ask_user 须有明确问题'
+        if k == 'blocked':
+            if not isinstance(a[k], str) or a[k] not in state.orders:
+                return 'blocked 须指向现有工单'
+            if state.orders[a[k]]['state'] not in ('open', 'failed'):
+                return 'blocked 只能暂停未完成且未运行的工单'
+            if not all(isinstance(a.get(x), str) and a[x].strip() for x in ('reason', 'missing')):
+                return 'blocked 须记录原因和最小缺项'
+        if k == 'authorize':
+            if not isinstance(a['authorize'], str):
+                return 'authorize 须指定工单号'
+            obj = state.orders.get(a['authorize'])
+            if not obj or obj['type'] not in ('implement', 'repair') or obj['state'] not in ('open', 'failed'):
+                return 'authorize 须指向未完成且未运行的实施/返修原单'
+            if not routing.current_work(state, obj) or not permissions.validate_paths(a.get('paths')):
+                return 'authorize 须为当前契约的精确仓库相对路径，不允许目录通配符'
+        if k == 'retry' and a.get('allow_protected'):
+            return 'retry 不登记权限；请使用 authorize 动作'
         if k == 'open' and (a['open'] not in OPENABLE or a.get('target') not in
                             list(plan['deliverables']) + list(plan['review_groups']) + [b['id'] for b in plan['batches']]):
             return 'open 动作的类型或目标无效'
+        if k == 'open':
+            target, kind, inp = a['target'], a['open'], a.get('input') or {}
+            known = {'implement': plan['deliverables'], 'repair': plan['deliverables'],
+                     'review': plan['review_groups'], 'triage': {b['id'] for b in plan['batches']}}
+            if target not in known[kind] or not isinstance(inp, dict):
+                return 'open 动作的类型与目标不匹配'
+            for paths in (a.get('allow_protected'), inp.get('allow_protected'), inp.get('required_protected')):
+                if paths is not None and (not isinstance(paths, list) or any(not model.valid_exact_path(p) for p in paths)):
+                    return 'open 的权限清单须为精确仓库相对路径'
+            deps = a.get('needs', [])
+            if not isinstance(deps, list) or any(n not in state.orders for n in deps):
+                return 'open.needs 须引用已存在的工单'
+            if kind == 'repair' and (inp.get('review_order') not in state.orders or not inp.get('findings') or
+                                     not inp.get('review_run')):
+                return 'repair 须指定 review_order、review_run 与 findings'
+            # A disposition cannot depend on the waiter it is meant to unblock.
+            waiter = order['input'].get('subject') if order else None
+            pending = list(deps)
+            if kind == 'review':
+                pending += routing.review_needs(state, target)
+            else:
+                for d in plan['deliverables'].get(target, {}).get('depends_on', []):
+                    pending += [o['id'] for o in state.orders.values() if o['target'] == d and o['type'] in ('implement', 'review')]
+            seen = set()
+            while pending:
+                n = pending.pop()
+                if n == waiter:
+                    return '裁决处置依赖被裁决工单，会形成等待环；请调整处置方案'
+                if n not in seen and n in state.orders:
+                    seen.add(n)
+                    pending.extend(state.orders[n]['needs'])
         if k in ('supersede', 'retry') and a[k] not in state.orders:
             return '%s 指向不存在的工单' % k
         if k == 'grant' and not isinstance(a['grant'], dict):
             return 'grant 须为 {目标: {额度项: 增量}}'
+        if k == 'grant':
+            for owner, values in a['grant'].items():
+                target = state.orders[owner]['target'] if owner in state.orders else owner
+                if target not in plan['deliverables'] and target not in plan['review_groups']:
+                    return 'grant 目标无效'
+                allowed = {'review'} if target in plan['review_groups'] else {'implement', 'repair', 'backup', 'lead', 'review'}
+                if not isinstance(values, dict) or not values or any(
+                        key not in allowed or type(n) is not int or n <= 0 for key, n in values.items()):
+                    return 'grant 须指定正整数额度；审阅组只能追加 review'
         if k == 'refresh_design' and a[k] is not True:
             return 'refresh_design 须为 true'
         if k == 'plan_revision' and not isinstance(a['plan_revision'], str):
             return 'plan_revision 须为草案路径'
+        if k == 'plan_revision' and 'within_authorization' in a:
+            from . import changes
+            if a['within_authorization'] is not True or not changes.internal_revision(plan, a['plan_revision']):
+                return '包络内计划调整不得改变目标、验收、权限、预算、资源或必需审阅；实质变化转用户'
     return ''
 
 
@@ -163,7 +276,7 @@ def judge(state, order, run, p, decision, text):
             elif [f for f in p['findings'] if f['target'] not in members]:
                 reason = '返修目标不在审阅组内'
         if not reason and t == 'decide':
-            reason = validate_decision(state, decision)
+            reason = validate_decision(state, decision, order)
         if not reason and t == 'triage':
             ids = [i['id'] for i in order['input'].get('items', [])]
             items = (decision or {}).get('items') if isinstance(decision, dict) else None
@@ -175,6 +288,8 @@ def judge(state, order, run, p, decision, text):
         return (not reason), (reason or res)
     if res == 'VERIFIED' or res == 'RELEASE' or res == 'FIX_REQUIRED':
         return False, '结果 %s 不适用于 %s 工单' % (res, t)
+    if t in ('decide', 'triage'):
+        return False, '协调工单须交付 VERIFIED 与合法结构化处置；需要用户时用 ask_user 动作'
     if why.startswith('待裁决'):
         return (res == 'ARCH_DECISION_REQUIRED' and p['has_issue']), '待裁决须为 ARCH_DECISION_REQUIRED 且写明上升问题'
     if why.startswith('技术不可行'):

@@ -160,6 +160,8 @@ class Runner(object):
         progress = False
         if api.check_design(self.base):
             st = api.load(self.base)
+        if api.preflight(self.base):
+            st = api.load(self.base)
         for oid in api.runnable(st, self.parallel):
             o = st.orders[oid]
             if o['type'] == 'release':
@@ -175,13 +177,8 @@ class Runner(object):
         return progress
 
     def _attention(self):
-        st = api.load(self.base)
-        asks = api.orders(st, type='ask_user', state_='open')
-        path = self.base / 'attention.md'
-        text = ''.join('- %s（%s）：%s\n' % (o['id'], o['target'] or '-', o['input'].get('question', '')) for o in asks)
-        text = ('# 需要用户回答\n\n' + text) if asks else ''
-        if (path.read_text(encoding='utf-8') if path.exists() else '') != text:
-            path.write_text(text, encoding='utf-8')
+        from .store import refresh_attention
+        refresh_attention(self.base)
 
     def _stop_now(self):
         """stop --now: kill every in-flight call, register the runs as INVALID (free) and leave."""

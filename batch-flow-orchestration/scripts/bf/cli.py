@@ -25,6 +25,10 @@ def main(argv=None):
     wt.add_argument('--since', type=int, default=0)
     wt.add_argument('--once', action='store_true')
     sub.add_parser('report').add_argument('--text', action='store_true')
+    rc = sub.add_parser('reconcile')
+    rc.add_argument('--file', required=True)
+    rc.add_argument('--approval', required=True)
+    rc.add_argument('--dry-run', action='store_true')
     for name in ('retry', 'escalate'):
         p = sub.add_parser(name)
         p.add_argument('order')
@@ -84,6 +88,9 @@ def main(argv=None):
             return 0
         elif args.cmd == 'report':
             out = api.report(base)
+        elif args.cmd == 'reconcile':
+            from bf import reconcile
+            out = reconcile.apply(base, args.file, args.approval, dry_run=args.dry_run)
         elif args.cmd in ('retry', 'escalate'):
             out = {args.cmd: getattr(api, args.cmd)(base, args.order, args.note)}
         elif args.cmd == 'record':

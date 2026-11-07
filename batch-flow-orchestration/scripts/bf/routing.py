@@ -1,4 +1,6 @@
 """Order creation, selection (design 5.4) and event -> order openers (design 5.2)."""
+import hashlib
+import json
 from . import model, policy
 from .store import need, sha256_file
 
@@ -30,6 +32,12 @@ def new_order(state, type_, target, origin, input_=None, needs=None, key=None):
     state.seq += 1
     o = {'id': 'WO-%04d' % state.seq, 'key': key, 'type': type_, 'target': target, 'origin': origin,
          'input': input_ or {}, 'needs': list(needs or []), 'runs': [], 'state': 'open', 'output': None}
+    if target in state.plan['deliverables']:
+        o['contract_version'] = state.plan['deliverables'][target].get('contract_version', 1)
+        if type_ in ('implement', 'repair') and state.plan['deliverables'][target].get('required_protected'):
+            o['input']['required_protected'] = list(state.plan['deliverables'][target]['required_protected'])
+    if target in state.plan['review_groups']:
+        o['contract'] = model.review_contract(state.plan, target)
     state.orders[o['id']] = o
     state.opened.append(o['id'])
     return o
@@ -53,7 +61,30 @@ def _broken_orders(state):
 
 
 def _resources(plan, order):
-    return set(x for d in model.deliverables_of(plan, order['target']) for x in plan['deliverables'][d]['resources'])
+    members = model.deliverables_of(plan, order['target'])
+    return set('deliverable:' + d for d in members) | set(
+        x for d in members for x in plan['deliverables'][d]['resources'])
+
+
+def current_work(state, order):
+    """Historical deliveries remain intact, but cannot satisfy a changed contract."""
+    if order['target'] in state.plan['deliverables'] or order['type'] in ('implement', 'repair'):
+        spec = state.plan['deliverables'].get(order['target'])
+        return bool(spec) and order.get('contract_version', 1) == spec.get('contract_version', 1)
+    if order['target'] in state.plan['review_groups'] or order['type'] == 'review':
+        return order['target'] in state.plan['review_groups'] and order.get('contract') in (
+            None, model.review_contract(state.plan, order['target']))
+    return True
+
+
+def work_for(state, target):
+    return [o for o in sorted_orders(state) if o['target'] == target and o['type'] in ('implement', 'repair')
+            and o['state'] != 'superseded' and current_work(state, o)]
+
+
+def review_needs(state, group):
+    """A review always waits for all current work on its declared deliverables."""
+    return [o['id'] for d in state.plan['review_groups'][group]['deliverables'] for o in work_for(state, d)]
 
 
 def _position(plan, order):
@@ -79,18 +110,21 @@ def runnable(state, parallel=1):
 
     def dep_ok(d):
         if d in plan['review_groups']:
-            impls = [o for o in state.orders.values() if o['type'] == 'review' and o['target'] == d]
+            impls = [o for o in state.orders.values() if o['type'] == 'review' and o['target'] == d and current_work(state, o)]
             return bool(impls) and all(i['state'] in SATISFIED and i['id'] not in bad for i in impls)
-        impls = [o for o in state.orders.values() if o['type'] == 'implement' and o['target'] == d]
+        impls = [o for o in work_for(state, d) if o['type'] == 'implement']
         return bool(impls) and all(i['state'] in SATISFIED and i['id'] not in bad for i in impls)
     drift = set(model.drifted(plan))
     cands = []
     for o in state.orders.values():
         if o['state'] != 'open' or o['type'] == 'ask_user' or o.get('ops'):
             continue
+        if not current_work(state, o):
+            continue
         if o['type'] in ('implement', 'repair') and o['target'] in drift:
             continue
-        if not all(state.orders[n]['state'] in SATISFIED and n not in bad for n in o['needs'] if n in state.orders):
+        needs = o['needs'] + (review_needs(state, o['target']) if o['type'] == 'review' else [])
+        if not all(state.orders[n]['state'] in SATISFIED and n not in bad for n in needs if n in state.orders):
             continue
         batch = model.batch_of(plan, o['target'])
         if batch and batch not in plan['envelope']['batches']:
@@ -101,7 +135,7 @@ def runnable(state, parallel=1):
             continue
         if o['type'] != 'decide' and o['target'] in deciding:
             continue
-        if o['type'] in policy.STAFFED and policy.stage(plan, o) is None:
+        if o['type'] in policy.STAFFED and policy.stage(plan, o, state) is None:
             continue
         cands.append(o)
     cands.sort(key=lambda o: (PRIORITY.index(o['type']), _position(plan, o), seqno(o)))
@@ -125,49 +159,87 @@ def _blocked_by_user_or_lead(state, order):
                for n in order['needs'] if n in state.orders)
 
 
-def open_ask(state, ref, waiter, question, pending=None, options=None):
+def open_ask(state, ref, waiter, question, pending=None, options=None, request=None):
+    from . import questions
+    need(not questions.validate(request), questions.validate(request))
+    question = '%s\n类别：%s\n需决定：%s\n推荐：%s\n影响：%s' % (
+        question, questions.CATEGORIES[request['category']], request['decision'], request['recommendation'], request['impact'])
     ask = new_order(state, 'ask_user', ref['target'], {'by': 'order', 'ref': ref['id'], 'reason': 'needs user'},
-                    {'question': question, 'pending': pending or [], 'options': options or [], 'subject': waiter})
+                    {'question': question, 'pending': pending or [], 'options': options or [], 'subject': waiter,
+                     'user_request': request})
     if waiter in state.orders:
         state.orders[waiter]['needs'].append(ask['id'])
     return ask
 
 
 def open_decide(state, subject, trigger, extra=None, force=False):
-    """One decide per trigger; past decide_per_source for the same subject the user is asked instead."""
+    """Bound consecutive repetitions of the same issue at the same material state."""
     plan = state.plan
-    count = len([o for o in state.orders.values() if o['type'] == 'decide' and o['origin'].get('ref') == subject['id']])
+    issue = [subject['type'], subject['target'], subject.get('contract_version'), trigger]
+    if subject['type'] == 'repair':
+        issue.append(subject['input'].get('review_order'))
+    details = extra or {}
+    issue.append(details.get('blocker') or sorted(details.get('paths') or []))
+    progress = decision_progress(state, subject)
+    count = len([o for o in state.orders.values() if o['type'] == 'decide'
+                 and o['input'].get('issue_key') == issue and o['input'].get('progress') == progress])
+    stalled = len([o for o in state.orders.values() if o['type'] == 'decide'
+                   and o['input'].get('issue_key', [])[:3] == issue[:3] and o['input'].get('progress') == progress])
+    active = next((o for o in state.orders.values() if o['type'] == 'decide' and
+                   o['state'] in ('open', 'running') and o['input'].get('subject') == subject['id'] and
+                   o['input'].get('issue_key') == issue), None)
+    if active and not force:
+        return active
+    if not force and stalled >= policy.rounds(plan, subject['target'], 'coordination_no_progress', 6):
+        return pause(state, subject, '本目标连续 %d 次协调没有相关进展' % stalled, 'no_progress')
     if count >= policy.rounds(plan, subject['target'], 'decide_per_source', 2) and not force:
-        return open_ask(state, subject, subject['id'], '同一触发源已裁决 %d 次仍未解决（%s）' % (count, trigger))
+        return pause(state, subject, '同一问题在无相关进展状态下已裁决 %d 次（%s）' % (count, trigger), 'no_progress')
     last = next((r for r in reversed(subject['runs']) if r['ended']), None)
     inp = {'trigger': trigger, 'subject': subject['id'], 'run': last['run_id'] if last else None,
-           'evidence': sorted(last['evidence']) if last else [], 'subject_input': subject['input']}
+           'evidence': sorted(last['evidence']) if last else [], 'subject_input': dict(subject['input']),
+           'issue_key': issue, 'progress': progress}
     inp.update(extra or {})
     d = new_order(state, 'decide', subject['target'], {'by': 'order', 'ref': subject['id'], 'reason': trigger}, inp)
     subject['needs'].append(d['id'])
     return d
 
 
+def decision_progress(state, subject):
+    from . import permissions
+    target = subject['target']
+    changes = [(r['run_id'], r.get('snapshot')) for o in state.orders.values() if o['target'] == target
+               and o['type'] in ('implement', 'repair') for r in o['runs'] if r.get('changed')]
+    # New prose, new order ids, read-only records and retry actions are not progress.
+    material = {'contract': state.plan['deliverables'].get(target, {}).get('contract_version'),
+                'rounds': {k: policy.rounds(state.plan, target, k) for k in ('implement', 'repair', 'backup', 'lead', 'review')},
+                'permissions': sorted(permissions.allowed(state.plan, subject)), 'changes': changes,
+                'credits': sorted((o['id'], sorted(o.get('budget_credits', {}))) for o in state.orders.values()
+                                  if o['target'] == target and o.get('budget_credits'))}
+    return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
+
+
 def check_exhausted(state, order):
     """Chain used up: the only exit is decide (decide/triage themselves exit to the user)."""
-    if order['state'] != 'open' or order['type'] not in policy.STAFFED or policy.stage(state.plan, order) is not None:
+    if order['state'] != 'open' or order.get('ops') or order['type'] not in policy.STAFFED or policy.stage(state.plan, order, state) is not None:
         return
-    if _blocked_by_user_or_lead(state, order):
+    if any(state.orders[n]['state'] not in SATISFIED for n in order['needs'] if n in state.orders):
         return
     if order['type'] in ('decide', 'triage'):
-        fail_to_user(state, order, '额度用尽')
+        pause(state, order, '协调重试次数用尽', 'coordination_exhausted')
     else:
         open_decide(state, order, 'exhausted')
 
 
-def fail_to_user(state, order, why):
-    """A decide/triage order that cannot be completed goes to the user (its only exit)."""
-    order['state'] = 'failed'
-    if order['type'] == 'decide':
-        open_ask(state, order, order['origin']['ref'], '裁决未能完成（%s）' % why)
-    else:
-        release = by_key(state, 'release:' + model.batch_of(state.plan, order['target'])) or {}
-        open_ask(state, order, release.get('id'), '分诊未能完成（%s）' % why)
+def pause(state, order, why, kind='technical_block', missing=''):
+    """Bound a stalled path without fabricating a user decision or satisfying dependencies."""
+    from .store import now
+    if not missing:
+        missing = {'coordination_exhausted': '修复协调交付并给出合法、可执行的处置',
+                   'tool_failure': '恢复当前 CLI 调用环境或账号',
+                   'no_progress': '依据新证据改变无效恢复方案或修复驱动器缺项'}.get(kind, '负责人核实具体恢复条件')
+    order['state'] = 'open'
+    order['ops'] = {'problem': why, 'kind': kind, 'missing': missing, 'at': now()}
+    return order
 
 
 def add_candidates(state, order, items):
@@ -210,64 +282,79 @@ def open_repairs(state, review, run, p):
             rep = new_order(state, 'repair', tg, {'by': 'order', 'ref': review['id'], 'reason': 'FIX_REQUIRED'}, inp, key=key)
         if rep['id'] not in review['needs']:
             review['needs'].append(rep['id'])
+        link(state, rep)
         check_exhausted(state, rep)
 
 
 def latest_snapshots(state, deliverable):
     """Snapshot paths of the newest legal run that changed this deliverable's files (design 24.7)."""
-    for o in reversed(sorted_orders(state)):
-        if o['type'] in ('implement', 'repair') and o['target'] == deliverable and o['state'] != 'superseded':
-            for r in reversed(o['runs']):
-                if r['ended'] and r['result'] == 'VERIFIED' and r.get('snapshot'):
-                    return list(r['snapshot'])
+    runs = [r for o in work_for(state, deliverable) for r in o['runs']
+            if r['ended'] and r['result'] == 'VERIFIED' and r.get('snapshot')]
+    if runs:
+        return list(max(runs, key=lambda r: r.get('ended_ts', r['started_ts']))['snapshot'])
     return []
 
 
 def _review_family(state, group):
-    out, n = [], 1
-    while True:
-        o = by_key(state, 'review:%s' % group if n == 1 else 'review:%s:%d' % (group, n))
-        if not o:
-            return out
-        out.append(o)
-        n += 1
+    return [o for o in sorted_orders(state) if o['type'] == 'review' and o['target'] == group]
+
+
+def ensure_review(state, group, work=None):
+    family = _review_family(state, group)
+    last = family[-1] if family else None
+    if last and last['state'] == 'open' and current_work(state, last):
+        review = last
+    else:
+        if last and last['state'] == 'open':
+            last['state'] = 'superseded'
+        needs = review_needs(state, group)
+        key = 'review:' + group + (':%d' % (len(family) + 1) if family else '')
+        review = new_order(state, 'review', group, {'by': 'plan', 'ref': 'r%d' % state.plan['revision'],
+                           'reason': 'current contract and work'},
+                           {'deliverables': list(state.plan['review_groups'][group]['deliverables'])}, needs, key)
+    if work and work['id'] not in review['needs']:
+        review['needs'].append(work['id'])
+    release = by_key(state, 'release:' + model.batch_of(state.plan, group))
+    if release:
+        release['state'] = 'open'
+        if review['id'] not in release['needs']:
+            release['needs'].append(review['id'])
+    return review
 
 
 def link(state, order):
-    """A later-opened implement joins the open review of its group (or reopens it as review :2, :3 ...) and the release."""
+    """All implementation and repair work invalidates every covering review and release."""
     plan = state.plan
-    if order['type'] != 'implement' or order['target'] not in plan['deliverables']:
+    if order['type'] not in ('implement', 'repair') or order['target'] not in plan['deliverables']:
         return
     release = by_key(state, 'release:' + plan['deliverables'][order['target']]['batch'])
     for g in model.groups_of(plan, order['target']):
-        family = _review_family(state, g)
-        if not family:
-            continue
-        last = family[-1]
-        if last['state'] == 'open':
-            last['needs'].append(order['id'])
-        elif last['state'] == 'done':
-            key = 'review:%s:%d' % (g, len(family) + 1)
-            new = new_order(state, 'review', g, {'by': 'order', 'ref': order['id'], 'reason': 'new work after review'},
-                            {'deliverables': list(plan['review_groups'][g]['deliverables'])}, [order['id']], key=key)
-            if release and release['state'] == 'open':
-                release['needs'].append(new['id'])
-    if release and release['state'] == 'open':
-        release['needs'].append(order['id'])
+        ensure_review(state, g, order)
+    if release:
+        release['state'] = 'open'
+        if order['id'] not in release['needs']:
+            release['needs'].append(order['id'])
 
 
 def sync_plan(state):
     """Open the orders a plan (revision) calls for; idempotent through order keys. Supersede orders of removed items."""
     plan = state.plan
     for d, spec in plan['deliverables'].items():
-        if not by_key(state, 'impl:' + d):
+        if not any(o['type'] == 'implement' and current_work(state, o) and o['target'] == d
+                   for o in state.orders.values()):
+            version = spec.get('contract_version', 1)
+            key = 'impl:' + d + (':r%d' % version if version != 1 else '')
             new_order(state, 'implement', d, {'by': 'plan', 'ref': 'r%d' % plan['revision'], 'reason': 'plan'},
-                      {'instruction': spec['instruction'], 'acceptance': spec['acceptance']}, key='impl:' + d)
+                      {'instruction': spec['instruction'], 'acceptance': spec['acceptance']}, key=key)
     for g, spec in plan['review_groups'].items():
-        if not by_key(state, 'review:' + g):
-            new_order(state, 'review', g, {'by': 'plan', 'ref': 'r%d' % plan['revision'], 'reason': 'plan'},
-                      {'deliverables': list(spec['deliverables'])},
-                      [by_key(state, 'impl:' + d)['id'] for d in spec['deliverables']], key='review:' + g)
+        family = _review_family(state, g)
+        if not family or not current_work(state, family[-1]):
+            ensure_review(state, g)
+        else:
+            for d in spec['deliverables']:
+                for work in work_for(state, d):
+                    if family[-1]['state'] == 'open' and work['id'] not in family[-1]['needs']:
+                        family[-1]['needs'].append(work['id'])
     for b in plan['batches']:
         if not by_key(state, 'release:' + b['id']):
             new_order(state, 'release', b['id'], {'by': 'plan', 'ref': 'r%d' % plan['revision'], 'reason': 'plan'}, key='release:' + b['id'])
@@ -275,7 +362,7 @@ def sync_plan(state):
         if o['state'] in ('done', 'superseded'):
             continue
         batch = model.batch_of(plan, o['target'])
-        if o['type'] in ('implement', 'review', 'release') and o['key'] and batch is None:
+        if o['target'] is not None and (batch is None or not current_work(state, o)):
             o['state'] = 'superseded'  # target removed by a plan revision
     for b in plan['batches']:
         release = by_key(state, 'release:' + b['id'])

@@ -7,7 +7,8 @@ from pathlib import Path
 
 from .store import BfError, need, sha256_file, now
 
-DEFAULT_ROUNDS = {'implement': 3, 'backup': 1, 'lead': 1, 'repair': 2, 'review': 3, 'decide_per_source': 2, 'invalid_retry': 2}
+DEFAULT_ROUNDS = {'implement': 3, 'backup': 1, 'lead': 1, 'repair': 2, 'review': 3, 'decide_per_source': 2, 'invalid_retry': 2,
+                  'coordination_attempts': 2, 'coordination_no_progress': 6}
 CLI_TOOLS = {'agy': 'agy', 'agy-cli': 'agy', 'codex': 'codex', 'codex-cli': 'codex', 'claude': 'claude',
              'claude-cli': 'claude', 'claude-code': 'claude', 'opencode': 'opencode', 'opencode-cli': 'opencode'}
 ORDER_TYPES = ('implement', 'review', 'repair', 'decide', 'ask_user', 'triage', 'release')
@@ -52,6 +53,10 @@ def normalize(plan):
         spec.setdefault('acceptance', [])
         spec.setdefault('depends_on', [])
         spec.setdefault('resources', [])
+        spec.setdefault('contract_version', 1)
+        required = spec.get('required_protected', [])
+        need(isinstance(required, list) and all(valid_exact_path(x) for x in required),
+             'deliverable %s: required_protected must contain exact paths' % d)
         need(str(spec['instruction']).strip(), 'deliverable %s: instruction is empty' % d)
         need(spec['acceptance'] and all(str(x).strip() for x in spec['acceptance']), 'deliverable %s: acceptance is empty' % d)
     groups = p.setdefault('review_groups', {})
@@ -90,6 +95,10 @@ def normalize(plan):
     env = p.setdefault('envelope', {})
     env.setdefault('batches', list(ids))
     need(all(b in ids for b in env['batches']), 'envelope: unknown batch')
+    permits = env.setdefault('protected', {})
+    need(isinstance(permits, dict) and all(d in dels and isinstance(paths, list) and
+         all(valid_exact_path(x) for x in paths) for d, paths in permits.items()),
+         'envelope.protected: deliverable -> exact repository-relative paths required')
     p.setdefault('env', {})
     pin_design(p, strict=True)
     chain = rounds['repair'] + rounds['backup'] + rounds['lead']
@@ -98,6 +107,12 @@ def normalize(plan):
     holds = p.setdefault('holds', [])
     need(all(h in dels or h in groups or h in ids for h in holds), 'holds: unknown deliverable, group or batch')
     return p
+
+
+def valid_exact_path(path):
+    return (isinstance(path, str) and bool(path) and not Path(path).is_absolute()
+            and all(x not in ('', '.', '..') for x in path.split('/'))
+            and not any(c in path for c in '*?[]\\'))
 
 
 def approval_ref(path):
@@ -116,6 +131,12 @@ def load_plan_file(path):
 
 def groups_of(plan, deliverable):
     return [g for g, spec in plan['review_groups'].items() if deliverable in spec['deliverables']]
+
+
+def review_contract(plan, group):
+    spec = plan['review_groups'][group]
+    value = [spec, {d: plan['deliverables'][d].get('contract_version', 1) for d in spec['deliverables']}]
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
 
 
 def batch_of(plan, target):

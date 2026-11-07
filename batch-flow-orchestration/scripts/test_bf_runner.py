@@ -159,7 +159,9 @@ class RunnerSpec(unittest.TestCase):
         self.init()
         fake = FakeAdapter(self.base, {('implement', 'D1'): [done()], ('implement', 'D2'): [done()],
                                        ('review', 'R12'): [release()], ('implement', 'D3'): [done()], ('review', 'R3'): [release()]})
-        runner.Runner(self.base, fake).step()
+        previous = runner.Runner(self.base, fake)
+        previous.step()
+        previous.close()  # process exit releases the lifetime driver lock
         runner.Runner(self.base, fake).run_until_idle()  # a new runner continues from orders.json
         self.assertTrue(all(o['state'] == 'done' for o in api.orders(api.load(self.base), type='release')))
 
@@ -185,6 +187,7 @@ class RunnerSpec(unittest.TestCase):
             self.assertIn(key, report)
         self.assertTrue(any(item['target'] == 'D1' for item in report['recent']))
         self.assertIn('D2', report['budgets'])  # open deliverables only (§22.3)
+        r.close()
 
     def test_cli_commands(self):  # §6.1
         self.init()
