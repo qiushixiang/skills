@@ -348,3 +348,19 @@ scripts/agent_cli.py      保留（CLI 适配器，已验证的宿主细节）
 | `broken_evidence(state)` | 哈希不符的证据列表 |
 
 错误一律抛 `bf.api.BfError`。
+
+## 18. 阶段 B 接口契约
+
+以 `scripts/test_bf_runner.py` 为准。
+
+| 对象 | 约定 |
+|---|---|
+| 角色适配器 | `launch(order, assignment, card_path, run_dir, resume=None) -> handle`；`poll(handle) -> None | {conversation_id, text, events, session_kb?, decision?}`。真实适配器包装 `agent_cli.py`：`events` 由 CLI 原始输出解析，`decision` 读自 `run_dir/decision.json` |
+| `runner.Runner(base, adapter, parallel=1)` | `step()`：回收已结束的调用 → 门禁登记（不合法则以续跑提示续用同一会话）→ 机械放行 → 按 `runnable` 派发；`run_until_idle()`：反复 step 直到无在途且无可派发；每次派发前检查 stopped |
+| 重启恢复 | 启动时发现无句柄的在途 run：`api.abandon(base, order_id, run_id, reason)` 登记为 INVALID、免扣，然后照常重派 |
+| 卡片 `cards.render(state, order_id, assignment) -> str` | 固定节：`## 目标`、`## 环境`、`## 本单`、`## 约束`、`## 交付`；续跑卡为短提示（< 800 字），以“尚未合法结束”开头说明原因 |
+| attention | 有开立的 ask_user 时写 `<base>/attention.md`，列出工单号与问题 |
+| `api.report(base)` | `{running, recent, ask_user, budgets{deliverable: 剩余}, runnable}` |
+| `bf/cli.py --base <dir> <cmd>` | `status`、`report`、`run [--parallel N]`、`stop`、`resume`、`answer <id> --file <原话> --approve|--reject`、`init --plan <json> --approval <file>`、`revise --plan <json> --approval <file>` |
+| `front.allowed(command) -> bool` | 只放行 `<python> <bf/cli.py> --base <dir> {status, report, run, stop, resume, answer}` 的单条命令，拒绝管道、重定向、分号、其他脚本与写操作子命令 |
+| triage 候选项 ID | 每张 triage 工单内按出现顺序编号 `C1, C2, …` |
