@@ -83,9 +83,12 @@ def runnable(state, parallel=1):
             return bool(impls) and all(i['state'] in SATISFIED and i['id'] not in bad for i in impls)
         impls = [o for o in state.orders.values() if o['type'] == 'implement' and o['target'] == d]
         return bool(impls) and all(i['state'] in SATISFIED and i['id'] not in bad for i in impls)
+    drift = set(model.drifted(plan))
     cands = []
     for o in state.orders.values():
         if o['state'] != 'open' or o['type'] == 'ask_user' or o.get('ops'):
+            continue
+        if o['type'] in ('implement', 'repair') and o['target'] in drift:
             continue
         if not all(state.orders[n]['state'] in SATISFIED and n not in bad for n in o['needs'] if n in state.orders):
             continue
@@ -210,16 +213,47 @@ def open_repairs(state, review, run, p):
         check_exhausted(state, rep)
 
 
+def latest_snapshots(state, deliverable):
+    """Snapshot paths of the newest legal run that changed this deliverable's files (design 24.7)."""
+    for o in reversed(sorted_orders(state)):
+        if o['type'] in ('implement', 'repair') and o['target'] == deliverable and o['state'] != 'superseded':
+            for r in reversed(o['runs']):
+                if r['ended'] and r['result'] == 'VERIFIED' and r.get('snapshot'):
+                    return list(r['snapshot'])
+    return []
+
+
+def _review_family(state, group):
+    out, n = [], 1
+    while True:
+        o = by_key(state, 'review:%s' % group if n == 1 else 'review:%s:%d' % (group, n))
+        if not o:
+            return out
+        out.append(o)
+        n += 1
+
+
 def link(state, order):
-    """A later-opened implement joins the open review of its group and the batch release."""
+    """A later-opened implement joins the open review of its group (or reopens it as review :2, :3 ...) and the release."""
     plan = state.plan
     if order['type'] != 'implement' or order['target'] not in plan['deliverables']:
         return
-    keys = ['review:' + g for g in model.groups_of(plan, order['target'])]
-    for key in keys + ['release:' + plan['deliverables'][order['target']]['batch']]:
-        target = by_key(state, key)
-        if target and target['state'] == 'open':
-            target['needs'].append(order['id'])
+    release = by_key(state, 'release:' + plan['deliverables'][order['target']]['batch'])
+    for g in model.groups_of(plan, order['target']):
+        family = _review_family(state, g)
+        if not family:
+            continue
+        last = family[-1]
+        if last['state'] == 'open':
+            last['needs'].append(order['id'])
+        elif last['state'] == 'done':
+            key = 'review:%s:%d' % (g, len(family) + 1)
+            new = new_order(state, 'review', g, {'by': 'order', 'ref': order['id'], 'reason': 'new work after review'},
+                            {'deliverables': list(plan['review_groups'][g]['deliverables'])}, [order['id']], key=key)
+            if release and release['state'] == 'open':
+                release['needs'].append(new['id'])
+    if release and release['state'] == 'open':
+        release['needs'].append(order['id'])
 
 
 def sync_plan(state):

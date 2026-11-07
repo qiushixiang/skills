@@ -3,11 +3,11 @@ import re
 import time
 from pathlib import Path
 
-from . import gate, model, policy, register, routing, context
+from . import evidence as evidence_mod, gate, model, policy, register, routing, context, snap
 from .store import BfError, State, load, need, now, transact
 
 __all__ = ['driver_event', 'watch', 'watch_lines', 'driver_status', 'retry', 'escalate', 'report_text', 'abandon', 'report', 'BfError', 'init', 'load', 'orders', 'runnable', 'assign', 'start', 'deliver', 'release', 'answer',
-           'revise_plan', 'stop', 'resume', 'broken_evidence']
+           'revise_plan', 'stop', 'resume', 'broken_evidence', 'check_design']
 
 
 def init(base, plan, approval, expected_revision=None, request_id=None, actor='user'):
@@ -57,6 +57,8 @@ def start(base, order_id, conversation_id=None, expected_revision=None, request_
             need(conversation_id not in context.author_sessions(st, o), 'a session that authored the work cannot review it (I4)')
         run = new_run(order_id, len(o['runs']) + 1, a['stage'], a['tool'], a['model'], a['effort'], conversation_id,
                       a['session']['mode'], a['session']['rule'])
+        if st.plan.get('repos'):
+            run['baseline'] = snap.baseline(st.plan)
         o['runs'].append(run)
         o['state'] = 'running'
         o.pop('fresh_next', None)
@@ -73,6 +75,15 @@ def deliver(base, order_id, run_id, text, events=(), decision=None, conversation
         p = gate.parse(text, st.base)
         edited_now = gate.scan(run, events, model.env_for(st.plan, run['tool']))
         legal, reason = gate.judge(st, o, run, p, decision, text)
+        changes = snap.changed(st.plan, run['baseline']) if st.plan.get('repos') and run.get('baseline') is not None else {}
+        forced, hits = None, []
+        if changes and o['type'] == 'review':
+            forced, hits = 'review_modified', [x for v in changes.values() for x in v]
+        elif changes and o['type'] in ('implement', 'repair'):
+            hits = snap.protected_hits(st.plan, o, changes)
+            forced = 'protected_change' if hits else None
+        if forced:
+            legal, reason = False, '%s：%s' % ('审阅者改动了源码' if forced == 'review_modified' else '改动了受保护路径', ', '.join(hits))
         run['segments'] += 1
         if conversation_id:
             run['session'] = conversation_id
@@ -84,7 +95,7 @@ def deliver(base, order_id, run_id, text, events=(), decision=None, conversation
         since, run['last_ts'] = run['last_ts'], time.time()
         k = run['continuations'] + 1
         out = {'run_id': run_id, 'legal': legal, 'reason': reason if not legal else p['result'], 'opened': []}
-        if not legal and k <= st.plan['policy']['continue_limit'] and (k == 1 or edited_now or gate.new_records(st.base, since)):
+        if not legal and not forced and k <= st.plan['policy']['continue_limit'] and (k == 1 or edited_now or gate.new_records(st.base, since)):
             run['continuations'] = k
             out['outcome'] = 'continue'
             return out
@@ -95,11 +106,38 @@ def deliver(base, order_id, run_id, text, events=(), decision=None, conversation
                              and not gate.new_records(st.base, run['started_ts']))
         run['evidence'] = dict((path, gate_hash(path)) for path in p['evidence'])
         run['version'] = p['version'] or version
+        run['changed'] = changes
+        run['snapshot'] = []
+        for repo, rels in sorted(changes.items()):
+            run['snapshot'].append(evidence_mod.snapshot(st.base, repo, rels)['evidence'])
+        if run['snapshot']:
+            run['version'] = ' '.join(run['snapshot'])
         o['state'] = 'open'
+        if forced:
+            routing.open_decide(st, o, forced, {'paths': hits, 'snapshot': run['snapshot']})
         register.on_registered(st, o, run, p, legal, decision)
         out.update(outcome='registered', result=run['result'], opened=list(st.opened))
         return out
     return transact(base, 'deliver', actor, fn, expected_revision, request_id)
+
+
+def check_design(base):
+    """Open one design_drift decide when pinned design sections changed (no-op otherwise). True when something was opened."""
+    st = load(base)
+    drifted = model.drifted(st.plan)
+    if not drifted or st.stopped or any(o['type'] == 'decide' and o['input'].get('trigger') == 'design_drift'
+                                        and o['state'] in ('open', 'running') for o in st.orders.values()):
+        return False
+
+    def fn(s):
+        now_drifted = model.drifted(s.plan)
+        if now_drifted:
+            d = routing.new_order(s, 'decide', None, {'by': 'plan', 'ref': 'design', 'reason': 'design_drift'},
+                                  {'trigger': 'design_drift', 'subject': None, 'run': None, 'evidence': [], 'subject_input': {},
+                                   'deliverables': now_drifted, 'issue': '设计文档中被引用的章节已变更：%s' % ', '.join(now_drifted)})
+            return d['id']
+        return None
+    return bool(transact(base, 'check_design', 'driver', fn))
 
 
 def gate_hash(path):

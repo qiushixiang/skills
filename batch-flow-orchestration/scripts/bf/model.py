@@ -1,6 +1,8 @@
 """Plan validation and normalisation (design 4.1) and plan lookups."""
 import copy
+import hashlib
 import json
+import re
 from pathlib import Path
 
 from .store import BfError, need, sha256_file, now
@@ -50,6 +52,8 @@ def normalize(plan):
         spec.setdefault('acceptance', [])
         spec.setdefault('depends_on', [])
         spec.setdefault('resources', [])
+        need(str(spec['instruction']).strip(), 'deliverable %s: instruction is empty' % d)
+        need(spec['acceptance'] and all(str(x).strip() for x in spec['acceptance']), 'deliverable %s: acceptance is empty' % d)
     groups = p.setdefault('review_groups', {})
     for g, spec in groups.items():
         need(g not in dels, 'name %s is both a deliverable and a review group' % g)
@@ -62,6 +66,10 @@ def normalize(plan):
         spec.setdefault('reviewer', 'reviewer')
         need(spec['reviewer'] in ('reviewer', 'third_party') and spec['reviewer'] in roles,
              'review group %s: reviewer role %s unavailable' % (g, spec['reviewer']))
+    covered = set(x for g in groups.values() for x in g['deliverables'])
+    for d, spec in dels.items():
+        need(d in covered or str(spec.get('no_review') or '').strip(),
+             'deliverable %s belongs to no review group; add it to one or write no_review: <reason>' % d)
     for d, spec in dels.items():
         need(all((x in dels or x in groups) and x != d for x in spec['depends_on']), 'deliverable %s: bad depends_on' % d)
     graph = dict((d, list(spec['depends_on'])) for d, spec in dels.items())
@@ -78,6 +86,10 @@ def normalize(plan):
     env.setdefault('batches', list(ids))
     need(all(b in ids for b in env['batches']), 'envelope: unknown batch')
     p.setdefault('env', {})
+    pin_design(p, strict=True)
+    chain = rounds['repair'] + rounds['backup'] + rounds['lead']
+    p['warnings'] = (['policy.rounds.review (%d) < 1 + 返修链长度 (%d)：审阅额度可能不够走完返修链，请与用户确认或预留 grant' % (rounds['review'], 1 + chain)]
+                     if rounds['review'] < 1 + chain else [])
     holds = p.setdefault('holds', [])
     need(all(h in dels or h in groups or h in ids for h in holds), 'holds: unknown deliverable, group or batch')
     return p
@@ -125,3 +137,55 @@ def backend(tool):
 
 def env_for(plan, tool):
     return plan['env'].get(backend(tool), {})
+
+
+# ---- design pinning (design 24.3, 24.4) ----------------------------------------------------------
+
+def section_hash(text, ref):
+    """sha256 of the section whose heading text equals or starts with ref, up to the next heading of the same or
+    higher level; None when no heading matches."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r'^(#+)\s+(.*\S)\s*$', line)
+        if m and (m.group(2) == ref or m.group(2).startswith(ref)):
+            level, end = len(m.group(1)), len(lines)
+            for j in range(i + 1, len(lines)):
+                n = re.match(r'^(#+)\s', lines[j])
+                if n and len(n.group(1)) <= level:
+                    end = j
+                    break
+            return hashlib.sha256('\n'.join(lines[i:end]).encode('utf-8')).hexdigest()
+    return None
+
+
+def pin_design(plan, strict=False):
+    """Record the design file hash and the hash of every referenced section (plan.design.sections)."""
+    design = plan.get('design')
+    if not (design and design.get('path')):
+        return
+    path = Path(str(design['path']))
+    need(path.is_file(), 'design file does not exist: %s' % path)
+    text = path.read_text(encoding='utf-8')
+    design['sha256'] = hashlib.sha256(text.encode('utf-8')).hexdigest()
+    design['sections'] = {}
+    for d, spec in plan['deliverables'].items():
+        ref = spec.get('design_ref')
+        need(ref or not strict, 'deliverable %s: design_ref is required when plan.design is set' % d)
+        if ref and ref not in design['sections']:
+            sha = section_hash(text, ref)
+            need(sha, 'deliverable %s: design_ref %r matches no heading in the design' % (d, ref))
+            design['sections'][ref] = sha
+
+
+def drifted(plan):
+    """Deliverables whose referenced design section changed since it was pinned (read once per call)."""
+    design = plan.get('design') or {}
+    if not design.get('sections'):
+        return []
+    try:
+        text = Path(str(design['path'])).read_text(encoding='utf-8')
+    except OSError:
+        return [d for d, s in plan['deliverables'].items() if s.get('design_ref')]
+    current = dict((ref, section_hash(text, ref)) for ref in design['sections'])
+    return [d for d, s in plan['deliverables'].items() if s.get('design_ref') in current
+            and current[s['design_ref']] != design['sections'][s['design_ref']]]

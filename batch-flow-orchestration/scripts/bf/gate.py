@@ -4,7 +4,7 @@ import re
 import shlex
 from pathlib import Path
 
-from . import evidence as evidence_mod, model
+from . import evidence as evidence_mod, model, routing
 
 _LEAD = r'^[ \t*#>-]*'
 _SEP = r'[ \t]*[:：][ \t]*\**[ \t]*'
@@ -12,7 +12,7 @@ FINDING = re.compile(_LEAD + r'阻断' + _SEP + r'(\S+?)[ \t]*[|｜][ \t]*返修
                      r'方案级[ \t]*[:：][ \t]*(是|否)[ \t]*[|｜][ \t]*关闭条件[ \t]*[:：][ \t]*(.+?)\s*$', re.M)
 SUCCESS = {'implement': ('VERIFIED',), 'repair': ('VERIFIED',), 'review': ('RELEASE', 'FIX_REQUIRED'),
            'decide': ('VERIFIED',), 'triage': ('VERIFIED',)}
-ACTIONS = ('open', 'supersede', 'retry', 'plan_revision', 'grant', 'ask_user')
+ACTIONS = ('open', 'supersede', 'retry', 'plan_revision', 'grant', 'ask_user', 'refresh_design')
 OPENABLE = ('implement', 'repair', 'review', 'triage')
 
 
@@ -21,10 +21,10 @@ def field(text, name):
     return m.group(1).strip().strip('*').strip() if m else ''
 
 
-def candidates(text):
+def candidates(text, label='候选新项'):
     lines = (text or '').splitlines()
     for i, line in enumerate(lines):
-        m = re.match(_LEAD + r'候选新项' + _SEP + r'(.*)$', line)
+        m = re.match(_LEAD + label + _SEP + r'(.*)$', line)
         if not m:
             continue
         out = [m.group(1).strip()] if m.group(1).strip() and not m.group(1).strip().startswith('无') else []
@@ -56,8 +56,9 @@ def parse(text, base):
             'has_issue': bool(issue) and not issue.startswith('无'),
             'findings': [{'id': a, 'target': b, 'plan_level': c == '是', 'closure': d}
                          for a, b, c, d in FINDING.findall(text or '')],
-            'candidates': candidates(text), 'evidence': cited_evidence(base, text),
-            'version': (field(text, '改动与版本') or field(text, '固定版本'))[:200]}
+            'candidates': candidates(text), 'suggestions': candidates(text, '非阻断建议'), 'evidence': cited_evidence(base, text),
+            'fixed': field(text, '固定版本'), 'not_rerun': field(text, '未复跑原因'),
+            'version': (field(text, '改动与版本') or field(text, '固定版本'))[:1000]}
 
 
 # ---- environment evidence -------------------------------------------------------------------------
@@ -127,6 +128,8 @@ def validate_decision(state, decision):
             return '%s 指向不存在的工单' % k
         if k == 'grant' and not isinstance(a['grant'], dict):
             return 'grant 须为 {目标: {额度项: 增量}}'
+        if k == 'refresh_design' and a[k] is not True:
+            return 'refresh_design 须为 true'
         if k == 'plan_revision' and not isinstance(a['plan_revision'], str):
             return 'plan_revision 须为草案路径'
     return ''
@@ -139,6 +142,15 @@ def judge(state, order, run, p, decision, text):
         reason = ''
         if t in ('implement', 'repair') or (t == 'review' and res == 'RELEASE'):
             reason = '' if p['evidence'] else '须引用 bf record / bf snapshot 生成的 records/ 证据文件（手写文件不算证据）'
+            elsewhere = set(path for o in state.orders.values() for r in o['runs'] if r['run_id'] != run['run_id'] for path in r['evidence'])
+            if not reason and not (res == 'RELEASE' and p['not_rerun']) and not evidence_mod.fresh_pass(
+                    p['evidence'], run['started_ts'] - 2, elsewhere):
+                reason = '须至少引用一份本次运行内生成、退出码为 0 的 record（审阅 RELEASE 不能只引用他人记录，否则写“未复跑原因：”）'
+        if not reason and t == 'review':
+            need_paths = [x for d in state.plan['review_groups'].get(order['target'], {}).get('deliverables', [])
+                          for x in routing.latest_snapshots(state, d)]
+            missing = [x for x in need_paths if x not in p['fixed']]
+            reason = '固定版本须包含被审交付目标的最近快照路径：%s' % '、'.join(missing) if missing else ''
         if not reason and t == 'repair':
             tail = text[text.find('阻断关闭'):] if '阻断关闭' in text else ''
             missing = [f['id'] for f in order['input'].get('findings', [])
