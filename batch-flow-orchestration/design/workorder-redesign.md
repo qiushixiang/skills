@@ -408,3 +408,9 @@ scripts/agent_cli.py      保留（CLI 适配器，已验证的宿主细节）
   - `settings(base)`：Claude Code settings，PreToolUse 挂 `front.py hook --base <base>`。
   - `prompt(base)`：职责、命令、每 10 分钟用 `bf report` 汇报、用户回答写入 `answers/` 后 `bf answer`，不超过 3000 字。
   - `front.py launch --base <dir> [--model M]`：以上述 settings 与 prompt 启动 `claude` 交互会话。
+
+## 20. 切换记录（2026-11-07）
+
+- EtherCAT 台账已导入为 v2（同一 `.batch-flow` 目录，`records/` 原地沿用）；导入报告 `import-report.json`：38 个交付目标、22 个审阅组、45 项已完成、15 项开立、证据哈希全部完好。v1 `flow.json` 设为只读留作审计。
+- 按用户决定修订计划：授权包络覆盖全部批次；`policy.rounds.implement = 1`（返修走独立返修链，不占实施轮次）；用户原话存于 `.batch-flow/approvals/cutover-20261107.txt`。
+- v1 代码与文档已删除，可从 git 标签 `v1-final` 取回；一次性导入器随之删除（同一标签内保留）。

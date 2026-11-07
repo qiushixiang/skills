@@ -25,10 +25,6 @@ def main(argv=None):
     group = ans.add_mutually_exclusive_group(required=True)
     group.add_argument('--approve', action='store_true')
     group.add_argument('--reject', action='store_true')
-    imp = sub.add_parser('import')
-    imp.add_argument('--v1', required=True)
-    imp.add_argument('--approval', required=True)
-    imp.add_argument('--workspace')
     for name in ('init', 'revise'):
         p = sub.add_parser(name)
         p.add_argument('--plan', required=True)
@@ -53,9 +49,6 @@ def main(argv=None):
         elif args.cmd in ('init', 'revise'):
             plan = json.loads(Path(args.plan).read_text(encoding='utf-8'))
             out = {args.cmd: (api.init if args.cmd == 'init' else api.revise_plan)(base, plan, args.approval)}
-        elif args.cmd == 'import':
-            from bf import importer
-            out = importer.import_v1(args.v1, base, args.approval, workspace=args.workspace)
         else:
             from bf import adapter, runner
             profiles = adapter.ensure_profiles(base, args.agent_cli, dict(p.split('=', 1) for p in args.profile))

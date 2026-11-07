@@ -13,8 +13,6 @@ from unittest.mock import patch
 
 import agent_cli
 import model_catalog as catalog
-import start_agy_orchestrator as launcher
-import orchestrator_guard
 
 
 class CatalogTests(unittest.TestCase):
@@ -93,35 +91,6 @@ for line in sys.stdin:
                 self.assertEqual(agent_cli.main(), 0)
                 self.assertEqual(agent_cli.main(), 2)
             self.assertEqual(json.loads(output.read_text()), {'models': []})
-
-    def test_bound_orchestrator_can_query_but_cannot_override_binary_or_escape_records(self):
-        spec = dict(python=sys.executable, profiles=['/runtime/profile'], records='/task/records')
-        base = [sys.executable, str(launcher.SCRIPTS/'agent_cli.py')]
-        for args in [ ['models','--profile','/runtime/profile','--output','/task/records/catalog.json'],
-                      ['resolve-model','--profile','/runtime/profile','--catalog','/task/records/catalog.json','--name','Gemini 3.8 Flash'] ]:
-            self.assertTrue(launcher.safe_command(shlex.join(base+args), spec))
-            self.assertFalse(launcher.safe_command(shlex.join(base+args+['--binary','/bad']), spec))
-            self.assertFalse(launcher.safe_command(shlex.join(base+[v.replace('/runtime/profile','/fake/profile') for v in args]), spec))
-            self.assertFalse(launcher.safe_command(shlex.join(base+[v.replace('/task/records/catalog.json','/outside/catalog.json') for v in args]), spec))
-        self.assertFalse(launcher.safe_command(shlex.join(base+['models','--profile','/runtime/profile',
-            '--output','/task/records/ok','--output','/outside/bad']), spec))
-
-    def test_claude_metadata_queries_require_launch_binding(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            runtime = root/'.claude-launch/test'; runtime.mkdir(parents=True)
-            profile = str(runtime/'agy-profile.json')
-            (runtime/'spec.json').write_text(json.dumps(dict(profiles=[profile])))
-            card_root = root/'records/dispatch'
-            args = ['python3', str(launcher.SCRIPTS/'agent_cli.py'), 'models', '--profile', profile,
-                    '--output', str(root/'records/catalog.json')]
-            with patch.dict(os.environ, {'BATCH_FLOW_CLAUDE_LAUNCH':'test'}):
-                self.assertIsNone(orchestrator_guard.check_bash(dict(command=shlex.join(args)),tmp,[root],card_root))
-                args[-1] = str(root/'outside.json')
-                self.assertIsNotNone(orchestrator_guard.check_bash(dict(command=shlex.join(args)),tmp,[root],card_root))
-                args[-1] = str(root/'records/catalog.json'); args[4] = '/unbound/profile'
-                self.assertIsNotNone(orchestrator_guard.check_bash(dict(command=shlex.join(args)),tmp,[root],card_root))
-
 
 if __name__ == '__main__':
     unittest.main()
