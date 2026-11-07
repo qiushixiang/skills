@@ -70,7 +70,7 @@ class AgentCliAdapter(object):
             raise api.BfError('plan.workspace is not set (source working directory)')
         argv = [sys.executable, self.agent_cli, 'run', '--profile', profile, '--task', order['id'], '--cwd', plan['workspace'],
                 '--model', assignment['model'], '--effort', assignment['effort'], '--prompt-file', str(card_path),
-                '--run-dir', str(cli_dir), '--access', 'read' if order['type'] == 'review' else 'write']
+                '--run-dir', str(cli_dir), '--access', assignment.get('access') or ('read' if order['type'] == 'review' else 'write')]
         env = model.env_for(plan, assignment['tool'])
         for d in env.get('add_dirs') or []:
             argv += ['--add-dir', d]

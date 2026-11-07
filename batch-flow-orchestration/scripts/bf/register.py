@@ -25,13 +25,21 @@ def on_registered(state, order, run, p, legal, decision):
         order['state'] = 'done'
         apply_triage(state, order, decision)
     if legal:
-        routing.add_candidates(state, order, p['candidates'])
+        routing.add_candidates(state, order, p['candidates'] + p['suggestions'])
     routing.check_exhausted(state, order)
 
 
 def _needs_user(state, a):
     plan = state.plan
     if 'grant' in a or 'plan_revision' in a:
+        return True
+    if 'supersede' in a and a['supersede'] in state.orders:
+        victim = state.orders[a['supersede']]
+        if victim['type'] in ('review', 'release') or any(
+                victim['id'] in o['needs'] and o['state'] not in routing.SATISFIED and o['type'] not in ('review', 'release')
+                for o in state.orders.values()):
+            return True
+    if a.get('allow_protected'):
         return True
     return 'open' in a and model.batch_of(plan, a['target']) not in plan['envelope']['batches']
 
@@ -52,8 +60,11 @@ def apply_actions(state, source, actions, waiter, forced=False, diagnosis=''):
 def _execute(state, source, a, waiter):
     plan = state.plan
     if 'open' in a:
+        inp = dict(a.get('input') or {})
+        if a.get('allow_protected'):
+            inp['allow_protected'] = list(a['allow_protected'])
         o = routing.new_order(state, a['open'], a.get('target'), {'by': 'order', 'ref': source['id'], 'reason': 'decision'},
-                              dict(a.get('input') or {}), a.get('needs'))
+                              inp, a.get('needs'))
         if a.get('fresh_session'):
             o['fresh_next'] = True
         routing.link(state, o)
@@ -62,6 +73,10 @@ def _execute(state, source, a, waiter):
         if o['state'] != 'done':
             o['state'] = 'superseded'
             o['output'] = {'superseded_by': source['id'], 'reason': a.get('reason', '')}
+    elif 'refresh_design' in a:
+        model.pin_design(plan)
+        plan['revision'] += 1
+        state.plan_dirty = True
     elif 'retry' in a:
         o = routing.get(state, a['retry'])
         if o['state'] in ('open', 'failed'):

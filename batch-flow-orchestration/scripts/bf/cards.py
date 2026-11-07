@@ -3,7 +3,7 @@ import json
 import os
 import sys
 
-from . import model
+from . import model, routing
 
 STOP_RULES = ('停止原因规则：完成=结果 VERIFIED 并引用 records/ 下存在的证据；范围内仍有可试路径=未完成；'
               '技术不可行=FAILED 且上升问题写明已试方案；外部阻塞=WAIT_EVIDENCE，仅当直接调用受控入口出现环境失败。')
@@ -13,7 +13,7 @@ EXECUTOR = ['结果：VERIFIED | FAILED | ARCH_DECISION_REQUIRED | WAIT_EVIDENCE
             '停止原因：完成 | 未完成 | 技术不可行 | 待裁决 | 外部阻塞',
             '改动与版本：<提交或快照>', '验证证据：<records/ 下证据文件的绝对路径>', '未运行/失败：...',
             '上升问题：...（没有写“无”）', '候选新项：（可选，下接逐行“- ”）', '限制：...']
-REVIEWER = ['结果：RELEASE | FIX_REQUIRED', '固定版本：<被审版本>', '复跑与证据：<records/ 下证据文件的绝对路径>',
+REVIEWER = ['结果：RELEASE | FIX_REQUIRED', '固定版本：<被审版本>', '复跑与证据：<records/ 下证据文件的绝对路径>', '未复跑原因：（沿用执行者记录而未亲自复跑时必填）',
             '阻断：B1 | 返修:<交付目标> | 方案级:是/否 | 关闭条件:...（FIX_REQUIRED 时每项一行）',
             '非阻断建议：...', '候选新项：（可选）']
 SCHEMA = ('{"diagnosis": "...", "actions": [{"open": "implement|repair|review|triage", "target": "...", "input": {...}}, '
@@ -90,7 +90,10 @@ def _body(state, o, run_dir):
         out = ['被审版本：']
         for d in model.deliverables_of(plan, o['target']):
             r = _last_done(state, d)
-            out.append('- %s：版本 %s；证据 %s' % (d, (r or {}).get('version') or '未记录', ', '.join(sorted((r or {}).get('evidence', {}))) or '无'))
+            snaps = ' '.join(routing.latest_snapshots(state, d))
+            out.append('- %s：版本 %s；证据 %s' % (d, snaps or (r or {}).get('version') or '未记录', ', '.join(sorted((r or {}).get('evidence', {}))) or '无'))
+        if state.plan.get('repos'):
+            out.append('“固定版本”行须包含上列每个交付目标的快照路径；你只可写 records 与交付文本，不得改动源码。')
         repairs = [state.orders[n] for n in o['needs'] if n in state.orders and state.orders[n]['type'] == 'repair']
         if repairs:
             out.append('这是复审：只核对下列阻断项与回归；已关闭的写入通过，未关闭的重新列为阻断。')

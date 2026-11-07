@@ -119,13 +119,15 @@ class Runner(object):
         if st.stopped:
             return False
         progress = False
+        if api.check_design(self.base):
+            st = api.load(self.base)
         for oid in api.runnable(st, self.parallel):
             o = st.orders[oid]
             if o['type'] == 'release':
                 api.release(self.base, oid)
                 progress = True
                 continue
-            a = api.assign(st, oid)
+            a = dict(api.assign(st, oid), access='read' if o['type'] == 'review' and not st.plan.get('repos') else 'write')
             resume = a['session']['conversation_id'] if a['session']['mode'] == 'resume' else None
             run_id = api.start(self.base, oid, conversation_id=resume)
             st = api.load(self.base)

@@ -89,3 +89,15 @@ def doctor(base):
                     if not (SKILL / 'scripts' / ref).exists():
                         missing.append({'file': str(path), 'line': n, 'ref': 'scripts/' + ref})
     return {'missing': missing}
+
+
+def fresh_pass(paths, since, elsewhere=()):
+    """True when some cited record has exit_code 0, was written at or after `since`, and is not another run's evidence."""
+    for p in paths:
+        try:
+            ok = json.loads(Path(p).read_text(encoding='utf-8')).get('exit_code') == 0 and os.path.getmtime(p) >= since
+        except (OSError, ValueError, AttributeError):
+            continue
+        if ok and p not in elsewhere:
+            return True
+    return False

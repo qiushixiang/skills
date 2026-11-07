@@ -54,3 +54,11 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow init --plan plan.
 - **授权包络**：`envelope.batches` 是用户批准可自主推进的批次；包络外的工作由脚本转交用户。
 - **环境**：需要宿主权限的验证只经 `env.entry` 受控入口；`blocked_output` 写入口自身的环境失败输出，用于机械判定“外部阻塞”。
 - 默认额度通常够用；个别交付目标需要更多轮次时写 `overrides`，并在审阅计划时向用户说明。
+
+## 完整性字段（design §24）
+
+- `repos`：源码仓库绝对路径列表。写了才启用自动快照：每次运行前记录脏文件基线，登记时算出本次改动并生成快照；审阅卡因此可写源码仓库之外的 records（审阅访问为 write，但改动源码会被判 `review_modified`）。不写则不做快照。
+- `protected`：受保护路径 glob（如 `tests/run_board_test.sh`）。执行者改动即登记为 FAILED 并转技术负责人（trigger `protected_change`）；放开须裁决 `open` 带 `allow_protected`，并经用户批准。
+- `no_review`：交付目标不属于任何审阅组时必须写明原因，否则计划不通过。
+- `design_ref`：设计文档章节标题（有 `design.path` 时每个交付目标必填，须能匹配标题）。脚本记下章节哈希（`design.sections`）；章节后来被改，相关交付目标暂停派发，并开 `design_drift` 裁决（处置 `{"refresh_design": true}` 表示方案不变，重新固定哈希）。
+- `instruction`、`acceptance` 不得为空。`policy.rounds.review < 1 + 返修链长度` 时写入 `plan.warnings`，审阅轮次可能不够。
