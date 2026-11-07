@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-COMMANDS = ('status', 'report', 'run', 'stop', 'resume', 'answer')
+COMMANDS = ('status', 'report', 'run', 'stop', 'resume', 'answer', 'doctor', 'watch')
 # Adjustment commands: positionals ('one', 'many' or None), flags with value counts (-1 = variadic), required flags.
 ADJUST = {
     'models': {'pos': 'one', 'flags': {}, 'need': ()},
@@ -21,7 +21,8 @@ ADJUST = {
     'supersede': {'pos': 'one', 'flags': {'--reason': 1, '--approval': 1}, 'need': ('--reason', '--approval')},
 }
 ADJUST['retry'] = ADJUST['escalate'] = {'pos': 'one', 'flags': {'--note': 1}, 'need': ('--note',), 'order': True}
-FLAGS = {'report': {'--text': 0}, 'run': {'--parallel': 1, '--profile': 1}, 'answer': {'--file': 1, '--approve': 0, '--reject': 0}}
+ADJUST['snapshot'] = {'pos': None, 'flags': {'--repo': 1, '--paths': -1}, 'need': ('--repo', '--paths')}
+FLAGS = {'doctor': {}, 'watch': {'--since': 1, '--once': 0}, 'stop': {'--now': 0}, 'report': {'--text': 0}, 'run': {'--parallel': 1, '--profile': 1}, 'answer': {'--file': 1, '--approve': 0, '--reject': 0}}
 SHELL_META = r'[;&|<>`$()\n\\]'
 SWITCH_FLAGS = ('-k', '-n')
 SWITCH_TARGET = re.compile(r'[^@\s/]+@[^@\s/]+')
@@ -96,6 +97,12 @@ def allowed(command, account_switch=()):
         return False
     if words[2] != '--base':
         return False
+    if words[4] == 'record':
+        rest = words[5:]
+        if '--' not in rest:
+            return False
+        head, child = rest[:rest.index('--')], rest[rest.index('--') + 1:]
+        return (head == [] or (len(head) == 2 and head[0] == '--cwd')) and bool(child) and readonly_words(child)
     if words[4] in ADJUST:
         return _adjust_allowed(ADJUST[words[4]], os.path.normpath(words[3]), words[5:])
     if words[4] not in COMMANDS:
@@ -114,7 +121,7 @@ def allowed(command, account_switch=()):
 
 # ---- launcher: PreToolUse guard, settings and prompt for the chat-front Claude Code session ---------
 
-PASS_TOOLS = ('ScheduleWakeup', 'CronCreate', 'CronDelete', 'CronList')
+PASS_TOOLS = ('Monitor', 'ScheduleWakeup', 'CronCreate', 'CronDelete', 'CronList')
 
 
 def _inside(path, root, cwd=None):
@@ -124,29 +131,57 @@ def _inside(path, root, cwd=None):
 
 
 READ_TOOLS = ('Read', 'Grep', 'Glob', 'Skill')
-READONLY = ('ls', 'cat', 'head', 'tail', 'grep', 'rg', 'wc')
+READONLY = ('ls', 'cat', 'head', 'tail', 'grep', 'rg', 'wc', 'ps', 'pgrep', 'true')
 FIND_WRITES = ('-exec', '-execdir', '-ok', '-okdir', '-delete', '-fprint', '-fprint0', '-fprintf', '-fls')
 GIT_READS = ('log', 'status', 'diff', 'show')
-HOOK_META = re.compile(r'[|;&<>`$\n\\]')
+HOOK_META = re.compile(r'[;<>`$\n\\]')
 
 
-def readonly_shell(command):
-    """ls/cat/head/tail/grep/rg/wc, find without write actions, and git log/status/diff/show (with -C <dir>)."""
-    if HOOK_META.search(command or ''):
-        return False
-    try:
-        w = shlex.split(command)
-    except ValueError:
-        return False
+def readonly_words(w):
+    """ls/cat/head/tail/grep/rg/wc/ps/pgrep, find without write actions, git -C <dir> log|status|diff|show, cd <dir>."""
     if not w:
         return False
     if w[0] in READONLY:
         return not any(x in ('-f', '-F', '--follow', '--pre') or x.startswith('--pre=') for x in w[1:])
     if w[0] == 'find':
         return not any(x in FIND_WRITES for x in w[1:])
+    if w[0] == 'cd':
+        return len(w) == 2
     if w[0] == 'git' and len(w) >= 4 and w[1] == '-C':
         return w[3] in GIT_READS and not any(x.startswith(('--output', '--ext-diff', '--exec')) for x in w[4:])
     return False
+
+
+def readonly_shell(command):
+    if HOOK_META.search(command or ''):
+        return False
+    try:
+        return readonly_words(shlex.split(command))
+    except ValueError:
+        return False
+
+
+def shell_ok(command, account_switch=()):
+    """Pipelines (|) and && whose every segment is an allowed bf command, account switch or read-only command."""
+    if HOOK_META.search(command or ''):
+        return False
+    try:
+        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return False
+    segments, cur = [], []
+    for t in tokens:
+        if t in ('|', '&&'):
+            segments.append(cur)
+            cur = []
+        elif re.fullmatch(r'[();<>|&]+', t):
+            return False
+        else:
+            cur.append(t)
+    segments.append(cur)
+    return all(s and (readonly_words(s) or allowed(' '.join(shlex.quote(x) for x in s), account_switch)) for s in segments)
 
 
 def hook_decision(event, base, account_switch=()):
@@ -157,7 +192,7 @@ def hook_decision(event, base, account_switch=()):
     path = inp.get('file_path') or ''
     if tool == 'Bash':
         command = inp.get('command') or ''
-        ok = not HOOK_META.search(command) and (allowed(command, account_switch) or readonly_shell(command))
+        ok = shell_ok(command, account_switch)
     elif tool == 'Write':
         target = path if os.path.isabs(path) else os.path.join(cwd or '', path)
         ok = bool(path) and _inside(target, os.path.join(base, 'answers')) and not os.path.exists(target)
@@ -179,8 +214,8 @@ def prompt(base, account_switch=()):
         '你是 batch-flow v2 的运维与沟通角色（聊天前端）。脚本负责派发、交付判定与额度；技术负责人负责技术判断；你负责运维、汇报和转达用户的决定。',
         '下文 CLI 指：%s' % cli,
         '职责：',
-        '1. 启动、停止、查看驱动器：CLI run 必须用 Bash 的 run_in_background 启动，使它在你与用户交谈时持续运行；CLI stop / CLI resume（stop 只阻止新派发，在途调用会结束并被回收）；CLI status。',
-        '2. 每 10 分钟（用 ScheduleWakeup 或 CronCreate）及用户询问时运行 CLI report --text，把结果转述给用户，必要时加上你自己的判断（例如哪里可能卡住）。需要更多细节时读 CLI report 的 JSON、%s/attention.md 与 %s/records/runs/ 下的卡片和原始输出。' % (base, base),
+        '1. 启动、停止、查看驱动器：CLI run 必须用 Bash 的 run_in_background 启动，使它在你与用户交谈时持续运行；CLI stop / CLI resume（stop 阻止新派发与续跑，在途调用自行结束；用户说“立刻停”“全部停掉”时用 CLI stop --now，终止在途调用，登记为免扣无效）；CLI status。',
+        '2. 启动驱动器后立刻用 Monitor 工具挂上 CLI watch（事件推送，每行一条：待你决定、运维故障、交付结果、批次放行、驱动器启停），被唤醒后告诉用户并按需处理；另用 CronCreate 建一个每 10 分钟重复的定时任务（不要用一次性的 ScheduleWakeup），以及用户询问时，运行 CLI report --text，把结果转述给用户，必要时加上你自己的判断（例如哪里可能卡住）。需要更多细节时读 CLI report 的 JSON、%s/attention.md 与 %s/records/runs/ 下的卡片和原始输出。' % (base, base),
         '3. 处理运维故障：report 的“待你决定”里带运维故障的项，是 CLI 连续不可用而被暂停的工单。读它的 problem 和对应运行目录 %s/records/runs/<运行>/ 下的原始输出再判断：' % base,
         '   - codex 额度或用量限制，且已配置账号切换命令：运行账号切换，然后 CLI retry WO-n --note \'已切换账号\'；',
         '   - 认证失效、网络、需要用户操作的问题：如实告诉用户；用户处理后再 retry；',

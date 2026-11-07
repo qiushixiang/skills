@@ -1,11 +1,12 @@
 """Public API of batch-flow v2 core (design 17). Every mutation is one transaction = one revision + one event."""
 import re
 import time
+from pathlib import Path
 
 from . import gate, model, policy, register, routing, context
 from .store import BfError, State, load, need, now, transact
 
-__all__ = ['retry', 'escalate', 'report_text', 'abandon', 'report', 'BfError', 'init', 'load', 'orders', 'runnable', 'assign', 'start', 'deliver', 'release', 'answer',
+__all__ = ['driver_event', 'watch', 'watch_lines', 'driver_status', 'retry', 'escalate', 'report_text', 'abandon', 'report', 'BfError', 'init', 'load', 'orders', 'runnable', 'assign', 'start', 'deliver', 'release', 'answer',
            'revise_plan', 'stop', 'resume', 'broken_evidence']
 
 
@@ -135,19 +136,27 @@ def revise_plan(base, plan, approval, expected_revision=None, request_id=None, a
     return transact(base, 'revise_plan', actor, fn, expected_revision, request_id)
 
 
-def _set_stopped(base, value, op, expected_revision, request_id, actor):
+def _set_stopped(base, value, op, expected_revision, request_id, actor, kill=False):
     def fn(st):
         st.stopped = value
+        st.kill = kill
         return value
     return transact(base, op, actor, fn, expected_revision, request_id)
 
 
-def stop(base, expected_revision=None, request_id=None, actor='user'):
-    return _set_stopped(base, True, 'stop', expected_revision, request_id, actor)
+def stop(base, expected_revision=None, request_id=None, actor='user', now=False):
+    """Stop dispatching and continuing; now=True also asks the driver to kill in-flight calls."""
+    return _set_stopped(base, True, 'stop', expected_revision, request_id, actor, kill=bool(now))
 
 
 def resume(base, expected_revision=None, request_id=None, actor='user'):
     return _set_stopped(base, False, 'resume', expected_revision, request_id, actor)
+
+
+def driver_event(base, kind, pid=None):
+    """Record driver_start / driver_exit as a (state-neutral) transaction so the event stream shows the driver's life."""
+    import os
+    return transact(base, kind, 'driver', lambda st: pid or os.getpid())
 
 
 def abandon(base, order_id, run_id, reason, expected_revision=None, request_id=None, actor='driver'):
@@ -167,7 +176,7 @@ def abandon(base, order_id, run_id, reason, expected_revision=None, request_id=N
             if o['type'] in ('decide', 'triage'):
                 routing.fail_to_user(st, o, 'tool_failure')
             else:  # operational: the chat front decides between retry and escalate (design 22)
-                o['ops'] = {'problem': reason, 'at': now()}
+                o['ops'] = {'problem': reason, 'at': now(), 'run': run_id}
         return run_id
     return transact(base, 'abandon', actor, fn, expected_revision, request_id)
 
@@ -275,7 +284,7 @@ def report(base, recent=10):
     ended.sort(key=lambda x: x['ended'])
     return {'revision': st.revision, 'stopped': st.stopped, 'running': running, 'recent': ended[-recent:], 'ask_user': ask,
             'budgets': budgets, 'runnable': runnable_ids, 'roles': plan['roles'], 'next': nxt, 'batches': batches,
-            'ops': ops, 'name': plan.get('name', ''), 'broken_evidence': routing.broken_paths(st)}
+            'ops': ops, 'name': plan.get('name', ''), 'driver': driver_status(base), 'broken_evidence': routing.broken_paths(st)}
 
 
 def _who_run(st, item):
@@ -290,12 +299,94 @@ def _line(item):
     return item['label'] + extra
 
 
+def driver_status(base):
+    """Heartbeat file written by the runner: alive = pid alive and not exited."""
+    import json as _json, os
+    try:
+        d = _json.loads((Path(str(base)) / 'driver.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {'alive': False}
+    alive = not d.get('exited')
+    if alive:
+        try:
+            os.kill(d['pid'], 0)
+        except (OSError, KeyError, TypeError):
+            alive = False
+    return dict(d, alive=alive)
+
+
+def watch(base, since=0):
+    """(lines, last revision): one human line per notable event after revision `since`."""
+    import json as _json
+    st = load(base)
+    lines, last = [], since
+    try:
+        raw = (Path(str(base)) / 'events.jsonl').read_text(encoding='utf-8').splitlines()
+    except OSError:
+        raw = []
+    for line in raw:
+        try:
+            ev = _json.loads(line)
+        except ValueError:
+            continue
+        if ev['revision'] <= since:
+            continue
+        last = max(last, ev['revision'])
+        text = _event_line(st, ev)
+        if text:
+            lines.append(' '.join(text.split()))
+    return lines, last
+
+
+def watch_lines(base, since_revision=0):
+    return watch(base, since_revision)[0]
+
+
+def _event_line(st, ev):
+    op, res, plan = ev['op'], ev.get('result'), st.plan
+    if op == 'driver_start':
+        return '驱动器启动'
+    if op == 'driver_exit':
+        return '驱动器退出'
+    if op == 'stop':
+        return '已停止'
+    if op == 'resume':
+        return '已恢复'
+    if op == 'answer':
+        return '已记录你的回答'
+    if op == 'release' and res in st.orders:
+        t = st.orders[res]['target']
+        title = next((b.get('title') for b in plan['batches'] if b['id'] == t), '')
+        return '批次放行：%s %s' % (t, title)
+    if op == 'abandon' and isinstance(res, str):
+        o = st.orders.get(res.rsplit('-r', 1)[0])
+        if o and o.get('ops') and o['ops'].get('run') == res:
+            return '运维故障待处理（已暂停）：%s：%s' % (label(plan, o['target']), o['ops']['problem'][:80])
+        return None
+    if op == 'deliver' and isinstance(res, dict):
+        o = st.orders.get(res['run_id'].rsplit('-r', 1)[0])
+        if not o:
+            return None
+        parts = []
+        if res.get('outcome') == 'registered' and o['type'] in ('implement', 'repair', 'review'):
+            run = next((r for r in o['runs'] if r['run_id'] == res['run_id']), {})
+            parts.append('%s %s：%s%s' % (VERBS[o['type']], label(plan, o['target']), run.get('result'),
+                                        '（%s）' % run['stop_reason'] if run.get('stop_reason') and run.get('result') != 'VERIFIED' else ''))
+        for oid in res.get('opened', []):
+            ask = st.orders.get(oid)
+            if ask and ask['type'] == 'ask_user':
+                parts.append('待你决定：%s：%s' % (label(plan, ask['target']), re.sub(r'WO-\d+', '', ask['input'].get('question', ''))[:80]))
+        return '；'.join(parts) or None
+    return None
+
+
 def report_text(base):
     """Short Chinese status note for people: titles, never order ids."""
     r = report(base)
     strip = lambda t: re.sub(r'WO-\d+', '', t or '').strip()[:100]
     out = ['%s · %s' % (r['name'] or '任务', time.strftime('%H:%M'))]
     out.append('已停止（stop），不再派发新工单。' if r['stopped'] else '')
+    out.append('驱动器：' + ('运行中' if r['driver'].get('alive') else '未运行'))
     out.append('正在做：' + ('；'.join('%s %s' % (VERBS.get(x['type'], x['type']), _line(x)) for x in r['running']) or '无'))
     nxt = r['next'][:3]
     out.append('下一步：' + ('；'.join('%s %s' % (VERBS.get(x['type'], x['type']), _line(x)) for x in nxt) +

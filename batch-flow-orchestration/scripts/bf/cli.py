@@ -13,8 +13,17 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog='bf')
     ap.add_argument('--base', required=True)
     sub = ap.add_subparsers(dest='cmd', required=True)
-    for name in ('status', 'stop', 'resume'):
+    for name in ('status', 'resume', 'doctor'):
         sub.add_parser(name)
+    sub.add_parser('stop').add_argument('--now', action='store_true')
+    rec = sub.add_parser('record')
+    rec.add_argument('--cwd')
+    snap = sub.add_parser('snapshot')
+    snap.add_argument('--repo', required=True)
+    snap.add_argument('--paths', nargs='+', required=True)
+    wt = sub.add_parser('watch')
+    wt.add_argument('--since', type=int, default=0)
+    wt.add_argument('--once', action='store_true')
     sub.add_parser('report').add_argument('--text', action='store_true')
     for name in ('retry', 'escalate'):
         p = sub.add_parser(name)
@@ -54,6 +63,11 @@ def main(argv=None):
         p = sub.add_parser(name)
         p.add_argument('--plan', required=True)
         p.add_argument('--approval', required=True)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    child = []
+    if '--' in argv:  # record's child command is never parsed by argparse
+        split = argv.index('--')
+        argv, child = argv[:split], argv[split + 1:]
     args = ap.parse_args(argv)
     base = Path(args.base)
     try:
@@ -71,8 +85,31 @@ def main(argv=None):
             out = api.report(base)
         elif args.cmd in ('retry', 'escalate'):
             out = {args.cmd: getattr(api, args.cmd)(base, args.order, args.note)}
-        elif args.cmd in ('stop', 'resume'):
-            out = {args.cmd: getattr(api, args.cmd)(base)}
+        elif args.cmd == 'record':
+            from bf import evidence
+            out, code = evidence.record(base, child, args.cwd)
+            print(json.dumps(out, ensure_ascii=False))
+            return code
+        elif args.cmd == 'snapshot':
+            from bf import evidence
+            out = evidence.snapshot(base, args.repo, args.paths)
+        elif args.cmd == 'doctor':
+            from bf import evidence
+            out = evidence.doctor(base)
+        elif args.cmd == 'watch':
+            since = args.since
+            while True:
+                lines, since = api.watch(base, since)
+                for line in lines:
+                    print(line, flush=True)
+                if args.once:
+                    return 0
+                import time
+                time.sleep(2)
+        elif args.cmd == 'stop':
+            out = {'stop': api.stop(base, now=args.now)}
+        elif args.cmd == 'resume':
+            out = {'resume': api.resume(base)}
         elif args.cmd == 'answer':
             text = Path(args.file).read_text(encoding='utf-8')
             out = {'answered': api.answer(base, args.order, text, approve=args.approve)}

@@ -17,6 +17,12 @@ description: 以下情形加载：用户要求使用本技能（batch-flow / 分
 | `scripts/bf/front.py launch` | 聊天前端：启动和查看 `bf run`、每 10 分钟汇报、转交用户回答；不调度 |
 | `scripts/agent_cli.py` | 各 CLI 后端（codex、claude、opencode、agy）的调用适配，见 [CLI 适配器](references/cli-adapter.md) |
 
+## 对外接口（项目脚本与角色可依赖）
+
+- `bf/cli.py --base <任务>/.batch-flow record [--cwd D] -- 命令 …`：运行命令（直接子进程）并写 `records/<随机>.json`，字段 `command`(list)、`cwd`、`started_at`、`ended_at`、`exit_code`(int)、`stdout`、`stderr`；标准输出一行 `{"ok","evidence","exit_code"}`；退出码透传（0..125，否则 1）；不改工单状态。
+- `bf/cli.py --base <…> snapshot --repo R --paths 文件…`：写代码快照记录，字段 `repository`、`base_commit`、`paths`、`diff`、`untracked_base64`。
+- 门禁只接受符合这两种结构的证据文件，手写文件不算证据。项目的受控入口应调用 `bf record`；切换或升级技能前运行 `bf doctor` 检查任务目录是否还引用已不存在的技能脚本。
+
 ## 按身份只读一份
 
 | 身份 | 读 |

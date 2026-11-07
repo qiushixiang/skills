@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from . import api, model
@@ -93,6 +94,22 @@ class AgentCliAdapter(object):
         log.close()
         self.procs[proc.pid] = proc
         return {'dir': str(cli_dir), 'pid': proc.pid, 'run_dir': str(run_dir)}
+
+    def kill(self, handle, grace=5.0):
+        """Terminate the call's process group (it is a session leader): TERM, then KILL after a grace period."""
+        import signal
+        pid = handle['pid']
+        for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 1.0)):
+            try:
+                os.killpg(pid, sig)
+            except OSError:
+                return
+            end = time.time() + wait
+            while time.time() < end:
+                proc = self.procs.get(pid)
+                if (proc.poll() is not None) if proc is not None else not _alive(pid):
+                    return
+                time.sleep(0.1)
 
     def poll(self, handle):
         cli_dir = Path(handle['dir'])

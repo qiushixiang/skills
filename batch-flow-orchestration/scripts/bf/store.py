@@ -35,12 +35,13 @@ def sha256_file(path):
 
 
 class State(object):
-    def __init__(self, base, plan, orders, revision=0, stopped=False, seq=0):
+    def __init__(self, base, plan, orders, revision=0, stopped=False, seq=0, kill=False):
         self.base = Path(base)
         self.plan = plan
         self.orders = orders
         self.revision = revision
         self.stopped = stopped
+        self.kill = kill
         self.seq = seq
         self.plan_dirty = False
         self.opened = []  # order ids opened by the current transaction
@@ -66,7 +67,7 @@ def _read(base):
     need((base / 'plan.json').is_file() and (base / 'orders.json').is_file(), 'not initialised: %s' % base)
     meta = _read_json(base / 'orders.json')
     return State(base, _read_json(base / 'plan.json'), meta['orders'], meta['revision'],
-                 meta.get('stopped', False), meta.get('seq', 0))
+                 meta.get('stopped', False), meta.get('seq', 0), meta.get('kill', False))
 
 
 def load(base):
@@ -136,7 +137,7 @@ def transact(base, op, actor, fn, expected_revision=None, request_id=None, init=
             _atomic_write(base / 'plan.json', _dump(state.plan))
             (base / 'plan.history').mkdir(exist_ok=True)
             _atomic_write(base / 'plan.history' / ('plan-%04d.json' % state.plan['revision']), _dump(state.plan))
-        orders_bytes = _dump({'revision': state.revision, 'stopped': state.stopped, 'seq': state.seq,
+        orders_bytes = _dump({'revision': state.revision, 'stopped': state.stopped, 'kill': state.kill, 'seq': state.seq,
                               'orders': state.orders})
         _atomic_write(base / 'orders.json', orders_bytes)
         event = {'revision': state.revision, 'request_id': request_id or uuid.uuid4().hex, 'actor': actor,
