@@ -13,7 +13,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog='bf')
     ap.add_argument('--base', required=True)
     sub = ap.add_subparsers(dest='cmd', required=True)
-    for name in ('status', 'resume', 'doctor'):
+    for name in ('status', 'resume', 'doctor', 'ensure-run'):
         sub.add_parser(name)
     sub.add_parser('stop').add_argument('--now', action='store_true')
     rec = sub.add_parser('record')
@@ -30,6 +30,7 @@ def main(argv=None):
         p.add_argument('order')
         p.add_argument('--note', required=True)
     run = sub.add_parser('run')
+    run.add_argument('--background', action='store_true', help='Start a detached single driver and return immediately')
     run.add_argument('--parallel', type=int, default=1)
     run.add_argument('--profile', action='append', default=[], help='backend=profile.json (repeatable)')
     run.add_argument('--agent-cli')
@@ -110,6 +111,9 @@ def main(argv=None):
             out = {'stop': api.stop(base, now=args.now)}
         elif args.cmd == 'resume':
             out = {'resume': api.resume(base)}
+        elif args.cmd == 'ensure-run':
+            from bf import runner
+            out = runner.ensure_running(base)
         elif args.cmd == 'answer':
             text = Path(args.file).read_text(encoding='utf-8')
             out = {'answered': api.answer(base, args.order, text, approve=args.approve)}
@@ -135,8 +139,17 @@ def main(argv=None):
             from bf import adapter, runner
             profiles = adapter.ensure_profiles(base, args.agent_cli, dict(p.split('=', 1) for p in args.profile))
             ad = adapter.AgentCliAdapter(base, profiles, agent_cli=args.agent_cli)
-            runner.Runner(base, ad, parallel=args.parallel).run_until_idle()
-            out = api.report(base)
+            command = [sys.executable, str(Path(__file__).resolve()), '--base', str(base.resolve()),
+                       'run', '--parallel', str(args.parallel)]
+            for backend, profile in profiles.items():
+                command += ['--profile', '%s=%s' % (backend, Path(profile).resolve())]
+            if args.agent_cli:
+                command += ['--agent-cli', str(Path(args.agent_cli).resolve())]
+            if args.background:
+                out = runner.ensure_running(base, command)
+            else:
+                runner.Runner(base, ad, parallel=args.parallel, run_command=command).run_until_idle()
+                out = api.report(base)
     except api.BfError as error:
         print(json.dumps({'error': str(error)}, ensure_ascii=False))
         return 2

@@ -168,6 +168,8 @@ revision:    计划修订号
 
 前端不选择、不派发、不回收工单，也不读写状态文件；它只能运行 bf 的查询与上述三类命令。因为调度不在它手里，旧版为约束编排者而设的 guard、stop hook 门禁、角色审计都不再需要；前端只保留“命令白名单”这一项限制。驱动器不依赖前端：前端会话结束或上下文压缩，`bf run` 照常推进。
 
+前端支持 Claude、Codex、agy、OpenCode V2，共用白名单与运维职责，用 `bf run --background` 独立启动驱动器。宿主只适配交互启动、工具门禁和通知：Claude 使用原生 Monitor/CronCreate；Codex/agy 由启动器将事件与定时报告写入 notifications.log，不唤醒闲置模型。OpenCode 使用 mini 私有服务和原生插件，插件定时只读查询 report/watch，经会话 API 主动请求汇报，忙时合并、排队并限制重试，不向 TUI 终端直接插入文字；通知不是用户授权。插件仅由本次启动器环境加载，并在派生终端环境中清除前端叠加配置，防止影响执行角色。具体配置与信任要求见 references/operations.md。
+
 角色仍全部经 CLI 调用；失去的是宿主原生子代理（Claude Agent 工具、AGY 原生子代理），Claude 角色经 `claude -p` 使用同一订阅。
 
 ### 6.4 并发与资源

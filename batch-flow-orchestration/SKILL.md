@@ -14,7 +14,7 @@ description: 以下情形加载：用户要求使用本技能（batch-flow / 分
 | `<任务>/.batch-flow/plan.json` | 目标、交付目标、审阅组、角色模型、额度与上下文策略、环境、授权包络 |
 | `orders.json` / `events.jsonl` | 工单（唯一状态）与只追加日志；只经 `bf` 脚本写入 |
 | `scripts/bf/cli.py` | `init / revise / run / status / report / answer / stop / resume` |
-| `scripts/bf/front.py launch` | 聊天前端：启动和查看 `bf run`、每 10 分钟汇报、转交用户回答；不调度 |
+| `scripts/start-batch-flow.sh` / `scripts/bf/front.py launch` | Claude / Codex / agy / OpenCode V2 聊天前端：后台启动和查看驱动器、每 10 分钟汇报、转交用户回答；不调度。后端能力差异见[运行与恢复](references/operations.md) |
 | `scripts/agent_cli.py` | 各 CLI 后端（codex、claude、opencode、agy）的调用适配，见 [CLI 适配器](references/cli-adapter.md) |
 
 ## 对外接口（项目脚本与角色可依赖）

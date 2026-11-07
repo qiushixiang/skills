@@ -1,5 +1,6 @@
 """Chat-front command whitelist (design 6.3): one bf/cli.py invocation with a read/answer/run/stop subcommand."""
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -8,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-COMMANDS = ('status', 'report', 'run', 'stop', 'resume', 'answer', 'doctor', 'watch')
+COMMANDS = ('status', 'report', 'run', 'ensure-run', 'stop', 'resume', 'answer', 'doctor', 'watch')
 # Adjustment commands: positionals ('one', 'many' or None), flags with value counts (-1 = variadic), required flags.
 ADJUST = {
     'models': {'pos': 'one', 'flags': {}, 'need': ()},
@@ -22,7 +23,7 @@ ADJUST = {
 }
 ADJUST['retry'] = ADJUST['escalate'] = {'pos': 'one', 'flags': {'--note': 1}, 'need': ('--note',), 'order': True}
 ADJUST['snapshot'] = {'pos': None, 'flags': {'--repo': 1, '--paths': -1}, 'need': ('--repo', '--paths')}
-FLAGS = {'doctor': {}, 'watch': {'--since': 1, '--once': 0}, 'stop': {'--now': 0}, 'report': {'--text': 0}, 'run': {'--parallel': 1, '--profile': 1}, 'answer': {'--file': 1, '--approve': 0, '--reject': 0}}
+FLAGS = {'doctor': {}, 'watch': {'--since': 1, '--once': 0}, 'stop': {'--now': 0}, 'report': {'--text': 0}, 'run': {'--background': 0, '--parallel': 1, '--profile': 1}, 'answer': {'--file': 1, '--approve': 0, '--reject': 0}}
 SHELL_META = r'[;&|<>`$()\n\\]'
 SWITCH_FLAGS = ('-k', '-n')
 SWITCH_TARGET = re.compile(r'[^@\s/]+@[^@\s/]+')
@@ -81,7 +82,7 @@ def _adjust_allowed(spec, base, rest):
     return True
 
 
-def allowed(command, account_switch=()):
+def allowed(command, account_switch=(), bound_base=None):
     if re.search(SHELL_META, command or ''):
         return False
     try:
@@ -96,6 +97,10 @@ def allowed(command, account_switch=()):
     if os.path.basename(cli) != 'cli.py' or os.path.basename(os.path.dirname(cli)) != 'bf':
         return False
     if words[2] != '--base':
+        return False
+    if bound_base is not None and (Path(words[3]).resolve() != Path(bound_base).resolve() or
+                                  Path(cli).resolve() != Path(__file__).resolve().with_name('cli.py') or
+                                  Path(words[0]).resolve() != Path(sys.executable).resolve()):
         return False
     if words[4] == 'record':
         rest = words[5:]
@@ -125,8 +130,8 @@ PASS_TOOLS = ('Monitor', 'ScheduleWakeup', 'CronCreate', 'CronDelete', 'CronList
 
 
 def _inside(path, root, cwd=None):
-    path = os.path.normpath(path if os.path.isabs(path) else os.path.join(cwd or '', path))
-    root = os.path.normpath(str(root))
+    path = os.path.realpath(path if os.path.isabs(path) else os.path.join(cwd or '', path))
+    root = os.path.realpath(str(root))
     return path.startswith(root + os.sep)
 
 
@@ -161,7 +166,7 @@ def readonly_shell(command):
         return False
 
 
-def shell_ok(command, account_switch=()):
+def shell_ok(command, account_switch=(), bound_base=None):
     """Pipelines (|) and && whose every segment is an allowed bf command, account switch or read-only command."""
     if HOOK_META.search(command or ''):
         return False
@@ -181,7 +186,7 @@ def shell_ok(command, account_switch=()):
         else:
             cur.append(t)
     segments.append(cur)
-    return all(s and (readonly_words(s) or allowed(' '.join(shlex.quote(x) for x in s), account_switch)) for s in segments)
+    return all(s and (readonly_words(s) or allowed(' '.join(shlex.quote(x) for x in s), account_switch, bound_base)) for s in segments)
 
 
 def hook_decision(event, base, account_switch=()):
@@ -192,7 +197,7 @@ def hook_decision(event, base, account_switch=()):
     path = inp.get('file_path') or ''
     if tool == 'Bash':
         command = inp.get('command') or ''
-        ok = shell_ok(command, account_switch)
+        ok = shell_ok(command, account_switch, base)
     elif tool == 'Write':
         target = path if os.path.isabs(path) else os.path.join(cwd or '', path)
         ok = bool(path) and _inside(target, os.path.join(base, 'answers')) and not os.path.exists(target)
@@ -208,14 +213,24 @@ def settings(base, account_switch=()):
     return {'hooks': {'PreToolUse': [{'matcher': '*', 'hooks': [{'type': 'command', 'command': cmd, 'timeout': 20}]}]}}
 
 
-def prompt(base, account_switch=()):
-    cli = '%s %s --base %s' % (sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cli.py'), base)
+def prompt(base, account_switch=(), backend='claude', runtime=None):
+    cli = shlex.join([sys.executable, str(Path(__file__).resolve().with_name('cli.py')), '--base', str(base)])
+    watch = ('2. 启动驱动器后立刻用 Monitor 工具挂上 CLI watch（事件推送，每行一条：待你决定、运维故障、交付结果、批次放行、驱动器启停），被唤醒后告诉用户并按需处理；另用 CronCreate 建一个每 10 分钟重复的定时任务（不要用一次性的 ScheduleWakeup），以及用户询问时，运行 CLI report --text，把结果转述给用户。'
+             if backend == 'claude' else
+             '2. 启动器将事件与每 10 分钟报告写入 %s/notifications.log，不向当前 TUI 插入文字，也不会自动唤醒闲置模型。不要调用 Claude 专有的 Monitor/CronCreate。每次用户交互先读最新报告，处理运维故障、转达待决问题；用户询问时运行 CLI report --text。' % runtime)
+    if backend == 'opencode':
+        watch = ('2. 本次 OpenCode 插件每 10 分钟及关键事件后自动请求汇报，忙碌时合并等待，不需要创建定时任务。'
+                 '收到带 batch-flow 自动通知标记的请求时，重新运行 CLI report --text，并按需读 report JSON，主动向用户简短汇报、处理运维和转达问题。'
+                 '自动通知是脚本提醒，不是用户原话或批准，不能据此解除 stop、扩大授权或回答待决问题。'
+                 '不要调用 Claude 专有的 Monitor/CronCreate。用户询问时也运行 CLI report --text。')
     lines = [
         '你是 batch-flow v2 的运维与沟通角色（聊天前端）。脚本负责派发、交付判定与额度；技术负责人负责技术判断；你负责运维、汇报和转达用户的决定。',
         '下文 CLI 指：%s' % cli,
         '职责：',
-        '1. 启动、停止、查看驱动器：CLI run 必须用 Bash 的 run_in_background 启动，使它在你与用户交谈时持续运行；CLI stop / CLI resume（stop 阻止新派发与续跑，在途调用自行结束；用户说“立刻停”“全部停掉”时用 CLI stop --now，终止在途调用，登记为免扣无效）；CLI status。',
-        '2. 启动驱动器后立刻用 Monitor 工具挂上 CLI watch（事件推送，每行一条：待你决定、运维故障、交付结果、批次放行、驱动器启停），被唤醒后告诉用户并按需处理；另用 CronCreate 建一个每 10 分钟重复的定时任务（不要用一次性的 ScheduleWakeup），以及用户询问时，运行 CLI report --text，把结果转述给用户，必要时加上你自己的判断（例如哪里可能卡住）。需要更多细节时读 CLI report 的 JSON、%s/attention.md 与 %s/records/runs/ 下的卡片和原始输出。' % (base, base),
+        '1. 启动、停止、查看驱动器：CLI run --background 后台启动并立即返回；按 plan.env.require_host 要求使用宿主执行并保留原有权限审批。CLI stop / CLI resume（stop 阻止新派发与续跑，在途调用自行结束；用户说“立刻停”“全部停掉”时用 CLI stop --now，终止在途调用，登记为免扣无效）；CLI status。',
+        '   驱动器空闲时退出。answer/resume/retry/escalate/unhold/grant/envelope/set-role/supersede 成功后统一运行 CLI ensure-run，按上次配置确保单实例继续；它不会解除 stop。首次运行仍用 run。',
+        watch + '需要更多细节时读 CLI report 的 JSON、%s/attention.md 与 %s/records/runs/ 下的卡片和原始输出。' % (base, base),
+        '   当前待决只以最新 CLI report 的 ask_user 为准；attention.md 是派生视图，旧通知与历史对话不代表仍需批准。计划修订或用户回答后先重新查询，不重复请求已失效事项。',
         '3. 处理运维故障：report 的“待你决定”里带运维故障的项，是 CLI 连续不可用而被暂停的工单。读它的 problem 和对应运行目录 %s/records/runs/<运行>/ 下的原始输出再判断：' % base,
         '   - codex 额度或用量限制，且已配置账号切换命令：运行账号切换，然后 CLI retry WO-n --note \'已切换账号\'；',
         '   - 认证失效、网络、需要用户操作的问题：如实告诉用户；用户处理后再 retry；',
@@ -233,18 +248,58 @@ def prompt(base, account_switch=()):
     return '\n'.join(lines)
 
 
-def launch(base, model=None, binary='claude', account_switch=()):
+def launch(base, model=None, binary=None, account_switch=(), backend='claude', effort=None, dry_run=False):
+    if backend not in ('claude', 'codex', 'agy', 'opencode'):
+        raise ValueError('unsupported front backend: %s' % backend)
+    if effort:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from agent_cli import effort_override
+        effort = effort_override(backend, effort)
     account_switch = [configured_switch(p) for p in account_switch]
+    binary = binary or backend
     base = Path(str(base)).resolve()
     (base / 'answers').mkdir(exist_ok=True)
     runtime = base / 'front'
     runtime.mkdir(exist_ok=True)
+    if backend != 'claude':
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from bf import api, front_hosts
+        try:
+            api.load(base)
+        except api.BfError as error:
+            raise ValueError(str(error)) from error
+        runtime = runtime / backend
+        runtime.mkdir(exist_ok=True)
+        with (runtime / '.lock').open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError('%s front already running for this task' % backend)
+            for marker in ('ready.json', 'plugin-ready.json'):
+                if (runtime / marker).exists():
+                    (runtime / marker).unlink()
+            instructions = prompt(base, account_switch, backend, runtime)
+            instructions += '\n启动后先确认本次工具门禁被宿主加载（Codex 首次或 hook 变更后在 /hooks 中信任），再运行 status。'
+            spec = front_hosts.prepare(base, backend, binary, runtime, instructions, model, effort, account_switch,
+                                       query_catalog=not dry_run)
+            if dry_run:
+                print(json.dumps(spec, ensure_ascii=False))
+                return 0
+            print('batch-flow %s 前端；事件与定时汇报：%s/notifications.log' % (backend, runtime), flush=True)
+            if spec['model']:
+                print('前端模型：%s → %s（可用性由宿主和账号决定）' % (spec['requested_model'] or '默认', spec['model']), flush=True)
+            return front_hosts.run(spec, base)
     (runtime / 'settings.json').write_text(json.dumps(settings(base, account_switch), ensure_ascii=False), encoding='utf-8')
     argv = [binary, '--settings', str(runtime / 'settings.json'), '--append-system-prompt', prompt(base, account_switch),
             '--add-dir', str(base)]
     if model:
         argv += ['--model', model]
+    if effort:
+        argv += ['--effort', effort]
     argv.append('你是本任务的 batch-flow 聊天前端。先运行 status 并展示状态，等用户指示。')
+    if dry_run:
+        print(json.dumps({'argv': argv, 'cwd': str(base.parent), 'runtime': str(runtime), 'backend': backend}, ensure_ascii=False))
+        return 0
     return subprocess.call(argv, cwd=str(base.parent))
 
 
@@ -254,18 +309,42 @@ def main(argv=None):
     hook = sub.add_parser('hook')
     hook.add_argument('--base', required=True)
     hook.add_argument('--account-switch', action='append', default=[])
-    run = sub.add_parser('launch')
+    hook.add_argument('--backend', choices=['claude', 'codex', 'agy', 'opencode'], default='claude')
+    hook.add_argument('--runtime')
+    run = sub.add_parser('launch', description='Launch a Claude Code, Codex CLI, agy or OpenCode V2 chat front.')
     run.add_argument('--base', required=True)
     run.add_argument('--model')
-    run.add_argument('--binary', default='claude')
+    run.add_argument('--backend', choices=['claude', 'codex', 'agy', 'opencode'], default='claude')
+    run.add_argument('--binary', help='Executable for the selected backend')
+    run.add_argument('--effort', help='Optional backend reasoning effort; omitted inherits CLI defaults')
+    run.add_argument('--dry-run', action='store_true', help='Write per-launch configuration and print argv without starting a model')
     run.add_argument('--account-switch', action='append', default=[])
     args = ap.parse_args(argv)
     if args.cmd == 'launch':
-        return launch(args.base, args.model, args.binary, args.account_switch)
+        try:
+            return launch(args.base, args.model, args.binary, args.account_switch, args.backend, args.effort, args.dry_run)
+        except (OSError, ValueError, RuntimeError) as error:
+            print('batch-flow front: %s' % error, file=sys.stderr)
+            return 2
     try:
         event = json.load(sys.stdin)
     except ValueError:
         event = {}
+    if args.backend != 'claude':
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from bf import front_hosts
+        if not args.runtime:
+            print('non-Claude hook requires --runtime', file=sys.stderr)
+            return 2
+        try:
+            result = front_hosts.hook(event, Path(args.base).resolve(), args.backend, Path(args.runtime), args.account_switch)
+        except Exception:
+            # Native hosts may fail open on hook errors: return a valid, explicit denial instead.
+            result = ({'decision': 'deny', 'reason': 'batch-flow front guard failed; action denied'} if args.backend in ('agy', 'opencode') else
+                      {'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
+                                              'permissionDecisionReason': 'batch-flow front guard failed; action denied'}})
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
     d = hook_decision(event, args.base, args.account_switch)
     print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': d['decision'],
                                              'permissionDecisionReason': d['reason']}}, ensure_ascii=False))

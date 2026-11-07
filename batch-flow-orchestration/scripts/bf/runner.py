@@ -1,19 +1,45 @@
 """Driver loop (design 6.1): select, render, launch, wait, collect, gate, route. State lives in files only (I7)."""
 import json
+import fcntl
 import os
+import subprocess
 import time
 
 from . import api, cards
 from .store import BfError, now
 
 
+def ensure_running(base, command=None):
+    """Front-owned restart using the last explicit run configuration; never resumes a user stop."""
+    base = api.load(base).base.resolve()
+    state = api.load(base)
+    if state.stopped or not (api.runnable(state) or api.orders(state, state_='running')):
+        return {'started': False, 'reason': 'stopped or no runnable work'}
+    with open(str(base / '.driver.lock'), 'a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {'started': False, 'reason': 'already running'}
+        if command is None:
+            try:
+                command = json.loads((base / 'driver-command.json').read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                raise BfError('no previous run configuration; start bf run with the required profiles first')
+    with open(str(base / 'driver.log'), 'ab') as log:
+        proc = subprocess.Popen(command, cwd=str(base.parent), stdin=subprocess.DEVNULL,
+                                stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    return {'started': True, 'pid': proc.pid}
+
+
 class Runner(object):
-    def __init__(self, base, adapter, parallel=1, poll_interval=0.2):
+    def __init__(self, base, adapter, parallel=1, poll_interval=0.2, run_command=None):
         self.base, self.adapter, self.parallel, self.poll_interval = api.load(base).base, adapter, parallel, poll_interval
         self.inflight = {}  # run_id -> {handle, order, assignment, n}
         self.recovered = False
         self.started = None
         self.exit_now = False
+        self.lock = None
+        self.run_command = run_command
 
     def _beat(self, exited=False):
         data = {'pid': os.getpid(), 'started': self.started, 'last_step': now(), 'exited': exited}
@@ -23,6 +49,16 @@ class Runner(object):
 
     def _begin(self):
         if self.started is None:
+            self.lock = open(str(self.base / '.driver.lock'), 'a')
+            try:
+                fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                self.lock.close()
+                self.lock = None
+                raise BfError('driver already running for %s' % self.base)
+            if self.run_command:
+                from .store import _atomic_write
+                _atomic_write(self.base / 'driver-command.json', json.dumps(self.run_command).encode('utf-8'))
             self.started = now()
             api.driver_event(self.base, 'driver_start')
 
@@ -32,6 +68,9 @@ class Runner(object):
             self._beat(exited=True)
             api.driver_event(self.base, 'driver_exit')
             self.started = None
+        if self.lock is not None:
+            self.lock.close()
+            self.lock = None
 
     def _dir(self, run_id):
         path = self.base / 'records' / 'runs' / run_id

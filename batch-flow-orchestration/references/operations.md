@@ -2,16 +2,59 @@
 
 ## 启动
 
-```text
-python3 <技能>/scripts/bf/front.py launch --base <任务>/.batch-flow [--model <前端模型>]
+聊天前端支持 **Claude Code、Codex CLI、agy、OpenCode V2**。用 `--backend` 选择，默认 Claude；前端选择不改变计划中执行者、审阅者等角色的工具和模型。
+
+项目根目录的 `start-batch-flow.sh` 软链接指向技能的同名脚本，可从任意工作目录调用：
+
+```sh
+./start-batch-flow.sh <任务目录> [--model <前端模型>]
+./start-batch-flow.sh <任务目录> --backend codex [--model <前端模型>] [--effort high]
+./start-batch-flow.sh <任务目录> --backend agy [--model <前端模型>] [--effort high]
+./start-batch-flow.sh <任务目录> --backend opencode [--model <provider/model>]
+./start-batch-flow.sh --base <任务目录>/.batch-flow
 ```
 
-前端会话在后台运行 `bf run`，每 10 分钟用 `bf report` 汇报：在途工单与耗时、最近完成和新开立的工单、待回答的问题、额度余量。
+任务目录必须明确指定；不带参数只显示帮助，不选择或恢复任务。`--binary` 指定所选后端的可执行文件或兼容包装器，不用于选择后端。OpenCode 前端省略 `--model` 时默认传入 `deepseek/deepseek-flash`，显式指定时以参数为准；其他前端省略 model/effort 时沿用该 CLI 的配置，不从计划角色推定。启动前端后先展示状态，等待用户指示，不自动启动任务驱动器。加 `--dry-run` 只生成启动配置并打印实际 argv，不调用模型。
+
+agy 前端支持简称替换，显式映射维护在 [model-aliases.json](model-aliases.json)：`argon` 或 `Gemini 4 Argon` → `gemini-4-argon`，不自动指定 High/Medium/Low。其他简称如 `opus` 查询 `agy models` 并要求唯一匹配；`flash` 若有多个变体则报候选，不能代选。完整 ID 原样传入，未列入当前目录不等于账号一定可用。dry-run 只解析显式映射与完整 ID，不启动 CLI 查询目录。
+
+启动时显示“输入名称 → 实际传入 ID”；原生 hook 的 `modelName`（Codex 为 `model`）保存到 `front/<backend>/ready.json`，收到的宿主报告值写入 `notifications.log`。参数解析结果和宿主回报分别留存，不用请求值冒充实际模型。映射只影响前端，不修改 plan.roles。Gemini 4 Argon 的基础 ID 依据[官方标识说明](https://antigravity.google/docs/enterprise/)，模型及账号可用性仍需由宿主确认。
+
+| 前端 | 交互与权限约束 | 事件与 10 分钟汇报 |
+|---|---|---|
+| Claude | 原生交互；会话 `--settings` 注入 PreToolUse | 原生 Monitor 与 CronCreate，可唤醒模型 |
+| Codex | 原生交互；`-c` 注入 developer instructions 与 PreToolUse；保留 workspace-write 和 on-request 审批 | 写入 `front/codex/notifications.log` |
+| agy | `--prompt-interactive`；在 `front/agy` 的独立工作区加载 AGENTS.md 与 `.agents/hooks.json`，用 `--add-dir` 关联任务 | 写入 `front/agy/notifications.log` |
+| OpenCode V2 | 原生 `mini --standalone`；会话环境叠加专用 primary agent 与 V2 工具/终端插件，保留用户已有配置与权限 | 插件通过会话 API 主动请求汇报，并写入 `front/opencode/notifications.log` |
+
+四种前端共用同一命令白名单：只操作绑定任务、读文件、在 answers/ 新建原话文件，不改源码或手写工单状态。Codex 的 apply_patch 仅允许新建 answers/ 文件；agy/OpenCode 的原生工具事件转换后执行同一检查。配置只写入本任务的 front/，不改用户或项目既有的宿主配置。
+
+OpenCode 使用 V2 的交互式 mini 界面，不是 print/run 单轮调用；`--standalone` 保证临时配置由本次私有服务加载，不连接已有后台服务。显式模型须为 `provider/model`；不支持单独的 `--effort`，省略时沿用模型配置。专用 agent 和插件在环境中叠加，不将继承的 provider 凭据写入文件或 dry-run 输出。终端命令继承环境前会移除本前端的 agent/插件，避免限制扩散到 bf 驱动器与执行角色。现有同名 `batch_flow_front` agent 冲突时报错，不覆盖。
+
+Codex 首次启动或 hook 变更后需在 `/hooks` 中审阅并信任；启动器不绕过 hook 信任，也不绕过 CLI 权限或沙箱。agy 需要信任该前端工作区。Codex/agy/OpenCode 若 120 秒内没有收到真实工具门禁回执，启动器结束前端，不宣称门禁已生效；重新启动会清除旧就绪标记。同一任务、同一后端的前端有排他锁。
+
+Codex/agy 前端的事件、定时报告与宿主模型回执只写日志，不向运行中的 TUI 共用 stdout/stderr 插入文字，避免破坏光标与状态栏重绘。需要实时查看时在另一终端运行 `tail -f <任务>/.batch-flow/front/<backend>/notifications.log`。这两个后端的定时报告不调用模型，也不会自动唤醒闲置模型；模型在下一次用户交互读取最新状态并处理运维。关闭前端会停止通知线程，已在后台运行的驱动器继续推进。
+
+OpenCode 的现有服务端插件同时负责主动汇报：每 5 秒只读查询绑定任务的 report/watch，任务推进或等待期间每 10 分钟、以及关键事件后，用 `session.prompt(delivery: queue)` 请求前端读取最新报告并向用户汇报，会产生前端模型调用。只绑定本次专用 agent 的首个根会话；子会话、其他目录和 agent 不绑定，切换到其他 agent 后暂停投递。模型忙时只保留一个提醒；投递间隔至少 30 秒，失败最多尝试 3 次并复用消息 ID，后续状态更新可重新尝试。停止或任务完成后不再周期唤醒，仍监测恢复及新事件；退出时清理定时器和查询子进程。日志保留投递与故障记录，通知不向 TUI 的 stdout/stderr 写文字，也不作为用户批准。插件仅通过启动器的进程环境启用，正常启动 OpenCode 不加载，不修改用户或项目配置。
+
+启动器同步本次 `PWD` 与任务目录，避免 OpenCode 使用继承的旧工作目录。前端进程移除 `DEBUG`：OpenTUI 会因任意非空 DEBUG（包括 `release`）向终端输出 `[Reconciler]` 调试日志，干扰显示。原值只在环境中暂存，并在派生终端中恢复，同时移除暂存变量；不改用户环境或配置。
+
+宿主契约依据：[Codex hooks](https://learn.chatgpt.com/docs/hooks)、[agy hooks](https://antigravity.google/docs/hooks/)、[agy CLI settings](https://antigravity.google/docs/settings?tab=cli)。本地元数据核对版本为 Codex 0.167.0、agy 1.5.2；离线测试使用替身前端，不代表真实模型交互已验收。
+
+OpenCode 依据 [V2 CLI](https://dev.opencode.ai/v2/docs/cli/commands/)、[V2 插件](https://dev.opencode.ai/v2/docs/build/plugins/server)。本机 v2.2.5 已验证专用 agent 与原生插件加载，并在临时任务中用默认前端模型实际运行 mini：临时缩短汇报周期后成功自动投递两次，输入草稿保留，窗口缩放后输入区与底栏正常，终端无 `[Reconciler]` 调试输出。正式周期仍为 10 分钟；修改后须重新启动前端以加载新插件。
+
+也可直接调用 Python 入口：
+
+```text
+python3 <技能>/scripts/bf/front.py launch --base <任务>/.batch-flow [--backend claude|codex|agy|opencode] [--model <前端模型>]
+```
+
+前端会话通过 `bf run --background` 启动独立驱动器并立即返回；每 10 分钟按上表汇报状态。
 
 也可以不用前端，直接运行：
 
 ```text
-python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow run --profile codex=<profile> --profile claude=<profile> [--parallel N]
+python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow run [--background] --profile codex=<profile> --profile claude=<profile> [--parallel N]
 ```
 
 ## 回答问题
@@ -25,6 +68,8 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow answer WO-0012 --
 只有依赖该问题的工单会等待，其余工作照常推进。
 
 ## 停止、恢复、重启
+
+- 驱动器没有可派发或在途工作时退出，包括等待用户时。前端在 `answer / resume / retry / escalate / unhold / grant / envelope / set-role / supersede` 成功后统一运行 `ensure-run`：复用上次 `run` 保存的配置，在需要时后台启动；不会解除用户 stop，单实例锁防止重复派发。首次运行仍用 `run`。直接使用 CLI 的用户也应在这些操作后运行 `ensure-run`。
 
 - `stop`：不再派发新工单，已在运行的调用结束后照常回收。`resume` 恢复。
 - 驱动器随时可以重启：状态全部在文件里；上次未回收的调用会被接管或登记为无效（免扣）后重派。
