@@ -178,7 +178,7 @@ class RunnerSpec(unittest.TestCase):
         for key in ['running', 'recent', 'ask_user', 'budgets', 'runnable']:
             self.assertIn(key, report)
         self.assertTrue(any(item['target'] == 'D1' for item in report['recent']))
-        self.assertIn('D1', report['budgets'])
+        self.assertIn('D2', report['budgets'])  # open deliverables only (§22.3)
 
     def test_cli_commands(self):  # §6.1
         self.init()
