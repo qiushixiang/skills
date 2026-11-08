@@ -113,9 +113,11 @@ class RunnerSpec(unittest.TestCase):
         for launch in fake.launches:
             by_type.setdefault(launch['type'], []).append(launch)
         card = by_type['implement'][0]['card']
-        for heading in ['## 目标', '## 环境', '## 工单输入', '## 交付']:
+        for heading in ['## 目标', '## 验收条件', '## 范围与约束', '## 本次工作', '## 环境与留证', '## 交付']:
             self.assertIn(heading, card)
-        self.assertLess(card.index('## 环境'), card.index('## 工单输入'))
+        self.assertLess(card.index('## 目标'), card.index('## 验收条件'))
+        self.assertLess(card.index('## 范围与约束'), card.index('## 本次工作'))
+        self.assertLess(card.index('## 本次工作'), card.index('## 环境与留证'))
         self.assertIn('停止原因', card)
         repair = by_type['repair'][0]['card']
         self.assertIn('B1', repair)

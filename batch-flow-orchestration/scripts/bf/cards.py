@@ -58,18 +58,41 @@ def _last_done(state, deliverable):
 
 
 def _goal(state, o):
-    plan = state.plan
-    out = []
-    for d in model.deliverables_of(plan, o['target']):
-        spec = plan['deliverables'][d]
-        label = d if spec['title'] == d else '%s %s' % (d, spec['title'])
-        out.append('%s；验收：%s' % (label, '；'.join(spec['acceptance']) or '见指令'))
-        if spec.get('non_goals'):
-            out.append('非目标（不要做）：%s' % '；'.join(spec['non_goals']))
-        if o['type'] in ('review', 'repair') or (o['type'] == 'implement' and o['origin'].get('by') != 'plan'):
-            out.append('目标契约（界定范围；本次工作见工单输入）：%s' % spec['instruction'])
-    return '\n'.join(out)
+    targets = model.deliverables_of(state.plan, o['target'])
+    lead = '本次仅审阅下列交付目标；不承担实施工作：' if o['type'] == 'review' else '本次负责下列交付目标：'
+    return lead + '\n' + _lines('%s：%s' % (d, state.plan['deliverables'][d]['title'] or d) for d in targets)
 
+def _acceptance(state, o):
+    return '\n'.join('%s.A%d 验收：%s' % (d, i, text) for d in model.deliverables_of(state.plan, o['target'])
+                     for i, text in enumerate(state.plan['deliverables'][d]['acceptance'], 1))
+
+def _contracts(state, o):
+    if o['type'] not in ('review', 'repair') and not (o['type'] == 'implement' and o['origin'].get('by') != 'plan'):
+        return ''
+    return '\n\n'.join('### %s\n%s' % (d, state.plan['deliverables'][d]['instruction'])
+                        for d in model.deliverables_of(state.plan, o['target']))
+
+def _non_goals(state, o):
+    return '\n'.join('- %s：%s' % (d, text) for d in model.deliverables_of(state.plan, o['target'])
+                     for text in state.plan['deliverables'][d].get('non_goals', []))
+
+def _review_scope(state, o):
+    if o['type'] != 'review':
+        return ''
+    out = [
+        '本组范围：%s。仅按上述逐项验收和下列实施约定核对交付；实施约定是符合性依据，不是要求审阅者重新实施。' %
+        '、'.join(model.deliverables_of(state.plan, o['target'])),
+        '可阻断：本组验收未满足或必需证据不足；本组改动导致已支持场景的实际回归；本组改动引入可复现的实际缺陷。'
+        '每项阻断必须绑定本组交付目标，说明对应验收或本次改动、实际影响、证据和最小关闭条件。',
+        '不可扩张：不得从历史失败、旧裁决、通用规范或参考材料推导新的验收；不要求其他批次的目标提前完成。'
+        '范围外发现只列非阻断建议，交技术负责人决定去向。',
+        '复跑服务于本组验收和本次改动的直接影响；结合现有证据决定必要复跑，并说明未复跑原因。'
+        '历史失败保留，不能用新通过覆盖；证据异常如实说明影响，不自动扩大到全项目复验。',
+        '审阅者只读被审对象；确有阻断时提出返修目标和关闭条件，不自行修改产品、测试判据或验收。']
+    focus = state.plan['review_groups'].get(o['target'], {}).get('focus')
+    if focus:
+        out.append('本组重点（不新增验收）：' + focus)
+    return _lines(out)
 
 def _environment(state, assignment, run_dir):
     env = model.env_for(state.plan, assignment['tool'])
@@ -99,7 +122,7 @@ def _constraints(state, o):
     allowed = permissions.allowed(state.plan, o)
     if allowed:
         out.append('当前生效的受保护路径权限：%s' % json.dumps(allowed, ensure_ascii=False))
-    return _lines(out)
+    return _lines(dict.fromkeys(out))
 
 
 def required_read(state, o):
@@ -141,9 +164,6 @@ def _body(state, o, run_dir):
                     out.append('- %s（返修:%s）关闭条件：%s' % (f['id'], rep['target'], f['closure']))
         elif not inp.get('instruction'):
             out.append('首审：独立核对验收和证据，判断必要复跑，不沿用作者结论。')
-        focus = plan['review_groups'].get(o['target'], {}).get('focus')
-        if focus:
-            out.append('审阅重点：%s' % focus)
         return '\n'.join(out)
     if t == 'decide':
         out = ['触发：%s；对象工单 %s，运行 %s。' % (inp.get('trigger'), inp.get('subject'), inp.get('run')),
@@ -226,6 +246,8 @@ def prepare(state, order_id):
                               'dispatch': run.get('dispatch'),
                               'observations': run.get('observations', []), 'citations': run.get('citations', [])})
     return {'goal': _goal(state, o), 'order': o['id'], 'type': o['type'], 'target': o['target'], 'input': inp,
+            'acceptance': _acceptance(state, o), 'contracts': _contracts(state, o),
+            'non_goals': _non_goals(state, o), 'review_scope': _review_scope(state, o),
             'constraints': _constraints(state, o), 'versions_and_evidence': facts if o['type'] in ('review', 'decide') else [],
             'required_read': required_read(state, o),
             'control': {'held': bool({o['target'], model.batch_of(state.plan, o['target'])} & set(state.plan.get('holds', []))),
@@ -245,13 +267,16 @@ def _input_text(data):
     # These fields have a single presentation in their dedicated sections.
     for key in ('acceptance', 'constraints', 'required_read'):
         inp.pop(key, None)
+    # Membership and protected-path declarations are presented once in scope/constraints.
+    if data['type'] == 'review':
+        inp.pop('deliverables', None)
+    inp.pop('required_protected', None)
     out = [instruction] if instruction else []
     if inp:
         out.append('本次输入：\n' + export_input(inp))
-    out.append('状态：%s；%s。' % ('已暂停' if data['control']['held'] else '未暂停',
-        '授权范围内' if data['control']['in_envelope'] else '授权范围外'))
-    if data['versions_and_evidence']:
-        out.append('版本与证据（供判断，不自动否决）：\n' + export_input(data['versions_and_evidence']))
+    out.append('派发状态：%s；%s。限定路径的修改许可见范围与约束，不等同于启动执行。' %
+               ('已暂停' if data['control']['held'] else '未暂停',
+                '自主执行包络内' if data['control']['in_envelope'] else '自主执行包络外'))
     if data['design_changes']:
         out.append('设计变化记录：' + export_input(data['design_changes']))
     return '\n'.join(out)
@@ -262,25 +287,53 @@ def _reading_text(data):
     return _lines('%s — %s；%s' % (r['path'], r['section'], r['purpose']) for r in data['required_read'])
 
 
+def _facts_text(data):
+    """Keep full observations in dispatch.json; expose a usable provenance index, never raw history as instructions."""
+    if not data['versions_and_evidence']:
+        return ''
+    out = ['以下是历史运行来源，仅供核对事实；完整版本观察、变更路径与登记/当前哈希见本次结构化派发记录 dispatch.json 的 versions_and_evidence。']
+    for fact in data['versions_and_evidence']:
+        refs = fact.get('evidence', [])
+        out.append('- %s / %s：证据 %d 条；完整输入来源 %s' % (
+            fact['order'], fact['run'], len(refs),
+            (fact.get('dispatch') or {}).get('input', {}).get('path') or '旧记录未登记派发输入'))
+        for ref in refs:
+            out.append('  - %s（登记SHA-256：%s）%s' % (ref['path'], ref.get('registered_sha256') or '未登记', '（登记/当前哈希不同或文件不可读，须判断影响）'
+                       if ref.get('registered_sha256') != ref.get('current_sha256') or not ref.get('current_sha256') else ''))
+    return '\n'.join(out)
+
 def validate_export(data, text):
-    need(_input_text(data) in text and data['constraints'] in text and data['goal'] in text,
-         'card export omitted or changed the resolved order input')
+    for key in ('goal', 'acceptance', 'contracts', 'non_goals', 'review_scope', 'constraints'):
+        need(data.get(key, '') in text, 'card export omitted or changed ' + key)
+    need(_input_text(data) in text, 'card export omitted or changed the resolved order input')
     if data['required_read']:
         need(_reading_text(data) in text, 'card export omitted required reading')
+    if data['versions_and_evidence']:
+        need(_facts_text(data) in text, 'card export omitted evidence provenance')
 
 
 def render(state, order_id, assignment, run_dir=None, prepared=None):
     o = state.orders[order_id]
     data = prepared if prepared is not None else prepare(state, order_id)
-    parts = [('目标', data['goal']), ('环境', _environment(state, assignment, run_dir)),
-             ('工单输入', _input_text(data)),
-             ('本单', _body(state, o, run_dir)), ('约束', data['constraints']), ('交付', _delivery(o))]
+    bounds = '\n'.join(x for x in [data['non_goals'], data['constraints']] if x)
+    if o['type'] == 'review':
+        parts = [('审阅目标', data['goal']), ('验收依据', data['acceptance']),
+                 ('审阅边界', data['review_scope']), ('范围与约束', bounds),
+                 ('本次审阅要求', _input_text(data)), ('被审交付与证据', _body(state, o, run_dir)),
+                 ('实施约定（供核对，不是审阅者待办）', data['contracts'])]
+    else:
+        parts = [('目标', data['goal']), ('验收条件', data['acceptance']),
+                 ('范围与约束', bounds), ('本次工作', _input_text(data)),
+                 ('本单', _body(state, o, run_dir)), ('目标实施约定', data['contracts'])]
     if data['required_read']:
-        parts.append(('必读', '执行前读指定范围：\n' + _reading_text(data)))
+        parts.append(('输入材料', '只读指定范围；历史材料用于所列用途，不自动成为当前命令：\n' + _reading_text(data)))
+    if data['versions_and_evidence']:
+        parts.append(('历史证据索引（按需核对）', _facts_text(data)))
+    parts += [('环境与留证', _environment(state, assignment, run_dir)), ('交付', _delivery(o))]
     if _norms(o):
-        parts.append(('规范', '按下列文件的对应章节工作：\n' + _norms(o)))
+        parts.append(('规范', '按下列文件的对应章节工作；通用规范不增加本组验收或审阅范围：\n' + _norms(o)))
     head = '# 工单 %s（%s，%s）' % (o['id'], o['type'], o['target'] or '-')
-    text = head + '\n\n' + '\n\n'.join('## %s\n%s' % p for p in parts if p[1]) + '\n'
+    text = head + '\n\n' + '\n\n'.join('## %s\n%s' % item for item in parts if item[1]) + '\n'
     validate_export(data, text)
     return text
 
