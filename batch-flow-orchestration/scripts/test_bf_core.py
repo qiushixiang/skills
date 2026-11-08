@@ -241,20 +241,19 @@ class Gate(Base):
         self.assertEqual(len(self.one('implement', 'D1')['runs']), 1)
         self.assertEqual(api.assign(self.st(), oid)['stage'], 'primary')  # next ordinary round, same ladder
 
-    def test_continuation_requires_progress(self):  # §10.3
-        oid = self.impl('D1')
-        rid = api.start(self.base, oid)
-        self.assertEqual(api.deliver(self.base, oid, rid, UNFINISHED, events=[EDIT])['outcome'], 'continue')
-        self.assertEqual(api.deliver(self.base, oid, rid, UNFINISHED, events=[])['outcome'], 'registered')
+    def test_continuation_is_bounded_without_progress_heuristic(self):
+        oid = self.impl('D1'); rid = api.start(self.base, oid)
+        for _ in range(2):
+            self.assertEqual(api.deliver(self.base, oid, rid, UNFINISHED)['outcome'], 'continue')
+        self.assertEqual(api.deliver(self.base, oid, rid, UNFINISHED)['outcome'], 'registered')
 
-    def test_verified_needs_existing_evidence(self):  # I5
+    def test_missing_evidence_is_recorded_for_reviewer_not_silently_accepted_as_proof(self):
         oid = self.impl('D1')
-        rid = api.start(self.base, oid)
-        out = api.deliver(self.base, oid, rid, '结果：VERIFIED\n停止原因：完成\n验证证据：%s\n' % (self.base / 'records' / 'nope.json'))
-        self.assertFalse(out['legal'])
-        out = api.deliver(self.base, oid, rid, self.done(), events=[EDIT])
+        missing = str(self.base / 'records' / 'nope.json')
+        out = self.go(oid, '结果：VERIFIED\n停止原因：完成\n验证证据：%s\n' % missing)
         self.assertTrue(out['legal'])
-        self.assertEqual(self.one('implement', 'D1')['state'], 'done')
+        run = self.one('implement', 'D1')['runs'][-1]
+        self.assertEqual(run['citations'], [{'path': missing, 'valid_record': False}])
 
     def test_reason_and_result_must_match(self):  # §10.2
         oid = self.impl('D1')
@@ -262,17 +261,11 @@ class Gate(Base):
         self.assertFalse(api.deliver(self.base, oid, rid, '结果：FAILED\n停止原因：待裁决\n上升问题：x\n', events=[EDIT])['legal'])
         self.assertFalse(api.deliver(self.base, oid, rid, '结果：FAILED\n停止原因：技术不可行\n上升问题：无\n', events=[EDIT])['legal'])
 
-    def test_environment_block_needs_direct_entry_environment_failure(self):  # §10.3, DEC-41
-        oid = self.impl('D1')
-        rid = api.start(self.base, oid)
-        own_shell = cmd("awk '/NoNewPrivs/' /proc/self/status", 0, 'NoNewPrivs: 1')
-        self.assertFalse(api.deliver(self.base, oid, rid, ENV_BLOCK, events=[own_shell, EDIT])['legal'])
-        wrapped = cmd("/bin/bash -lc 'date; %s s3'" % ENTRY, 1, 'ERROR: Sandbox detected')
-        self.assertFalse(api.deliver(self.base, oid, rid, ENV_BLOCK, events=[wrapped, EDIT])['legal'])
-        product = cmd("/bin/bash -lc '%s s3'" % ENTRY, 1, 'TC-03 FAIL')
-        out = api.deliver(self.base, oid, rid, ENV_BLOCK, events=[product])
-        self.assertEqual(out['outcome'], 'registered')  # limit reached: FAILED, not an environment block
-        self.assertEqual(self.one('implement', 'D1')['runs'][0]['result'], 'FAILED')
+    def test_environment_diagnosis_goes_to_lead_with_raw_facts(self):
+        oid = self.impl('D1'); own_shell = cmd("awk '/NoNewPrivs/' /proc/self/status", 0, 'NoNewPrivs: 1')
+        out = self.go(oid, ENV_BLOCK, events=[own_shell])
+        self.assertTrue(out['legal'])
+        self.assertEqual(self.one('decide', 'D1')['input']['trigger'], 'wait_evidence')
 
     def test_legal_environment_block_without_work_is_exempt_and_opens_decide(self):  # §7
         oid = self.impl('D1')
@@ -280,7 +273,7 @@ class Gate(Base):
         out = self.go(oid, ENV_BLOCK, events=[blocked])
         self.assertTrue(out['legal'])
         run = self.one('implement', 'D1')['runs'][0]
-        self.assertEqual((run['result'], run['exempt']), ('WAIT_EVIDENCE', True))
+        self.assertEqual((run['result'], run['exempt']), ('WAIT_EVIDENCE', False))
         self.assertEqual(self.one('decide', 'D1')['state'], 'open')
         self.assertIn(self.one('decide', 'D1')['id'], self.one('implement', 'D1')['needs'])
 
@@ -459,7 +452,7 @@ class Routing(Base):
         self.assertEqual(len(api.orders(self.st(), type='decide', target='D1')), 2)
         self.assertEqual(api.orders(self.st(), type='decide', target='D1', state_='open'), [])
         self.assertEqual(api.orders(self.st(), type='ask_user'), [])
-        self.assertEqual(self.st().orders[oid]['ops']['kind'], 'no_progress')
+        self.assertEqual(self.st().orders[oid]['ops']['kind'], 'coordination_limit')
 
     def test_candidates_go_to_batch_triage_and_gate_release(self):  # §5.2, decision 3
         self.go(self.impl('D1'), self.done('候选新项：\n- CAN 自测偶发超时（records/x）\n- SII 偶发读失败\n'))
@@ -505,7 +498,7 @@ class Routing(Base):
         Path(evidence).write_text('changed')
         st = self.st()
         self.assertEqual(api.broken_evidence(st), [evidence])
-        self.assertNotIn(self.one('review', 'R12')['id'], api.runnable(st, parallel=5))
+        self.assertIn(self.one('review', 'R12')['id'], api.runnable(st, parallel=5))
 
 
 class Context(Base):  # §9
@@ -525,14 +518,12 @@ class Context(Base):  # §9
         self.assertEqual(a['stage'], 'backup')
         self.assertEqual(a['session']['mode'], 'fresh')  # stage change
 
-    def test_rejected_environment_claim_forces_fresh_session(self):
+    def test_script_does_not_label_environment_claim_as_misjudgment(self):
         oid = self.impl('D1')
-        rid = api.start(self.base, oid)
-        own = cmd("awk '/NoNewPrivs/' /proc/self/status", 0, 'NoNewPrivs: 1')
-        api.deliver(self.base, oid, rid, ENV_BLOCK, events=[own, EDIT], conversation_id='s1')
-        api.deliver(self.base, oid, rid, ENV_BLOCK, events=[own, EDIT], conversation_id='s1')
-        api.deliver(self.base, oid, rid, ENV_BLOCK, events=[own, EDIT], conversation_id='s1')
-        self.assertEqual(api.assign(self.st(), oid)['session']['mode'], 'fresh')
+        self.go(oid, ENV_BLOCK, conversation_id='s1')
+        run = self.one('implement', 'D1')['runs'][0]
+        self.assertFalse(run['env_rejected'])
+        self.assertEqual(self.one('decide', 'D1')['state'], 'open')
 
     def test_repair_review_decide_triage(self):
         self.go(self.impl('D1'), self.done(), conversation_id='impl-1')

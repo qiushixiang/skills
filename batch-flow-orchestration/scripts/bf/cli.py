@@ -68,6 +68,7 @@ def main(argv=None):
         p = sub.add_parser(name)
         p.add_argument('--plan', required=True)
         p.add_argument('--approval', required=True)
+    sub.choices['revise'].add_argument('--revalidate', nargs='*', default=[])
     argv = list(sys.argv[1:] if argv is None else argv)
     child = []
     if '--' in argv:  # record's child command is never parsed by argparse
@@ -141,7 +142,8 @@ def main(argv=None):
                 out = {'superseded': adjust.supersede(base, args.order, args.approval, args.reason)}
         elif args.cmd in ('init', 'revise'):
             plan = json.loads(Path(args.plan).read_text(encoding='utf-8'))
-            out = {args.cmd: (api.init if args.cmd == 'init' else api.revise_plan)(base, plan, args.approval)}
+            out = {args.cmd: (api.init(base, plan, args.approval) if args.cmd == 'init' else
+                              api.revise_plan(base, plan, args.approval, revalidate=args.revalidate))}
         else:
             from bf import adapter, runner
             profiles = adapter.ensure_profiles(base, args.agent_cli, dict(p.split('=', 1) for p in args.profile))

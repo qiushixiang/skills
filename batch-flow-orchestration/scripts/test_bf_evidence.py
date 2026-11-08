@@ -79,20 +79,20 @@ class Record(Base):  # §23.1 — the public contract used by roles and project 
         (repo / 'new.h').write_text('#define X 1\n')
         out = json.loads(self.cli('snapshot', '--repo', str(repo), '--paths', 'a.c', 'new.h', check=True).stdout.strip().splitlines()[-1])
         data = json.loads(Path(out['evidence']).read_text())
-        self.assertEqual(sorted(data), ['base_commit', 'diff', 'paths', 'repository', 'untracked_base64'])
+        self.assertTrue({'base_commit', 'diff', 'paths', 'repository', 'untracked_base64'}.issubset(data))
         self.assertIn('int a = 1;', data['diff'])
         self.assertIn('new.h', data['untracked_base64'])
 
-    def test_gate_accepts_only_records_as_evidence(self):
+    def test_non_record_citation_is_flagged_without_overruling_reviewer(self):
         oid = api.orders(api.load(self.base), type='implement', target='D1')[0]['id']
         hand = self.base / 'records' / 'handwritten.json'
         hand.write_text(json.dumps({'note': '我跑过了，通过'}))
         run = api.start(self.base, oid)
         out = api.deliver(self.base, oid, run, '结果：VERIFIED\n停止原因：完成\n验证证据：%s\n' % hand, events=[EDIT], conversation_id='c')
-        self.assertFalse(out['legal'])
-        real = json.loads(self.cli('record', '--', 'true', check=True).stdout.strip().splitlines()[-1])['evidence']
-        out = api.deliver(self.base, oid, run, '结果：VERIFIED\n停止原因：完成\n验证证据：%s\n' % real, events=[EDIT], conversation_id='c')
         self.assertTrue(out['legal'])
+        registered = api.load(self.base).orders[oid]['runs'][-1]
+        self.assertEqual(registered['evidence'], {})
+        self.assertEqual(registered['citations'], [{'path': str(hand), 'valid_record': False}])
 
     def test_cards_tell_roles_how_to_record(self):
         fake = FakeAdapter(self.base, {('implement', 'D1'): [done()]})

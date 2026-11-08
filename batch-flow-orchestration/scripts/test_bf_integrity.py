@@ -121,20 +121,13 @@ class PlanChecks(Base):  # §24.3
 
 
 class DesignDrift(Base):  # §24.4
-    def test_changed_section_pauses_its_deliverables_and_asks_lead(self):
+    def test_design_change_is_presented_for_role_judgment(self):
         self.init()
         self.design.write_text(DESIGN.replace('方案 A。', '方案 A，改为双缓冲。'))
-        st = self.st()
-        runnable = api.runnable(st, parallel=5)
-        self.assertNotIn(self.one('implement', 'D1')['id'], runnable)
-        self.assertNotIn(self.one('implement', 'D2')['id'], runnable)
-        api.check_design(self.base)                      # the driver calls this before each dispatch
-        decide = self.one('decide', None)
-        self.assertEqual(decide['input']['trigger'], 'design_drift')
-        self.assertEqual(sorted(decide['input']['deliverables']), ['D1', 'D2'])
-        self.run_order(decide['id'], '结果：VERIFIED\n停止原因：完成\n',
-                       decision={'diagnosis': '仅措辞调整，方案不变', 'actions': [{'refresh_design': True}]})
-        self.assertIn(self.one('implement', 'D1')['id'], api.runnable(self.st(), parallel=5))
+        oid = self.one('implement', 'D1')['id']
+        self.assertIn(oid, api.runnable(self.st(), 5))
+        from bf import cards
+        self.assertIn('D1', cards.prepare(self.st(), oid)['design_changes'])
 
     def test_unrelated_section_change_does_not_pause(self):
         self.init()
@@ -154,17 +147,18 @@ class Snapshots(Base):  # §24.1
         self.assertEqual(snap['paths'], ['app.c'])
         self.assertIn('int x = 1;', snap['diff'])
 
-    def test_review_card_and_fixed_version_bind_to_snapshots(self):
+    def test_review_receives_versions_without_path_recitation_gate(self):
         self.init()
         for d in ('D1', 'D2'):
             self.run_order(self.one('implement', d)['id'], self.done(), edit=self.touch('%s.c' % d, d))
-        versions = [self.one('implement', d)['runs'][-1]['version'] for d in ('D1', 'D2')]
+        from bf import cards
         review = self.one('review', 'R12')['id']
-        run = api.start(self.base, review)
-        out = api.deliver(self.base, review, run, self.release_text('固定版本：%s\n' % versions[0])(), conversation_id='rv')
-        self.assertFalse(out['legal'])                    # must name every reviewed deliverable's snapshot
-        out = api.deliver(self.base, review, run, self.release_text('固定版本：%s %s\n' % tuple(versions))(), conversation_id='rv')
-        self.assertTrue(out['legal'])
+        text = cards.render(self.st(), review, api.assign(self.st(), review))
+        for d in ('D1', 'D2'):
+            snap = self.one('implement', d)['runs'][-1]['snapshot'][0]
+            self.assertIn(snap, text)
+            self.assertIn(api.gate_hash(snap), text)
+        self.assertTrue(self.run_order(review, self.release_text('固定版本：已核对差异'))['legal'])
 
 
 class Protected(Base):  # §24.2
@@ -187,12 +181,11 @@ class Protected(Base):  # §24.2
         text = lambda: ('结果：FIX_REQUIRED\n复跑与证据：%s\n'
                         '阻断：B1 | 返修:D1 | 方案级:否 | 关闭条件:使用 bf record\n' % self.ev())
         out = self.run_order(oid, text, edit=preflight)
-        self.assertFalse(out['legal'], out)
-        self.assertEqual(self.one('decide', 'R12')['input']['trigger'], 'review_modified')
+        self.assertTrue(out['legal'], out)
         run = self.st().orders[oid]['runs'][-1]
         self.assertIn('tests/logs/latest', run['changed'][str(self.repo)])
         self.assertTrue(run['snapshot'])
-        self.assertFalse(api.orders(self.st(), type='repair', target='D1'))
+        self.assertTrue(api.orders(self.st(), type='repair', target='D1'))
 
     def test_run_artifacts_outside_source_repo_preserve_review_findings(self):
         oid = self.prepare_review()
@@ -213,9 +206,10 @@ class Protected(Base):  # §24.2
             (self.repo/'tests/output.txt').write_text('log')
             (self.repo/'app.c').write_text('changed')
         out = self.run_order(oid, self.release_text(), edit=edit)
-        self.assertFalse(out['legal'])
-        self.assertIn('app.c', out['reason'])
-        self.assertIn('tests/output.txt', out['reason'])
+        self.assertTrue(out['legal'])
+        changed = self.st().orders[oid]['runs'][-1]['changed'][str(self.repo)]
+        self.assertIn('app.c', changed)
+        self.assertIn('tests/output.txt', changed)
 
     def test_tracked_and_protected_files_are_checked_regardless_of_log_names(self):
         (self.repo/'tests/logs').mkdir()
@@ -227,9 +221,10 @@ class Protected(Base):  # §24.2
             (self.repo/'tests/logs/tracked.txt').write_text('modified')
             (self.repo/'tests/logs/protected.txt').write_text('modified')
         out = self.run_order(oid, self.release_text(), edit=edit)
-        self.assertFalse(out['legal'])
-        self.assertIn('tests/logs/tracked.txt', out['reason'])
-        self.assertIn('tests/logs/protected.txt', out['reason'])
+        self.assertTrue(out['legal'])
+        changed = self.st().orders[oid]['runs'][-1]['changed'][str(self.repo)]
+        self.assertIn('tests/logs/tracked.txt', changed)
+        self.assertIn('tests/logs/protected.txt', changed)
 
     def test_committing_deletion_of_tracked_log_is_still_a_review_change(self):
         (self.repo/'tests/logs').mkdir()
@@ -241,21 +236,18 @@ class Protected(Base):  # §24.2
             git(self.repo, 'rm', 'tests/logs/tracked.txt')
             git(self.repo, 'commit', '-qm', 'delete log')
         out = self.run_order(oid, self.release_text(), edit=edit)
-        self.assertFalse(out['legal'])
-        self.assertIn('tests/logs/tracked.txt', out['reason'])
+        self.assertTrue(out['legal'])
+        self.assertIn('tests/logs/tracked.txt', self.st().orders[oid]['runs'][-1]['changed'][str(self.repo)])
 
-    def test_touching_a_protected_path_is_refused_and_goes_to_lead(self):
-        self.init()
-        oid = self.one('implement', 'D1')['id']
+    def test_protected_path_changes_are_evidence_not_an_automatic_verdict(self):
+        self.init(); oid = self.one('implement', 'D1')['id']
         out = self.run_order(oid, self.done(), edit=self.touch('tests/run_board_test.sh', '#!/bin/sh\necho changed\n'))
-        self.assertFalse(out['legal'])
-        self.assertEqual(out['outcome'], 'registered')    # not continued: the change itself must be handled
+        self.assertTrue(out['legal'])
         run = self.one('implement', 'D1')['runs'][-1]
-        self.assertEqual(run['result'], 'FAILED')
-        self.assertTrue(Path(run['version']).is_file())   # snapshot kept so the change can be reverted exactly
-        decide = self.one('decide', 'D1')
-        self.assertEqual(decide['input']['trigger'], 'protected_change')
-        self.assertIn('tests/run_board_test.sh', json.dumps(decide['input'], ensure_ascii=False))
+        self.assertEqual(run['result'], 'VERIFIED')
+        self.assertIn('tests/run_board_test.sh', run['changed'][str(self.repo)])
+        self.assertTrue(run['snapshot'])
+        self.assertEqual(api.orders(self.st(), type='decide'), [])
 
     def test_authorizing_a_protected_change_needs_the_user(self):
         self.init()
@@ -278,8 +270,8 @@ class Protected(Base):  # §24.2
         review = self.one('review', 'R12')['id']
         versions = ' '.join(self.one('implement', d)['runs'][-1]['version'] for d in ('D1', 'D2'))
         out = self.run_order(review, self.release_text('固定版本：%s\n' % versions), edit=self.touch('app.c', 'oops'))
-        self.assertFalse(out['legal'])
-        self.assertEqual(self.one('decide', 'R12')['input']['trigger'], 'review_modified')
+        self.assertTrue(out['legal'])
+        self.assertEqual(api.orders(self.st(), type='decide'), [])
 
 
 class ReviewIntegrity(Base):  # §24.5
@@ -309,18 +301,14 @@ class ReviewIntegrity(Base):  # §24.5
         self.assertEqual(self.one('review', 'R12')['state'], 'open')
         self.assertEqual(self.one('ask_user', 'D1')['state'], 'open')
 
-    def test_review_needs_its_own_rerun_or_a_reason(self):
+    def test_reviewer_decides_whether_original_evidence_is_sufficient(self):
         self.init()
         for d in ('D1', 'D2'):
             self.run_order(self.one('implement', d)['id'], self.done(), edit=self.touch('%s.c' % d, d))
         old = self.one('implement', 'D1')['runs'][-1]['evidence']
-        versions = ' '.join(self.one('implement', d)['runs'][-1]['version'] for d in ('D1', 'D2'))
         review = self.one('review', 'R12')['id']
-        run = api.start(self.base, review)
-        reuse = '结果：RELEASE\n复跑与证据：%s\n固定版本：%s\n' % (list(old)[0], versions)
-        self.assertFalse(api.deliver(self.base, review, run, reuse, conversation_id='rv')['legal'])
-        reason = reuse + '未复跑原因：板子被其他任务占用，已逐条核对执行者原始记录\n'
-        self.assertTrue(api.deliver(self.base, review, run, reason, conversation_id='rv')['legal'])
+        reuse = '结果：RELEASE\n复跑与证据：%s\n固定版本：审阅者判断可复用\n' % list(old)[0]
+        self.assertTrue(self.run_order(review, reuse)['legal'])
 
     def test_non_blocking_suggestions_go_to_triage(self):
         self.init()
@@ -334,16 +322,14 @@ class ReviewIntegrity(Base):  # §24.5
 
 
 class EvidenceRecency(Base):  # §24.6
-    def test_verified_needs_a_passing_record_from_this_run(self):
-        self.init()
-        stale = self.ev()
-        time.sleep(3.0)  # beyond the 2 s clock-granularity grace
-        oid = self.one('implement', 'D1')['id']
-        run = api.start(self.base, oid)
-        (self.repo / 'app.c').write_text('int x = 2;\n')
-        self.assertFalse(api.deliver(self.base, oid, run, self.done(ev=stale)(), events=[EDIT], conversation_id='c')['legal'])
-        self.assertFalse(api.deliver(self.base, oid, run, self.done(ev=self.ev(exit_code=1))(), events=[EDIT], conversation_id='c')['legal'])
-        self.assertTrue(api.deliver(self.base, oid, run, self.done()(), events=[EDIT], conversation_id='c')['legal'])
+    def test_record_age_and_exit_code_do_not_determine_acceptance(self):
+        for code in (0, 1):
+            with self.subTest(code=code):
+                self.init() if not (self.base / 'plan.json').exists() else None
+                d = 'D1' if code == 0 else 'D2'
+                old = self.ev(exit_code=code)
+                out = self.run_order(self.one('implement', d)['id'], self.done(ev=old))
+                self.assertTrue(out['legal'])
 
 
 if __name__ == '__main__':

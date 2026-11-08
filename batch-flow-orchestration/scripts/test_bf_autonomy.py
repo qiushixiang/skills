@@ -25,28 +25,25 @@ class Autonomy(Base):
         self.assertEqual(policy.spent(s, s.orders[d['id']]), {})
         self.assertEqual(policy.spent(s, s.orders[self.impl('D1')]), {'primary': 1})
 
-    def test_readonly_escalation_is_free_but_technical_work_is_charged(self):
-        self.go(self.impl('D1'), NEEDS_DECISION, events=[cmd('cat README.md', 0)])
-        self.assertTrue(self.st().orders[self.impl('D1')]['runs'][0]['exempt'])
-        for events in ([cmd(ENTRY + ' test', 0)], [cmd('python3 opaque.py', 0)], [EDIT], []):
+    def test_technical_runs_are_not_reclassified_by_shell_spelling(self):
+        for events in ([cmd('cat README.md', 0)], [cmd('python3 opaque.py', 0)], [EDIT], []):
             self.reinit()
             self.go(self.impl('D1'), NEEDS_DECISION, events=events)
             self.assertFalse(self.st().orders[self.impl('D1')]['runs'][0]['exempt'])
 
-    def test_opaque_or_mutating_shell_is_not_classified_as_diagnostic(self):
-        for text in ['cat x > result', 'cat x; make', 'python3 test.py', 'git diff --output=x', 'rg --pre ./build x']:
-            self.assertFalse(gate.readonly_command(text), text)
+    def test_scan_records_commands_without_guessing_work_nature(self):
+        for text in ['cat README.md', 'python3 diagnostic.py', 'git diff --output=x']:
+            run = {'edited': False}
+            gate.scan(run, [cmd(text, 0)], {})
+            self.assertEqual(run['commands_seen'], 1)
+            self.assertNotIn('non_readonly_command', run)
 
-    def test_bf_record_preserves_diagnostic_classification_but_not_test_exemption(self):
+    def test_record_wrapper_does_not_create_an_accounting_exception(self):
         import shlex
         cli = Path(api.__file__).with_name('cli.py').resolve()
-        prefix = ['python3', str(cli), '--base', str(self.base), 'record', '--']
-        diagnostic = shlex.join(prefix + ['cat', 'README.md'])
-        self.assertTrue(gate.readonly_command(diagnostic))
-        self.assertFalse(gate.readonly_command(shlex.join(prefix + ['python3', 'test.py'])))
-        oid = self.impl('D1')
-        self.go(oid, NEEDS_DECISION, events=[cmd(diagnostic, 0)])
-        self.assertTrue(self.st().orders[oid]['runs'][0]['exempt'])
+        command = shlex.join(['python3', str(cli), '--base', str(self.base), 'record', '--', 'cat', 'README.md'])
+        self.go(self.impl('D1'), NEEDS_DECISION, events=[cmd(command, 0)])
+        self.assertFalse(self.st().orders[self.impl('D1')]['runs'][0]['exempt'])
 
     def test_bundle_approval_installs_permissions_and_grant_before_original_retry(self):
         oid = self.impl('D1')
@@ -66,7 +63,8 @@ class Autonomy(Base):
         c = cards.render(s, oid, api.assign(s, oid))
         self.assertIn('当前生效', c)
         self.assertIn('tests/runner.sh', c)
-        self.assertIn(ask['id'], c)
+        self.assertNotIn(ask['id'], c)  # approval provenance stays in state/archive
+        self.assertIn(ask['id'], cards.prepare(s, oid)['control']['dependencies'])
 
     def test_whole_bundle_waits_instead_of_partially_opening_work(self):
         self.go(self.impl('D1'), NEEDS_DECISION)
@@ -133,29 +131,23 @@ class Autonomy(Base):
             self.assertEqual(d['type'], 'decide')
             d['state'] = 'done'
         routing.open_decide(s, obj, 'arch_decision_required', {'blocker': 'issue-7'})
-        self.assertEqual(obj['ops']['kind'], 'no_progress')
+        self.assertEqual(obj['ops']['kind'], 'coordination_limit')
         self.assertFalse(any(o['type'] == 'ask_user' for o in s.orders.values()))
 
-    def test_actual_permission_progress_resets_issue_but_prose_and_new_order_do_not(self):
-        s = self.st()
-        obj = s.orders[self.impl('D1')]
+    def test_explicit_recovery_can_reopen_after_configured_call_limit(self):
+        s = self.st(); obj = s.orders[self.impl('D1')]
         for _ in range(2):
             routing.open_decide(s, obj, 'blocked')['state'] = 'done'
-        twin = routing.new_order(s, 'implement', 'D1', {'by': 'order', 'ref': obj['id']}, {'instruction': 'new prose'})
-        routing.open_decide(s, twin, 'blocked')
-        self.assertEqual(twin['ops']['kind'], 'no_progress')
-        permissions.install(s, twin, ['tests/runner.sh'], 'approved')
-        self.assertEqual(routing.open_decide(s, twin, 'blocked')['type'], 'decide')
+        permissions.install(s, obj, ['tests/runner.sh'], 'approved')
+        routing.open_decide(s, obj, 'blocked')
+        self.assertEqual(obj['ops']['kind'], 'coordination_limit')
+        self.assertEqual(routing.open_decide(s, obj, 'blocked', force=True)['type'], 'decide')
 
-    def test_grant_is_progress_but_retry_and_unrelated_prose_are_not(self):
-        s = self.st()
-        obj = s.orders[self.impl('D1')]
-        before = routing.decision_progress(s, obj)
-        obj['input']['answers'] = ['new words']
-        register._execute(s, obj, {'retry': obj['id']}, obj['id'])
-        self.assertEqual(routing.decision_progress(s, obj), before)
+    def test_budget_is_counted_without_inferred_progress_digest(self):
+        s = self.st(); obj = s.orders[self.impl('D1')]
         register._execute(s, obj, {'grant': {'D1': {'implement': 1}}}, obj['id'])
-        self.assertNotEqual(routing.decision_progress(s, obj), before)
+        self.assertEqual(policy.rounds(s.plan, 'D1', 'implement'), 4)
+        self.assertNotIn('progress', routing.open_decide(s, obj, 'diagnose')['input'])
 
     def test_known_missing_permissions_are_detected_before_any_model_run(self):
         from bf.store import transact
@@ -237,3 +229,21 @@ class Reconciliation(Base):
         api.stop(self.base)
         with self.assertRaises(api.BfError):
             reconcile.apply(self.base, path, self.approval)
+
+    def test_historical_operational_notes_are_retained_without_automatic_replay(self):
+        oid, path, ask = self.prepare()
+        before = copy.deepcopy(self.st().plan)
+        spec = json.loads(path.read_text())
+        spec.update(execution_notes='直接调用受控入口；入口自行留证；核对本次镜像身份。',
+                    constraints=['承接已有工作区，不恢复历史污染数据'], fresh_session=True)
+        path.write_text(json.dumps(spec))
+        reconcile.apply(self.base, path, self.approval)
+        s = self.st()
+        self.assertTrue(s.orders[oid]['fresh_next'])
+        self.assertEqual(s.plan['deliverables'], before['deliverables'])
+        self.assertEqual(s.plan['review_groups'], before['review_groups'])
+        self.assertEqual(s.plan['policy'], before['policy'])
+        for other in [oid, self.impl('D2'), self.one('review', 'R12')['id']]:
+            card = cards.render(s, other, api.assign(s, other))
+            self.assertNotIn(spec['execution_notes'], card)
+        self.assertEqual(s.plan['execution_notes'], spec['execution_notes'])

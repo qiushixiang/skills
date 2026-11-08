@@ -40,14 +40,19 @@ python3 <技能>/scripts/agent_cli.py resolve-model --profile <profile> --catalo
 - 续接必须提供上一轮成功调用的 run 目录（`--resume-from`）：核对 usable、后端、会话 ID 与 cwd 一致才启动。不用“最近会话”，不跨后端续接。
 - `collect` 只读：检查退出码、JSON、非空最终回复、实际会话 ID、权限拒绝与 CLI 错误。不可用的调用由驱动器登记为无效（免扣）。退出码 0 不等于技术成功。
 - 计划 `env.<backend>` 的 `require_host`、`add_dirs`、`approval_policy`（Codex：on-request/untrusted）自动转成启动参数。
+- Codex 的 write + on-request 使用经 profile.help 核验的 `--approve-for-me`，保留 workspace-write，不使用全权限。只有 `-c approval_policy=...` 不足以证明 exec/resume 已启用审批。read 角色不使用该快捷开关，避免它扩大到 workspace-write；若 CLI 不能兑现其声明策略，按不可用暂停，不能静默降为 never 或扩大读写权限。
+- 本机 0.167.0 拒绝同时使用 `--sandbox` 与 `--approve-for-me`；自动审批分支用显式 `-c sandbox_mode="workspace-write"` 固定同一边界，并核对本次原生回执实际仍为 workspace-write。其他分支继续使用 `-s read-only/workspace-write`，不改用户配置文件。
+- 声明了审批策略的 Codex 调用会监测原生会话中本次启动后的 turn_context，核对实际 approval_policy、sandbox_policy 和自动 reviewer。实际值写 execution-actual.json；错误策略、旧续接回执、缺失回执均使 collect 不可用。适配器在检测到不符时终止该调用树；调用仍保留在驱动器管理的进程组中，stop --now 照常覆盖。该检查不是隔离边界，不能用它代替原生沙箱或命令规则。
 
 ## 受控入口的自动放行（Codex）
 
 只在用户明确批准固定测试入口可在宿主运行时使用：在宿主实际加载的 `rules/*.rules` 中，只对入口绝对路径及有限参数前缀写 `prefix_rule(..., decision="allow")`，保留沙箱。命中时整个入口进程在沙箱外以普通用户运行。
 
 - 规则按 argv 前缀匹配：入口必须单独、直接调用；组合命令或另套 shell/flow 会不命中，在沙箱内失败（这正是“外部阻塞”判定只认直接调用的原因）。
+- 受控入口自行留证，不能套用通用 `bf record -- <命令>` 模板。bf record 在启动子进程前拒绝再次包装当前计划的受控入口；交付门禁发现已执行的包装调用时，要求同轮纠正调用，不把它当作宿主权限故障。查看入口源码不属于包装调用。
 - 入口自身须拒绝额外参数、跨角色互斥、限时、失败恢复、留原始记录；未实现的目标非零退出。
 - 新规则须在新启动的 CLI 中生效，并用 `codex execpolicy check` 与同版本 CLI 实测。
+- sudo 端点文件在沙箱内可见、可读甚至标为可执行，不等于能提权执行。沙箱的 NoNewPrivs/setuid/UID 映射可能使 sudo 在执行端点前就失败；不得据此改宿主 sudoers、属主或 setuid 位。排查时先对比沙箱与宿主的只读 stat 和 `sudo -n -l`，确认精确端点授权；实际入口依既有规则整段在宿主执行，不单独放行 sudo 或任意解释器。查询授权成功不等于已验证设备 down/up，本次是否执行过设备操作必须如实区分。
 - 参考 [Codex Rules](https://learn.chatgpt.com/docs/agent-configuration/rules)；项目的固定路径与 sudo 端点写在项目自己的测试说明里。
 
 ## Claude 后端认证
@@ -67,3 +72,7 @@ python3 <技能>/scripts/test_agent_cli_live.py --backend <后端> --model <模�
 ## 维护
 
 修改适配器后运行 `scripts/test_agent_cli.py`、`scripts/test_model_catalog.py`。
+
+## 工单正文传输
+
+Codex/Claude 用标准输入；OpenCode 用已探测的 `run --file` 附带完整工单；agy 用短指令读取固定工单文件。正文不得作为单个 argv，也不截断。request.json 保存输入文件与SHA；启动前检查及CLI创建失败写入 exit.json 的 launch_error，含阶段和未启动事实；外层创建失败由驱动器记录并回收。未创建进程不声称 CLI_STARTED，续作启动失败不退还已收到的实际工作轮次。续作引用保存的原始工单。离线假CLI须实际读取长文件核对保真，真实后端启动还需实际验证。

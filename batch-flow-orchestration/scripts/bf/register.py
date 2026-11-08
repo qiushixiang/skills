@@ -130,7 +130,8 @@ def _execute(state, source, a, waiter):
         candidate = model.load_plan_file(a['plan_revision'])
         if a.get('within_authorization'):
             need(changes.internal_revision(plan, candidate), 'internal plan changed outside the authorized boundary')
-        revise(state, candidate, None, 'internal technical decision' if a.get('within_authorization') else 'user answer')
+        revise(state, candidate, None, 'internal technical decision' if a.get('within_authorization') else 'user answer',
+               revalidate=a.get('revalidate', []))
     elif 'ask_user' in a:
         routing.open_ask(state, source, waiter, a['ask_user'], options=a.get('options'), request=a['user_request'])
 
@@ -175,7 +176,7 @@ def answer(state, order_id, text, approve, at):
                 waiter['needs'].append(decision['id'])
 
 
-def revise(state, new_plan, approval, source='user'):
+def revise(state, new_plan, approval, source='user', revalidate=()):
     """Install a revised plan: budgets never shrink below what was used (I2); orders for new items are opened."""
     old = state.plan
     # Freeze the pre-revision review basis, including stores created before this field existed.
@@ -185,32 +186,31 @@ def revise(state, new_plan, approval, source='user'):
     plan = model.normalize(new_plan)
     plan['revision'] = old['revision'] + 1
     plan['approval'] = approval or old.get('approval')
-    fields = ('batch', 'instruction', 'acceptance', 'depends_on', 'resources', 'design_ref', 'non_goals', 'no_review', 'required_protected')
-    changed = set(d for d, spec in plan['deliverables'].items() if d not in old['deliverables'] or any(
-        spec.get(k) != old['deliverables'][d].get(k) for k in fields))
-    if any(old.get(k) != plan.get(k) for k in ('goal', 'protected', 'repos', 'workspace')):
-        changed.update(plan['deliverables'])
-    old_sections = (old.get('design') or {}).get('sections', {})
-    sections = (plan.get('design') or {}).get('sections', {})
-    changed.update(d for d, spec in plan['deliverables'].items() if spec.get('design_ref') and
-                   old_sections.get(spec['design_ref']) != sections.get(spec['design_ref']))
-    changed.update(g for g, spec in plan['review_groups'].items() if old['review_groups'].get(g) != spec)
-    changed.update(set(old['deliverables']) - set(plan['deliverables']))
-    changed.update(set(old['review_groups']) - set(plan['review_groups']))
-    # Propagate through the approved dependency graph, including review nodes.
-    graph = {d: spec['depends_on'] for d, spec in plan['deliverables'].items()}
-    graph.update({g: spec['deliverables'] for g, spec in plan['review_groups'].items()})
-    while True:
-        more = {x for x, deps in graph.items() if changed.intersection(deps)} - changed
-        if not more:
-            break
-        changed.update(more)
+    need(isinstance(revalidate, (list, tuple)) and all(d in plan['deliverables'] for d in revalidate),
+         'revalidate must list deliverables explicitly selected by the lead')
+    # The lead selects what must be done again; textual changes never infer invalidation.
+    changed = set(revalidate)
+    plan['revision_notes'] = list(old.get('revision_notes', [])) + [{
+        'revision': plan['revision'], 'source': source, 'revalidate': sorted(changed),
+        'instruction_changes': [d for d in plan['deliverables'] if d in old['deliverables']
+                                and plan['deliverables'][d] != old['deliverables'][d]]}]
+    available = set(plan['deliverables']) | set(plan['review_groups']) | {None}
     for o in state.orders.values():
-        need(o['state'] != 'running' or o['target'] not in changed,
+        need(o['state'] != 'running' or (o['target'] not in changed and o['target'] in available),
              'revision affects running order %s; stop and collect it before revising' % o['id'])
     for d, spec in plan['deliverables'].items():
         spec['contract_version'] = (plan['revision'] if d in changed else
                                     old['deliverables'].get(d, {}).get('contract_version', 1))
+    for obj in state.orders.values():
+        group = obj['target']
+        if obj['type'] == 'review' and group in old['review_groups'] and group in plan['review_groups']:
+            before, after = old['review_groups'][group], plan['review_groups'][group]
+            structural = ('deliverables', 'batch', 'reviewer')
+            if not changed.intersection(after['deliverables']) and all(before.get(k) == after.get(k) for k in structural):
+                current = model.review_contract(plan, group)
+                if obj.get('contract') == model.review_contract(old, group) and obj['contract'] != current:
+                    obj.setdefault('contract_history', []).append({'revision': plan['revision'], 'prior': obj['contract']})
+                    obj['contract'] = current
     state.plan = plan
     for o in state.orders.values():
         if o['type'] in policy.STAFFED:

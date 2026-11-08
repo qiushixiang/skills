@@ -1,6 +1,4 @@
 """Order creation, selection (design 5.4) and event -> order openers (design 5.2)."""
-import hashlib
-import json
 from . import model, policy
 from .store import need, sha256_file
 
@@ -55,11 +53,6 @@ def broken_paths(state):
     return out
 
 
-def _broken_orders(state):
-    return set(o['id'] for o in state.orders.values()
-               if any(sha256_file(p) != h for r in o['runs'] for p, h in r['evidence'].items()))
-
-
 def _resources(plan, order):
     members = model.deliverables_of(plan, order['target'])
     return set('deliverable:' + d for d in members) | set(
@@ -99,7 +92,6 @@ def runnable(state, parallel=1):
     if state.stopped:
         return []
     plan = state.plan
-    bad = _broken_orders(state)
     held = set(plan.get('holds') or [])
     running = [o for o in state.orders.values() if o['state'] == 'running']
     busy_targets = set(o['target'] for o in running if o['target'])
@@ -111,20 +103,17 @@ def runnable(state, parallel=1):
     def dep_ok(d):
         if d in plan['review_groups']:
             impls = [o for o in state.orders.values() if o['type'] == 'review' and o['target'] == d and current_work(state, o)]
-            return bool(impls) and all(i['state'] in SATISFIED and i['id'] not in bad for i in impls)
+            return bool(impls) and all(i['state'] in SATISFIED for i in impls)
         impls = [o for o in work_for(state, d) if o['type'] == 'implement']
-        return bool(impls) and all(i['state'] in SATISFIED and i['id'] not in bad for i in impls)
-    drift = set(model.drifted(plan))
+        return bool(impls) and all(i['state'] in SATISFIED for i in impls)
     cands = []
     for o in state.orders.values():
         if o['state'] != 'open' or o['type'] == 'ask_user' or o.get('ops'):
             continue
         if not current_work(state, o):
             continue
-        if o['type'] in ('implement', 'repair') and o['target'] in drift:
-            continue
         needs = o['needs'] + (review_needs(state, o['target']) if o['type'] == 'review' else [])
-        if not all(state.orders[n]['state'] in SATISFIED and n not in bad for n in needs if n in state.orders):
+        if not all(state.orders[n]['state'] in SATISFIED for n in needs if n in state.orders):
             continue
         batch = model.batch_of(plan, o['target'])
         if batch and batch not in plan['envelope']['batches']:
@@ -180,42 +169,27 @@ def open_decide(state, subject, trigger, extra=None, force=False):
         issue.append(subject['input'].get('review_order'))
     details = extra or {}
     issue.append(details.get('blocker') or sorted(details.get('paths') or []))
-    progress = decision_progress(state, subject)
     count = len([o for o in state.orders.values() if o['type'] == 'decide'
-                 and o['input'].get('issue_key') == issue and o['input'].get('progress') == progress])
+                 and o['input'].get('issue_key') == issue])
     stalled = len([o for o in state.orders.values() if o['type'] == 'decide'
-                   and o['input'].get('issue_key', [])[:3] == issue[:3] and o['input'].get('progress') == progress])
+                   and o['input'].get('issue_key', [])[:3] == issue[:3]])
     active = next((o for o in state.orders.values() if o['type'] == 'decide' and
                    o['state'] in ('open', 'running') and o['input'].get('subject') == subject['id'] and
                    o['input'].get('issue_key') == issue), None)
     if active and not force:
         return active
     if not force and stalled >= policy.rounds(plan, subject['target'], 'coordination_no_progress', 6):
-        return pause(state, subject, '本目标连续 %d 次协调没有相关进展' % stalled, 'no_progress')
+        return pause(state, subject, '本目标协调调用达到配置上限 %d 次' % stalled, 'coordination_limit')
     if count >= policy.rounds(plan, subject['target'], 'decide_per_source', 2) and not force:
-        return pause(state, subject, '同一问题在无相关进展状态下已裁决 %d 次（%s）' % (count, trigger), 'no_progress')
+        return pause(state, subject, '同类触发的协调调用达到配置上限 %d 次（%s）' % (count, trigger), 'coordination_limit')
     last = next((r for r in reversed(subject['runs']) if r['ended']), None)
     inp = {'trigger': trigger, 'subject': subject['id'], 'run': last['run_id'] if last else None,
-           'evidence': sorted(last['evidence']) if last else [], 'subject_input': dict(subject['input']),
-           'issue_key': issue, 'progress': progress}
+           'evidence': sorted(last['evidence']) if last else [],
+           'issue_key': issue}
     inp.update(extra or {})
     d = new_order(state, 'decide', subject['target'], {'by': 'order', 'ref': subject['id'], 'reason': trigger}, inp)
     subject['needs'].append(d['id'])
     return d
-
-
-def decision_progress(state, subject):
-    from . import permissions
-    target = subject['target']
-    changes = [(r['run_id'], r.get('snapshot')) for o in state.orders.values() if o['target'] == target
-               and o['type'] in ('implement', 'repair') for r in o['runs'] if r.get('changed')]
-    # New prose, new order ids, read-only records and retry actions are not progress.
-    material = {'contract': state.plan['deliverables'].get(target, {}).get('contract_version'),
-                'rounds': {k: policy.rounds(state.plan, target, k) for k in ('implement', 'repair', 'backup', 'lead', 'review')},
-                'permissions': sorted(permissions.allowed(state.plan, subject)), 'changes': changes,
-                'credits': sorted((o['id'], sorted(o.get('budget_credits', {}))) for o in state.orders.values()
-                                  if o['target'] == target and o.get('budget_credits'))}
-    return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
 
 
 def check_exhausted(state, order):
@@ -236,7 +210,8 @@ def pause(state, order, why, kind='technical_block', missing=''):
     if not missing:
         missing = {'coordination_exhausted': '修复协调交付并给出合法、可执行的处置',
                    'tool_failure': '恢复当前 CLI 调用环境或账号',
-                   'no_progress': '依据新证据改变无效恢复方案或修复驱动器缺项'}.get(kind, '负责人核实具体恢复条件')
+                   'no_progress': '负责人核查历史暂停并确定恢复方案',
+                   'coordination_limit': '负责人或运维核查协调调用次数及恢复条件'}.get(kind, '负责人核实具体恢复条件')
     order['state'] = 'open'
     order['ops'] = {'problem': why, 'kind': kind, 'missing': missing, 'at': now()}
     return order
@@ -287,12 +262,15 @@ def open_repairs(state, review, run, p):
 
 
 def latest_snapshots(state, deliverable):
-    """Snapshot paths of the newest legal run that changed this deliverable's files (design 24.7)."""
-    runs = [r for o in work_for(state, deliverable) for r in o['runs']
-            if r['ended'] and r['result'] == 'VERIFIED' and r.get('snapshot')]
-    if runs:
-        return list(max(runs, key=lambda r: r.get('ended_ts', r['started_ts']))['snapshot'])
-    return []
+    """All captured versions, in run order; partial and interrupted work is relevant evidence too."""
+    paths = []
+    for o in sorted_orders(state):
+        if o['target'] == deliverable and o['type'] in ('implement', 'repair'):
+            for r in o['runs']:
+                for path in r.get('snapshot', []):
+                    if path not in paths:
+                        paths.append(path)
+    return paths
 
 
 def _review_family(state, group):
@@ -345,7 +323,7 @@ def sync_plan(state):
             version = spec.get('contract_version', 1)
             key = 'impl:' + d + (':r%d' % version if version != 1 else '')
             new_order(state, 'implement', d, {'by': 'plan', 'ref': 'r%d' % plan['revision'], 'reason': 'plan'},
-                      {'instruction': spec['instruction'], 'acceptance': spec['acceptance']}, key=key)
+                      {}, key=key)
     for g, spec in plan['review_groups'].items():
         family = _review_family(state, g)
         if not family or not current_work(state, family[-1]):

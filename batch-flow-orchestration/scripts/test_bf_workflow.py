@@ -68,7 +68,7 @@ class Workflow(Base):
         self.assertTrue(any(o['id'] in api.runnable(self.st(),10)
                             for o in api.orders(self.st(),type='review',target='R12')))
 
-    def test_user_constraints_cross_retired_dependency_without_leaking_review_verdicts(self):
+    def test_owner_compiles_effective_constraints_without_inheriting_retired_history(self):
         s = self.st()
         impl = s.orders[self.impl('D1')]
         impl['state'] = 'superseded'
@@ -82,14 +82,17 @@ class Workflow(Base):
         ask['needs'].append(other['id'])
         review = api.orders(s,type='review',target='R12')[0]
         c = cards.render(s,review['id'],api.assign(s,review['id']))
-        self.assertIn('入口改用 bf record，保留 S15',c)
-        self.assertEqual(c.count('用户答复：'),1)
+        self.assertNotIn('入口改用 bf record，保留 S15',c)
+        review['input']['constraints'] = ['使用 bf record 留证']
+        c = cards.render(s,review['id'],api.assign(s,review['id']))
+        self.assertIn('使用 bf record 留证', c)
         self.assertNotIn('PRIVATE REVIEW VERDICT',c)
         child = routing.new_order(s, 'implement', 'D1', {'by':'order','ref':impl['id'],'reason':'decision'},
                                   {'instruction':'apply the authorized direction'})
         review['needs'] = [child['id']]
         c = cards.render(s,review['id'],api.assign(s,review['id']))
-        self.assertIn('入口改用 bf record，保留 S15',c)
+        self.assertNotIn('入口改用 bf record，保留 S15',c)
+        self.assertIn('使用 bf record 留证', c)
         self.assertNotIn('PRIVATE REVIEW VERDICT',c)
         s.plan['deliverables']['D1']['contract_version'] = 2
         c = cards.render(s,review['id'],api.assign(s,review['id']))
@@ -136,7 +139,8 @@ class Workflow(Base):
         s.orders[oid]['input']['instruction'] = 'specific approved scope'
         c = cards.render(s, oid, api.assign(s, oid))
         self.assertIn('specific approved scope', c)
-        self.assertIn('当前完整指令 D1：do d1', c)
+        self.assertNotIn('当前完整指令 D1：do d1', c)
+        self.assertIn('验收：a1', c)
 
     def decide(self, actions):
         return self.go(self.one('decide', 'D1', 'open')['id'],
@@ -180,11 +184,11 @@ class Workflow(Base):
         old = copy.deepcopy(self.st().orders[self.impl('D1')])
         p = copy.deepcopy(self.st().plan)
         p['deliverables']['D1'].update(instruction='new instruction', acceptance=['new acceptance'])
-        api.revise_plan(self.base, p, self.approval)
+        api.revise_plan(self.base, p, self.approval, revalidate=['D1'])
         s = self.st()
         current = api.orders(s, type='implement', target='D1', state_='open')
         self.assertEqual(len(current), 1)
-        self.assertEqual(current[0]['input']['instruction'], 'new instruction')
+        self.assertEqual(cards.prepare(self.st(), current[0]['id'])['input']['instruction'], 'new instruction')
         self.assertEqual(s.orders[old['id']], old)  # immutable historical delivery
         self.assertEqual(s.orders[review]['state'], 'done')
         self.assertTrue(api.orders(s, type='review', target='R12', state_='open'))
@@ -224,7 +228,7 @@ class Workflow(Base):
         self.assertIn(ask,(self.base/'attention.md').read_text())
         p = copy.deepcopy(self.st().plan)
         p['deliverables']['D1']['instruction'] = '用户已批准的新方案'
-        api.revise_plan(self.base, p, self.approval)
+        api.revise_plan(self.base, p, self.approval, revalidate=['D1'])
         self.assertEqual(self.st().orders[ask]['state'], 'superseded')
         self.assertEqual((self.base/'attention.md').read_text(),'')
         current = self.one('implement', 'D1', state_='open')['id']
@@ -272,12 +276,14 @@ class Workflow(Base):
         self.assertFalse(out['legal'])
         self.assertIn('等待环', out['reason'])
 
-    def test_contract_change_invalidates_dependent_deliverable(self):
+    def test_lead_explicitly_selects_dependent_work_to_repeat(self):
         self.verify_batch1()
         self.go(self.impl('D3'), self.done())
         p = copy.deepcopy(self.st().plan)
         p['deliverables']['D1']['acceptance'] = ['changed interface']
-        api.revise_plan(self.base, p, self.approval)
+        api.revise_plan(self.base, p, self.approval, revalidate=['D1'])
+        self.assertEqual(self.one('implement', 'D3')['state'], 'done')
+        api.revise_plan(self.base, p, self.approval, revalidate=['D3'])
         self.assertEqual(len(api.orders(self.st(), type='implement', target='D3', state_='open')), 1)
 
     def test_exhausted_waiter_returns_to_lead_after_child_completes(self):
@@ -300,7 +306,7 @@ class Workflow(Base):
         self.go(oid, self.done())
         p = copy.deepcopy(self.st().plan)
         p['deliverables']['D1']['instruction'] = 'revised work'
-        api.revise_plan(self.base, p, self.approval)
+        api.revise_plan(self.base, p, self.approval, revalidate=['D1'])
         self.assertEqual(self.one('decide', 'D1', state_='open')['input']['trigger'], 'exhausted')
 
     def test_cross_batch_review_reopens_its_own_batch_release(self):
@@ -424,7 +430,8 @@ class Versions(RepoBase):
         content['diff'] = 'changed after registration'
         Path(snap).write_text(json.dumps(content))
         self.assertIn(snap, api.broken_evidence(self.st()))
-        self.assertNotIn(self.one('review', 'R12')['id'], api.runnable(self.st(), 10))
+        self.run_order(self.one('implement', 'D2')['id'], self.done())
+        self.assertIn(self.one('review', 'R12')['id'], api.runnable(self.st(), 10))
 
 
 if __name__ == '__main__':

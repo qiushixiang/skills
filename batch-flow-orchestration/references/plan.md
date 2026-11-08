@@ -31,7 +31,9 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow init --plan plan.
   "batches": [{"id": "S15", "title": "…"}],
   "deliverables": {
     "S15.E": {"batch": "S15", "title": "…", "instruction": "…", "acceptance": ["…"],
-              "depends_on": ["S1314.R"], "resources": ["board"], "design_ref": "任务跟踪.md §3.16.5"}
+              "depends_on": ["S1314.R"], "resources": ["board"], "design_ref": "任务跟踪.md §3.16.5",
+              "required_read": [{"path": "/任务/设计.md", "section": "§3.16.5 接口契约", "purpose": "实现接口时遵守已定语义"}],
+              "constraints": ["仅完成本批范围"]}
   },
   "review_groups": {
     "S1516.R": {"deliverables": ["S15.E", "S16.E"], "reviewer": "reviewer"},
@@ -54,29 +56,40 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow init --plan plan.
 - **资源**：会互相干扰的交付目标（如共用一块板）写相同的 `resources`，并发运行时不会同时派发。
 - **授权包络**：`envelope.batches` 是用户批准可自主推进的批次；可选 `envelope.protected: {"目标": ["精确仓库相对路径"]}` 预授限定路径权限。预授权只覆盖指定目标和路径，仍遵守设计中的修改内容、验收和审阅要求。包络外的工作由脚本转交用户。
 - **派发需求**：已知实施需要改保护路径时，在交付目标的 `required_protected` 列出精确路径，驱动器在派发前检查。它声明需求，不授予权限；不要把已知需求只藏在指令文字里。
-- **环境**：需要宿主权限的验证只经 `env.entry` 受控入口；`blocked_output` 写入口自身的环境失败输出，用于机械判定“外部阻塞”。
+- **环境**：需要宿主权限的验证只经 `env.entry` 受控入口；`blocked_output` 写入口自身的环境失败输出，作为环境诊断事实，由角色判断是否阻塞。
 - 默认额度通常够用；个别交付目标需要更多轮次时写 `overrides`，并在审阅计划时向用户说明。
 
 ## 修订、额度与版本
 
 - 实施额度由同一交付目标的全部实施单共享；返修额度由同一审阅周期与返修目标共享；审阅额度由同一审阅组共享。换单、换上下文和修订计划不重置用量。追加审阅额度用 `grant <审阅组> --review N --approval F`。
-- `contract_version` 由脚本维护。指令、验收、范围、依赖或引用设计章节实质变更时，`revise` 为受影响目标及其依赖方创建新契约下的实施与审阅；旧交付保留，不能证明新契约完成。审阅组成员、角色或重点改变也需要重新审阅。只调额度、模型等不会重做实施。
+- `contract_version` 记录契约版本。文字或引用变化不自动重做工作；负责人用 `revalidate` 明确选择需重做目标，其余历史结论保留，由角色判断适用性。
 - 有受影响工单正在运行时先停止派发并完成回收，再修订；脚本拒绝混用运行中的旧输入与新契约。新契约仍沿用已消耗的额度，必要时在本次批准中追加。
 - 后续实施与返修统一使覆盖该目标的审阅等待当前工作，已通过的常规/第三方审阅需重新确认；放行等待相应工单完成。
 
 ## 完整性字段（design §24）
 
-- `repos`：源码仓库绝对路径列表。写了才启用自动快照：每次运行前记录脏文件基线，登记时算出本次改动并生成快照；审阅卡因此可写源码仓库之外的 records（审阅访问为 write，但改动源码会被判 `review_modified`）。不写则不做快照。
-- `protected`：受保护路径 glob（如 `tests/run_board_test.sh`）。未授权改动登记为 FAILED 并转技术负责人（trigger `protected_change`）。给原单补权限使用裁决 `authorize`；新单可带 `allow_protected`。超出计划预授权的部分才转用户；批准后须结构化登记，不能以批准原文代替权限状态。
+- `repos`：源码仓库绝对路径。启用版本观察与自动快照（包括失败/中断），保存 SHA 和类型/模式等事实；不因检测到变化自动判交付失败。
+- `protected`：负责人明确的保护边界提示，不把整个任务内文件一律冻结。实际变化交角色判断；显式 required_protected 权限需求仍须正式登记，不能绕过宿主或用户明确授权。
 - `no_review`：交付目标不属于任何审阅组时必须写明原因，否则计划不通过。
-- `design_ref`：设计文档章节标题（有 `design.path` 时每个交付目标必填，须能匹配标题）。脚本记下章节哈希（`design.sections`）；章节后来被改，相关交付目标暂停派发，并开 `design_drift` 裁决（处置 `{"refresh_design": true}` 表示方案不变，重新固定哈希）。
+- `design_ref`：设计章节引用。保存章节哈希，变化作为事实送达角色，不自动暂停实施；负责人判断影响与需要重做的目标。
 - 可选 `deliverables.*.non_goals`（字符串列表，卡片目标节列出“不要做”）与 `review_groups.*.focus`（字符串，审阅卡列出审阅重点）。计划编制方法见 [技术负责人](technical-lead.md)。
 - `instruction`、`acceptance` 不得为空。`policy.rounds.review < 1 + 返修链长度` 时写入 `plan.warnings`，审阅轮次可能不够。
 
 ## 协调与额度
 
-`lead` 仅为兜底实施轮次。decide/triage 使用独立的 `coordination_attempts`（默认每单 2 次），不计技术轮次。`decide_per_source` 限制同类问题在相同相关状态下重复裁决（默认 2 次），不是某目标的历史裁决总数。待裁决可用“问题标识”区分稳定的不同阻塞；目标同时受 `coordination_no_progress` 总无进展上限（默认 6 次）约束，不能靠改标识绕过。有效权限、预算、契约或本目标源码变更属于进展；换工单、改描述、普通只读记录和 retry 不重置计数。
+`lead` 为兜底实施轮次。decide/triage 使用独立 coordination_attempts（默认每单 2 次）。decide_per_source（默认 2 次）及历史字段 coordination_no_progress（默认 6 次）现仅表示协调调用次数上限，不推断技术进展；额度与权限变化不自动重置次数，运维处置后显式 retry/escalate 开放有界恢复。
 
 达到协调上限只暂停受影响路径并报告，不自动询问用户。[六类新增用户决定](user-decisions.md)之外的技术问题由负责人和运维处理。纯技术方案调整可由负责人声明 plan_revision.within_authorization，脚本检查目标、验收、授权、预算、资源、依赖和必需审阅不变后执行；真正改变用户承诺的计划修订仍须批准。
 
-实施运行只有在工具事件能证明全程为受支持的只读诊断、无编辑或源码变化、无受控入口调用，并以待裁决结束时才免扣。无变化本身不构成免扣依据，未知脚本与真实构建测试仍计技术轮次。历史误记只经批准后的审计冲正，不能删除或改写运行。
+技术角色运行按既定阶段累计，不按命令拼写猜诊断性质免扣。CLI 传输失败免扣、协调单独记账；历史记账保留，修复需审计，不自动退款或重置。
+
+## 修订影响
+
+负责人判断修订是否改变用户承诺；within_authorization 仅表示负责人的裁定，结构比较只保护显式预算、权限和流程配置，不证明自然语言等价。新增承诺仍须用户批准。
+指令、验收或设计措辞变化不自动使已交付内容失效。plan_revision 的 revalidate（或 revise --revalidate）明确列出需重做的现有交付目标；覆盖这些目标的独立审阅按现有依赖执行，其余下游不自动重开。负责人必须判断并列全受影响目标。
+
+## 上下文与必读
+
+负责人在设计阶段按[工单上下文编制](technical-lead.md#工单上下文编制)选定必需输入。目标及审阅组可配置 `required_read: [{"path": "...", "section": "准确范围", "purpose": "具体用途", "sha256": "可选SHA256"}]`；专项单 `input.required_read` 替换该角色默认清单。目标 `constraints` 为当前有效要求，不保存历史覆盖语句。
+
+目标和验收以计划为唯一来源；专项 `input.instruction` 表达本次差异。`execution_notes` 仅保留历史审计，不再自动送给执行者；仍有效的必要规范须整理到正文或必读。卡片和 dispatch.json 只保存实际派发导出，不是可独立修改的任务来源。脚本只核对结构和导出保真；选材、约束含义与版本影响由负责人/审阅者判断。

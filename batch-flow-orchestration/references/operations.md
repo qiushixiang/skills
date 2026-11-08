@@ -63,7 +63,7 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow run [--background
 
 ask_user 只用于[六类新增用户决定](user-decisions.md)。report.ops 中的技术阻塞、协调次数用尽和工具故障属于“受阻待处理”，不归入“待你决定”，不因驱动器退出而自动改为用户问题。先处理已有授权内的运维和技术处置。
 
-协调单的运维 retry/escalate 在记录具体处理说明后开放新的有界协调尝试；技术预算保持累计。连续无进展路径的显式 retry 会重新交负责人诊断，不直接派实施。不得无实际处置循环调用这些入口；相关权限或预算已变化时仍应核对真实恢复条件。
+协调单的运维 retry/escalate 在记录具体处理说明后开放新的有界协调尝试；技术预算保持累计。历史 no_progress 暂停的显式 retry 仍交负责人诊断；新的 coordination_limit 只说明次数用尽，恢复需记录具体运维说明。不得无实际处置循环调用这些入口；相关权限或预算已变化时仍应核对真实恢复条件。
 
 把用户原话写入 `<任务>/.batch-flow/answers/<n>.txt`，然后：
 
@@ -94,8 +94,9 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow answer WO-0012 --
 
 ## 运维（聊天前端）
 
+- Codex 启动参数与实际权限策略不一致、或缺少本次原生会话回执，属于 CLI 不可用，免扣技术轮次并按 invalid_retry 有界重试后暂停；不能派角色反复核查权限来消耗实施额度。详见 [CLI 适配器](cli-adapter.md)。宿主父进程 NoNewPrivs=0 不代表每个工具命令都已出沙箱；受控入口须直接命中既有规则，不外套 bf record。
 - `report --text`：给人看的中文进展（正在做、下一步、待你决定、角色、批次），不含工单号；`report` 输出完整 JSON（含 roles、next、batches、ops）。
-- 计划来源的实施卡采用当前计划指令；裁决新开的实施卡保留专用指令，并附当前计划作为上下文。验证副作用触发门禁时，将证据交技术负责人修订批次方案；前端不维护项目路径豁免。
+- 计划来源的实施卡采用当前计划指令；裁决新开的实施卡保留专用指令，并附当前计划作为上下文。验证副作用和版本差异作为事实交角色判断；前端不维护路径豁免或替代审阅。
 - 所有入口创建的审阅均等待审阅组覆盖目标的当前实施/返修；校验、开单和派发使用相同依赖。需要实施前设计审阅时，由负责人在计划中建立独立设计交付与设计审阅组。
 - 同一工单连续 CLI 不可用达到 `invalid_retry` 次，工单被标记 `ops` 并暂停（其余照常推进），不再自动开裁决。前端读故障原文后：`retry WO-n --note T`（如切换 codex 账号后重试，免扣额度）、`escalate WO-n --note T`（交技术负责人，trigger `tool_failure`），或告诉用户。
 - 前端可读任何文件、运行只读命令和已配置的账号切换命令；写入只限 `answers/` 下的新文件；不改代码、不做技术判断。
@@ -113,6 +114,8 @@ bf/cli.py --base <任务>/.batch-flow reconcile --file <base>/answers/repair.jso
 
 清单包含 revision（当前状态修订）、order、paths（精确路径）、prior_approvals（已批准同目标问题）、credits（每项 run 与 reason）、resolve_asks（原单的空动作升级问题）。原话文件须包含用户对本次修复的授权，操作人核对先前批准确实覆盖这些路径和内容，不能从 approve=true 猜测任意路径授权。
 
+恢复时可附 constraints（原单额外执行约束）、fresh_session（明确换新执行上下文）；execution_notes 仅作历史记录，不再自动进入派发正文。这只澄清执行方式，不改验收、范围、预算、依赖、审阅或宿主授权；不能借操作说明夹带新承诺。原始用户批准和清单均留哈希。负责人整理并替换当前有效约束，旧报告保留，不累加覆盖语句。
+
 脚本同时检查当前契约、已有批准、运行证据完整性、冲正轮次没有源码变化或受控入口执行、修复后权限和执行余额均成立。原运行不改写，冲正另存 budget_credits；清单和批准记录哈希，精确重复请求幂等，dry-run 不修改状态。不能用于冲正真实实施或测试、跳过审阅、增加总预算或扩大验收。迁移不会启动任务，也不会解除 stop；技能维护结束不自动恢复项目编排。
 
 新问题不再使用这种迁移方式。计划声明 required_protected，裁决用 authorize 给原单登记权限；关联 grant、retry 与 authorize 整包批准执行。纯文字答复转协调解释，不能充当结构化权限登记。
@@ -122,3 +125,14 @@ bf/cli.py --base <任务>/.batch-flow reconcile --file <base>/answers/repair.jso
 - `watch [--since N] [--once]`：把值得关注的事件（驱动器启停、待你决定、运维暂停、交付结果、批次放行、停止）逐条输出为一行中文；前端用 Monitor 挂着它。`report` 的 `driver.alive` 表示驱动器是否在运行。
 - `doctor`：列出任务目录里引用了、但技能中已不存在的脚本（`{"missing": [{file, line, ref}]}`）；切换或升级技能前运行。
 - `stop` 同时阻止续跑（不合法交付暂存，`resume` 后继续）；`stop --now` 立即按进程组终止在途调用，登记为无效、免扣，驱动器退出。
+
+## 判断职责调整后的维护
+
+快照/证据哈希变化与文档差异不自动阻止派发或放行；report 保留 broken_evidence，派发工单包含注册 SHA、当前 SHA、缺项和版本历史，由审阅者或负责人判断。显式 stop、hold、预算、权限、资源锁和独立审阅继续有效。
+维护升级不会修复旧 ops 或旧工单指令；原有暂停、历史结果和批准保留。现存任务需按支持的 bf 操作核查并修复登记后另行恢复，不自动 ensure-run。
+每次首轮派发保存 dispatch.json 与 card-1.md，全部角色使用统一有效输入；续作引用原卡，导出丢字段在模型启动前报工具错误。
+
+### 仅修复历史协调记账
+
+reconcile 支持 paths=[] 且 credits 非空：只审计冲正指定的纯协调误记，不安装任何路径权限，不夹带 resolve_asks 批准或 execution_notes 计划变更。仍须本次修复的用户原话文件、同目标既有批准、当前 revision、完整且未漂移的运行证据；真实源码改动、受控测试及已有冲正不得再冲正。仅此模式可引用同目标旧契约批准作为历史来源，不能借此授予新权限。先 dry-run 核对，原运行与总额度保留。
+前端帮助使用完整绑定命令 `<Python> <技能>/scripts/bf/cli.py --base <绑定目录> reconcile --help`；不支持 flow 简写或任意 Python heredoc。读取状态用 Read/Grep/cat，工单在 orders.json 的 orders 字段中。report.ops 不应转成用户选择，只有 report.ask_user 是当前待决。

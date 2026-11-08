@@ -5,7 +5,8 @@ import os
 import subprocess
 import time
 
-from . import api, cards
+from . import api, cards, snap
+from .adapter import LaunchNotStarted
 from .store import BfError, now
 
 
@@ -103,7 +104,17 @@ class Runner(object):
         rd = self._dir(run_id)
         card = rd / ('card-%d.md' % n)
         card.write_text(text, encoding='utf-8')
-        handle = self.adapter.launch(st.orders[order_id], assignment, str(card), str(rd), resume=resume)
+        try:
+            handle = self.adapter.launch(st.orders[order_id], assignment, str(card), str(rd), resume=resume)
+        except LaunchNotStarted as error:
+            record = rd / ('launch-error-%d.json' % n)
+            record.write_text(json.dumps(dict(order=order_id, run=run_id, **error.details), ensure_ascii=False), encoding='utf-8')
+            api.abandon(self.base, order_id, run_id, 'CLI未启动：%s；详情：%s' % (error, record))
+            self.inflight.pop(run_id, None)
+            saved = rd / 'inflight.json'
+            if saved.exists():
+                saved.unlink()
+            return
         self.inflight[run_id] = {'handle': handle, 'order': order_id, 'assignment': assignment, 'n': n}
         self._persist(run_id)
 
@@ -141,7 +152,8 @@ class Runner(object):
             st = api.load(self.base)
             if out['outcome'] == 'continue':
                 k = next(r for r in st.orders[info['order']]['runs'] if r['run_id'] == run_id)['continuations']
-                text = cards.continue_prompt(info['order'], out['reason'], k, st.plan['policy']['continue_limit'])
+                text = cards.continue_prompt(info['order'], out['reason'], k, st.plan['policy']['continue_limit'],
+                                             str(self._dir(run_id) / 'card-1.md'))
                 if st.stopped:
                     self._pend(run_id, info['order'], info['assignment'], text, res.get('conversation_id'), info['n'] + 1)
                 else:
@@ -158,11 +170,12 @@ class Runner(object):
         if st.stopped:
             return False
         progress = False
-        if api.check_design(self.base):
-            st = api.load(self.base)
         if api.preflight(self.base):
             st = api.load(self.base)
         for oid in api.runnable(st, self.parallel):
+            st = api.load(self.base)
+            if oid not in api.runnable(st, self.parallel):
+                continue
             o = st.orders[oid]
             if o['type'] == 'release':
                 api.release(self.base, oid)
@@ -170,9 +183,35 @@ class Runner(object):
                 continue
             a = dict(api.assign(st, oid), access='read' if o['type'] == 'review' and not st.plan.get('repos') else 'write')
             resume = a['session']['conversation_id'] if a['session']['mode'] == 'resume' else None
-            run_id = api.start(self.base, oid, conversation_id=resume)
-            st = api.load(self.base)
-            self._launch(st, oid, run_id, a, cards.render(st, oid, a, run_dir=self._dir(run_id)), resume, 1)
+            # Export/validate before starting a billable role run.
+            next_id = '%s-r%d' % (oid, len(o['runs']) + 1)
+            try:
+                prepared = cards.prepare(st, oid)
+                rd = self._dir(next_id)
+                text = cards.render(st, oid, a, run_dir=rd, prepared=prepared)
+                cards.validate_export(prepared, text)
+            except (BfError, KeyError, TypeError, ValueError) as error:
+                api.dispatch_error(self.base, oid, '工单导出失败：%s' % error)
+                progress = True
+                continue
+            input_path, card_path = rd / 'dispatch.json', rd / 'card-1.md'
+            context_path = rd / 'context.json'
+            try:
+                observations = snap.baseline(st.plan)
+            except (OSError, BfError) as error:
+                observations = {'observation_error': str(error)}
+            context_path.write_text(cards.export_input({'repositories': observations, 'raw_input': o['input'],
+                'execution_notes': st.plan.get('execution_notes'), 'origin': o['origin']}), encoding='utf-8')
+            input_path.write_text(cards.export_input(prepared), encoding='utf-8')
+            card_path.write_text(text, encoding='utf-8')
+            try:
+                run_id = api.start(self.base, oid, conversation_id=resume, expected_revision=st.revision,
+                                   dispatch={'input': input_path, 'card': card_path, 'context': context_path})
+            except BfError:
+                if api.load(self.base).revision != st.revision:
+                    continue  # A concurrent user/state change requires a freshly resolved order.
+                raise
+            self._launch(st, oid, run_id, a, text, resume, 1)
             progress = True
         return progress
 

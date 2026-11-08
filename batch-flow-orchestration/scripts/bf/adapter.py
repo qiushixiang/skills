@@ -11,6 +11,14 @@ from . import api, model
 DEFAULT_AGENT_CLI = Path(__file__).resolve().parents[1] / 'agent_cli.py'
 
 
+class LaunchNotStarted(Exception):
+    """Raised only before Popen returns a process handle."""
+    def __init__(self, phase, error):
+        super().__init__(str(error))
+        self.details = {'phase': phase, 'started': False, 'type': type(error).__name__,
+                        'errno': getattr(error, 'errno', None), 'message': str(error)}
+
+
 def _alive(pid):
     try:
         os.kill(pid, 0)
@@ -88,10 +96,14 @@ class AgentCliAdapter(object):
     def launch(self, order, assignment, card_path, run_dir, resume=None):
         run_dir = Path(run_dir)
         cli_dir = run_dir / ('cli-%d' % (len(list(run_dir.glob('cli-*'))) + 1))
-        argv = self.argv(order, assignment, card_path, cli_dir, resume)
-        log = open(str(run_dir / ('launch-%s.log' % cli_dir.name)), 'wb')
-        proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-        log.close()
+        phase = 'adapter_preflight'
+        try:
+            argv = self.argv(order, assignment, card_path, cli_dir, resume)
+            phase = 'supervisor_spawn'
+            with open(str(run_dir / ('launch-%s.log' % cli_dir.name)), 'wb') as log:
+                proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        except (OSError, ValueError, api.BfError) as error:
+            raise LaunchNotStarted(phase, error) from error
         self.procs[proc.pid] = proc
         return {'dir': str(cli_dir), 'pid': proc.pid, 'run_dir': str(run_dir)}
 

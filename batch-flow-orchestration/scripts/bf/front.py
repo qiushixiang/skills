@@ -105,6 +105,8 @@ def allowed(command, account_switch=(), bound_base=None):
                                   Path(cli).resolve() != Path(__file__).resolve().with_name('cli.py') or
                                   Path(words[0]).resolve() != Path(sys.executable).resolve()):
         return False
+    if words[5:] == ['--help'] and words[4] in (*COMMANDS, *ADJUST, 'record'):
+        return True  # Bound CLI help never performs the requested operation.
     if words[4] == 'record':
         rest = words[5:]
         if '--' not in rest:
@@ -230,12 +232,13 @@ def prompt(base, account_switch=(), backend='claude', runtime=None):
         '你是 batch-flow v2 的运维与沟通角色（聊天前端）。脚本负责派发、交付判定与额度；技术负责人负责技术判断；你负责运维、汇报和转达用户的决定。',
         '用户问题只允许六类新增决定；report.ops 是受阻待处理，不是用户确认。次数用尽、工具故障或技术暂时无解只报告，不追加“是否继续”的问题。边界见 %s。' % (Path(__file__).resolve().parents[2] / 'references/user-decisions.md'),
         '下文 CLI 指：%s' % cli,
+        'CLI 不是 shell 别名 flow：执行时写上述完整 Python/cli.py/--base 命令；帮助用 CLI reconcile --help。读取 JSON 用 Read/Grep/cat，不运行 Python -c 或 heredoc；orders.json 的工单位于顶层 orders 字段。',
         '职责：',
         '1. 启动、停止、查看驱动器：CLI run --background 后台启动并立即返回；按 plan.env.require_host 要求使用宿主执行并保留原有权限审批。CLI stop / CLI resume（stop 阻止新派发与续跑，在途调用自行结束；用户说“立刻停”“全部停掉”时用 CLI stop --now，终止在途调用，登记为免扣无效）；CLI status。',
         '   驱动器空闲时退出。answer/resume/retry/escalate/unhold/grant/envelope/set-role/supersede 成功后统一运行 CLI ensure-run，按上次配置确保单实例继续；它不会解除 stop。首次运行仍用 run。',
         watch + '需要更多细节时读 CLI report 的 JSON、%s/attention.md 与 %s/records/runs/ 下的卡片和原始输出。' % (base, base),
         '   当前待决只以最新 CLI report 的 ask_user 为准；attention.md 是派生视图，旧通知与历史对话不代表仍需批准。计划修订或用户回答后先重新查询，不重复请求已失效事项。',
-        '3. 处理运维故障：report 的“待你决定”里带运维故障的项，是 CLI 连续不可用而被暂停的工单。读它的 problem 和对应运行目录 %s/records/runs/<运行>/ 下的原始输出再判断：' % base,
+        '3. 处理运维故障：读取 report.ops（不是待你决定），它包含被暂停工单。读它的 problem 和对应运行目录 %s/records/runs/<运行>/ 下的原始输出再判断：' % base,
         '   - codex 额度或用量限制，且已配置账号切换命令：运行账号切换，然后 CLI retry WO-n --note \'已切换账号\'；',
         '   - 认证失效、网络、需要用户操作的问题：如实告诉用户；用户处理后再 retry；',
         '   - 看起来是技术问题（模型调用格式错误、反复同一异常等）：CLI escalate WO-n --note \'你的观察\'，交给技术负责人。',

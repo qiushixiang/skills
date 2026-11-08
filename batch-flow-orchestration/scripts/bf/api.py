@@ -7,7 +7,7 @@ from . import evidence as evidence_mod, gate, model, policy, register, routing, 
 from .store import BfError, State, load, need, now, transact
 
 __all__ = ['driver_event', 'watch', 'watch_lines', 'driver_status', 'retry', 'escalate', 'report_text', 'abandon', 'report', 'BfError', 'init', 'load', 'orders', 'runnable', 'assign', 'start', 'deliver', 'release', 'answer',
-           'revise_plan', 'stop', 'resume', 'broken_evidence', 'check_design']
+           'revise_plan', 'stop', 'resume', 'broken_evidence']
 
 
 def init(base, plan, approval, expected_revision=None, request_id=None, actor='user'):
@@ -48,7 +48,7 @@ def new_run(order_id, n, performer, tool, model_name, effort, session, mode, rul
             'entry': None, 'session_kb': None, 'env_rejected': False}
 
 
-def start(base, order_id, conversation_id=None, expected_revision=None, request_id=None, actor='driver'):
+def start(base, order_id, conversation_id=None, expected_revision=None, request_id=None, actor='driver', dispatch=None):
     def fn(st):
         need(not st.stopped, 'stopped by user')
         o = routing.get(st, order_id)
@@ -58,8 +58,17 @@ def start(base, order_id, conversation_id=None, expected_revision=None, request_
             need(conversation_id not in context.author_sessions(st, o), 'a session that authored the work cannot review it (I4)')
         run = new_run(order_id, len(o['runs']) + 1, a['stage'], a['tool'], a['model'], a['effort'], conversation_id,
                       a['session']['mode'], a['session']['rule'])
+        if dispatch is not None:
+            run['dispatch'] = {key: {'path': str(Path(path).resolve()), 'sha256': gate_hash(path)}
+                               for key, path in dispatch.items()}
+            need({'input', 'card'} <= set(run['dispatch']) <= {'input', 'card', 'context'} and all(x['sha256'] for x in run['dispatch'].values()),
+                 'dispatch input and card must exist before starting')
+            run['card'] = run['dispatch']['card']['path']
         if st.plan.get('repos'):
-            run['baseline'] = snap.baseline(st.plan)
+            try:
+                run['baseline'] = snap.baseline(st.plan)
+            except (OSError, BfError) as error:
+                run['observations'] = ['基线采集失败：%s' % error]
         o['runs'].append(run)
         o['state'] = 'running'
         o.pop('fresh_next', None)
@@ -91,29 +100,20 @@ def deliver(base, order_id, run_id, text, events=(), decision=None, conversation
         run = next((r for r in o['runs'] if r['run_id'] == run_id), None)
         need(run is not None and run['ended'] is None, 'no open run %s on %s' % (run_id, order_id))
         p = gate.parse(text, st.base)
-        edited_now = gate.scan(run, events, model.env_for(st.plan, run['tool']))
+        gate.scan(run, events, model.env_for(st.plan, run['tool']))
         legal, reason = gate.judge(st, o, run, p, decision, text)
-        changes = snap.changed(st.plan, run['baseline']) if st.plan.get('repos') and run.get('baseline') is not None else {}
-        forced, hits = None, []
-        if changes and o['type'] == 'review':
-            forced, hits = 'review_modified', [x for v in changes.values() for x in v]
-        elif changes and o['type'] in ('implement', 'repair'):
-            hits = snap.protected_hits(st.plan, o, changes)
-            forced = 'protected_change' if hits else None
-        if forced:
-            legal, reason = False, '%s：%s' % ('审阅者改动了源码' if forced == 'review_modified' else '改动了受保护路径', ', '.join(hits))
+        _capture(st, run)
+        # Changes are observations for reviewers, never an engineering verdict.
         run['segments'] += 1
         if conversation_id:
             run['session'] = conversation_id
         if session_kb is not None:
             run['session_kb'] = (run.get('session_kb') or 0) + session_kb
         run['card'] = card or run['card']
-        if not legal and p['why'].startswith('外部阻塞'):
-            run['env_rejected'] = True
-        since, run['last_ts'] = run['last_ts'], time.time()
+        run['last_ts'] = time.time()
         k = run['continuations'] + 1
         out = {'run_id': run_id, 'legal': legal, 'reason': reason if not legal else p['result'], 'opened': []}
-        if not legal and not forced and k <= st.plan['policy']['continue_limit'] and (k == 1 or edited_now or gate.new_records(st.base, since)):
+        if not legal and k <= st.plan['policy']['continue_limit']:
             run['continuations'] = k
             out['outcome'] = 'continue'
             return out
@@ -122,25 +122,11 @@ def deliver(base, order_id, run_id, text, events=(), decision=None, conversation
         run['delivery'] = text
         run['result'] = p['result'] if legal else 'FAILED'
         run['stop_reason'] = p['why'] or ('未完成' if not legal else '')
-        run['exempt'] = bool(legal and run['result'] == 'WAIT_EVIDENCE' and not run['edited']
-                             and not gate.new_records(st.base, run['started_ts']))
-        if (legal and run['result'] == 'ARCH_DECISION_REQUIRED' and o['type'] in ('implement', 'repair')
-                and not changes and not run['edited'] and not run.get('entry')
-                and run.get('commands_seen') and not run.get('non_readonly_command')):
-            run['exempt'] = True
-            run['charge_reason'] = 'diagnostic-only escalation: no edits or technical command'
-        run['evidence'] = dict((path, gate_hash(path)) for path in p['evidence'])
-        run['version'] = p['version'] or version
-        run['changed'] = changes
-        run['snapshot'] = []
-        for repo, rels in sorted(changes.items()):
-            run['snapshot'].append(evidence_mod.snapshot(st.base, repo, rels)['evidence'])
-        run['evidence'].update((path, gate_hash(path)) for path in run['snapshot'])
-        if run['snapshot']:
-            run['version'] = ' '.join(run['snapshot'])
+        run['exempt'] = False  # Transport failures and coordination have explicit accounting rules.
+        run['evidence'].update((path, gate_hash(path)) for path in p['evidence'])
+        run['citations'] = p['citations']
+        run['version'] = p['version'] or version or (' '.join(run['snapshot']) if run['snapshot'] else run.get('version'))
         o['state'] = 'open'
-        if forced:
-            routing.open_decide(st, o, forced, {'paths': hits, 'snapshot': run['snapshot']})
         register.on_registered(st, o, run, p, legal, decision)
         out.update(outcome='registered', result=run['result'], opened=list(st.opened),
                    paused=[key for key, value in st.orders.items() if value.get('ops') and value['ops'] != previous_pauses.get(key)])
@@ -148,23 +134,35 @@ def deliver(base, order_id, run_id, text, events=(), decision=None, conversation
     return transact(base, 'deliver', actor, fn, expected_revision, request_id)
 
 
-def check_design(base):
-    """Open one design_drift decide when pinned design sections changed (no-op otherwise). True when something was opened."""
-    st = load(base)
-    drifted = model.drifted(st.plan)
-    if not drifted or st.stopped or any(o['type'] == 'decide' and o['input'].get('trigger') == 'design_drift'
-                                        and o['state'] in ('open', 'running') for o in st.orders.values()):
-        return False
+def _capture(st, run):
+    """Append version observations on every exit, including interrupted calls. Never decide acceptance."""
+    run.setdefault('observations', [])
+    run.setdefault('evidence', {})
+    run.setdefault('snapshot', [])
+    if run.get('baseline') is None:
+        return run.get('changed', {})
+    try:
+        changes = snap.changed(st.plan, run['baseline'])
+    except (OSError, BfError) as error:
+        run['observations'].append('变更采集失败：%s' % error)
+        return run.get('changed', {})
+    # Do not discard observations from earlier segments of the same call.
+    run['changed'] = {repo: sorted(set(paths) | set(run.get('changed', {}).get(repo, [])))
+                      for repo, paths in dict(run.get('changed', {}), **changes).items()}
+    for repo, rels in sorted(run['changed'].items()):
+        try:
+            path = evidence_mod.snapshot(st.base, repo, rels)['evidence']
+            run['snapshot'].append(path)
+            run['evidence'][path] = gate_hash(path)
+        except (OSError, BfError) as error:
+            run['observations'].append('快照采集失败 %s：%s' % (repo, error))
+    return run['changed']
 
-    def fn(s):
-        now_drifted = model.drifted(s.plan)
-        if now_drifted:
-            d = routing.new_order(s, 'decide', None, {'by': 'plan', 'ref': 'design', 'reason': 'design_drift'},
-                                  {'trigger': 'design_drift', 'subject': None, 'run': None, 'evidence': [], 'subject_input': {},
-                                   'deliverables': now_drifted, 'issue': '设计文档中被引用的章节已变更：%s' % ', '.join(now_drifted)})
-            return d['id']
-        return None
-    return bool(transact(base, 'check_design', 'driver', fn))
+
+def dispatch_error(base, order_id, reason):
+    """An incomplete dispatch is a tool fault, before a model run or budget charge."""
+    return transact(base, 'dispatch_error', 'driver', lambda st: routing.pause(
+        st, routing.get(st, order_id), reason, 'tool_failure', '修复工单导出/适配器输入后重试'))
 
 
 def gate_hash(path):
@@ -179,7 +177,6 @@ def release(base, order_id, expected_revision=None, request_id=None, actor='driv
         need(not st.stopped, 'stopped by user')
         pending = [n for n in o['needs'] if st.orders[n]['state'] not in routing.SATISFIED]
         need(not pending, 'release blocked by %s' % ', '.join(pending))
-        need(not routing.broken_paths(st), 'evidence hash mismatch: release refused')
         o['state'] = 'done'
         return order_id
     return transact(base, 'release', actor, fn, expected_revision, request_id)
@@ -192,11 +189,11 @@ def answer(base, order_id, text, approve, expected_revision=None, request_id=Non
     return transact(base, 'answer', actor, fn, expected_revision, request_id)
 
 
-def revise_plan(base, plan, approval, expected_revision=None, request_id=None, actor='user'):
+def revise_plan(base, plan, approval, expected_revision=None, request_id=None, actor='user', revalidate=()):
     ref = model.approval_ref(approval)
 
     def fn(st):
-        register.revise(st, plan, ref)
+        register.revise(st, plan, ref, revalidate=revalidate)
         return st.plan['revision']
     return transact(base, 'revise_plan', actor, fn, expected_revision, request_id)
 
@@ -225,12 +222,13 @@ def driver_event(base, kind, pid=None):
 
 
 def abandon(base, order_id, run_id, reason, expected_revision=None, request_id=None, actor='driver'):
-    """A run whose process is lost: INVALID and free of charge, the order becomes dispatchable again."""
+    """A lost process is INVALID; prior received segments retain their charge and normal recovery routing."""
     def fn(st):
         o = routing.get(st, order_id)
         run = next((r for r in o['runs'] if r['run_id'] == run_id), None)
         need(run is not None and run['ended'] is None, 'no open run %s on %s' % (run_id, order_id))
-        run.update(ended=now(), result='INVALID', stop_reason=reason, exempt=True)
+        _capture(st, run)
+        run.update(ended=now(), result='INVALID', stop_reason=reason, exempt=not bool(run.get('segments')))
         o['state'] = 'open'
         tail = 0
         for r in reversed(o['runs'][o.get('invalid_floor', 0):]):
@@ -240,6 +238,7 @@ def abandon(base, order_id, run_id, reason, expected_revision=None, request_id=N
         if tail >= policy.rounds(st.plan, o['target'], 'invalid_retry', 2) and not routing._blocked_by_user_or_lead(st, o):
             routing.pause(st, o, reason, 'tool_failure')
             o['ops']['run'] = run_id
+        routing.check_exhausted(st, o)
         return run_id
     return transact(base, 'abandon', actor, fn, expected_revision, request_id)
 
@@ -255,7 +254,7 @@ def retry(base, order_id, note, expected_revision=None, request_id=None, actor='
         o['invalid_floor'] = len(o['runs'])
         if o['type'] in ('decide', 'triage'):
             o['coordination_floor'] = len(o['runs'])
-        elif ops.get('kind') == 'no_progress':
+        elif ops.get('kind') in ('no_progress', 'coordination_limit'):
             routing.open_decide(st, o, 'operational_recovery', {'note': note}, force=True)
         return order_id
     return transact(base, 'retry', actor, fn, expected_revision, request_id)
@@ -306,7 +305,7 @@ def report(base, recent=10):
     running, ended = [], []
     for o in routing.sorted_orders(st):
         for r in o['runs']:
-            item = {'order': o['id'], 'type': o['type'], 'target': o['target'], 'run': r['run_id'],
+            item = {'observations': r.get('observations', []), 'order': o['id'], 'type': o['type'], 'target': o['target'], 'run': r['run_id'],
                     'performer': r['performer'], 'started': r['started']}
             if r['ended']:
                 if r['performer'] == 'imported':

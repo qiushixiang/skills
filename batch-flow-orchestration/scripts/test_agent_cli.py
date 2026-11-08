@@ -75,7 +75,8 @@ class AdapterTests(unittest.TestCase):
                                 self.assertLess(argv.index('-s'),argv.index('resume'))
                                 self.assertEqual(argv[-3:],['resume',resume,'-'])
                         elif backend=='agy':
-                            self.assertEqual(argv[-1],self.prompt.read_text())
+                            self.assertIn(str(self.prompt),argv[-1])
+                            self.assertNotIn(self.prompt.read_text(),argv)
                             self.assertIn('accept-edits',argv)
                             self.assertNotIn('plan',argv)
                             if access=='read':
@@ -93,7 +94,8 @@ class AdapterTests(unittest.TestCase):
                                 self.assertNotIn('--disallowedTools',argv)
                         else:
                             self.assertIsNone(stdin)
-                            self.assertEqual(argv[-2:],['--',self.prompt.read_text()])
+                            self.assertEqual(argv[argv.index('--file')+1],str(self.prompt))
+                            self.assertNotIn(self.prompt.read_text(),argv)
                             self.assertIn('--standalone',argv)
                             self.assertNotIn('--auto',argv)
                             self.assertEqual('--session' in argv,bool(resume))
@@ -133,6 +135,7 @@ class AdapterTests(unittest.TestCase):
         self.assertIn('write_file(/source)',cli.settings_json(path))
 
     def test_fake_cli_lifecycle_raw_evidence_no_rerun_and_version_drift(self):
+        self.prompt.write_text('中文-$()`\n' * 150000 + 'END-完整输入')
         for backend in cli.REQUIRED:
             with self.subTest(backend=backend):
                 self.args.model='test/explicit-model' if backend=='opencode' else 'explicit-model'
@@ -144,7 +147,7 @@ name=__file__.split('/')[-1]
 if '--version' in sys.argv:
  print('opencode v2.fake' if name=='opencode' else 'fake-1');sys.exit(0)
 if '--help' in sys.argv:
- print('--mode --model --effort --output-format --conversation --settings --sandbox --config --json --add-dir --skip-git-repo-check --permission-mode --permission-prompts --disallowedTools --resume SESSION_ID --format --session --agent --standalone');sys.exit(0)
+ print('--mode --model --effort --output-format --conversation --settings --sandbox --config --json --add-dir --skip-git-repo-check --permission-mode --permission-prompts --disallowedTools --resume SESSION_ID --format --session --agent --standalone --file');sys.exit(0)
 name=__file__.split('/')[-1]
 if name=='codex':
  for e in [{'type':'thread.started','thread_id':'01a1a540-b6eb-7ab0-aa1c-92f0cb428e69'},{'type':'item.completed','item':{'type':'agent_message','text':sys.stdin.read()}},{'type':'turn.completed'}]:print(json.dumps(e))
@@ -154,10 +157,10 @@ elif name=='claude':
  print(json.dumps({'session_id':cid,'subtype':'success','is_error':False,'result':sys.stdin.read()}))
 elif name=='opencode':
  cid=sys.argv[sys.argv.index('--session')+1] if '--session' in sys.argv else 'ses_TestNative0123456789'
- for e in [{'type':'text','sessionID':cid,'part':{'messageID':'msg_done','text':sys.argv[-1]}},
+ for e in [{'type':'text','sessionID':cid,'part':{'messageID':'msg_done','text':open(sys.argv[sys.argv.index('--file')+1]).read()}},
            {'type':'step_finish','sessionID':cid,'part':{'messageID':'msg_done','reason':'stop'}}]:print(json.dumps(e))
 else:
- print(json.dumps({'conversation_id':'01a1a540-b6eb-7ab0-aa1c-92f0cb428e69','status':'SUCCESS','response':sys.argv[-1]}))
+ print(json.dumps({'conversation_id':'01a1a540-b6eb-7ab0-aa1c-92f0cb428e69','status':'SUCCESS','response':open(sys.argv[-1].split('工单文件 ')[1].split(' 及其指定')[0]).read()}))
 ''')
                 binary.chmod(0o700);profile=self.root/(backend+'.json')
                 cli.probe(backend,profile,str(binary))
@@ -181,6 +184,39 @@ else:
                 self.assertEqual(cli.collect(self.args.run_dir)['conversation_id'],report['conversation_id'])
                 binary.write_text('#!'+sys.executable+'\nprint("changed-version")\n')
                 with self.assertRaisesRegex(ValueError,'version changed'):cli.run(profile,self.args)
+
+    def test_entrypoint_preflight_failure_has_exit_cause_and_preserves_exclusive_run(self):
+        profile = self.root / 'profile.json'
+        cli.save(profile, dict(backend='opencode', binary='/missing', version='v2'))
+        argv = ['agent_cli.py', 'run', '--profile', str(profile), '--task', 'T1',
+                '--cwd', str(self.root), '--model', 'test/model', '--effort', 'default',
+                '--access', 'read', '--prompt-file', str(self.prompt), '--run-dir', self.args.run_dir]
+        with patch.object(sys, 'argv', argv), patch.object(cli, 'check_profile', side_effect=ValueError('version changed')), \
+                patch.object(cli.subprocess, 'Popen') as spawn, patch('builtins.print'):
+            self.assertEqual(cli.main(), 2)
+            report = cli.collect(self.args.run_dir)
+            self.assertEqual(report['event'], 'CLI_LAUNCH_FAILED')
+            self.assertEqual(report['launch_error']['phase'], 'preflight')
+            self.assertFalse(report['launch_error']['started'])
+            self.assertIn('version changed', report['problems'][0])
+            spawn.assert_not_called()
+            evidence = (Path(self.args.run_dir) / 'exit.json').read_bytes()
+            self.assertEqual(cli.main(), 2)
+            self.assertEqual((Path(self.args.run_dir) / 'exit.json').read_bytes(), evidence)
+        self.assertFalse((Path(self.args.run_dir) / 'receipt.json').exists())
+
+    def test_spawn_oserror_is_structured_and_never_claims_started(self):
+        import errno
+        profile = self.root / 'profile.json'
+        cli.save(profile, dict(backend='opencode', binary='/missing', version='v2'))
+        self.args.model = 'test/model'; self.args.effort = 'default'
+        with patch.object(cli, 'check_profile'), patch.object(cli.subprocess, 'Popen',
+                side_effect=OSError(errno.E2BIG, 'argument too long')), patch('builtins.print'):
+            self.assertEqual(cli.run(profile, self.args), 2)
+        report = cli.collect(self.args.run_dir)
+        self.assertEqual(report['event'], 'CLI_LAUNCH_FAILED')
+        self.assertEqual(report['launch_error']['errno'], errno.E2BIG)
+        self.assertFalse((Path(self.args.run_dir) / 'receipt.json').exists())
 
     def test_claude_token_file_reaches_child_by_descriptor_only(self):
         binary=self.root/'claude'

@@ -36,6 +36,15 @@ def _save(base, value):
 def record(base, argv, cwd=None):
     """Run argv as a direct child, write the record, return (result dict, exit code to pass through)."""
     need(argv, 'record requires -- COMMAND [ARG ...]')
+    plan_file = Path(str(base)) / 'plan.json'
+    if plan_file.is_file():
+        from . import gate
+        import shlex
+        plan = json.loads(plan_file.read_text(encoding='utf-8'))
+        entries = [entry for env in plan.get('env', {}).values() for entry in env.get('entry', [])]
+        command = shlex.join(argv)
+        need(not gate.direct_entry(command, entries) and not gate.controlled_wrapper(command, entries),
+             '受控入口自行留证，必须直接调用；禁止在入口外套 bf record。')
     cwd = Path(cwd or os.getcwd()).resolve()
     started = now()
     run = subprocess.run(list(argv), cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -49,7 +58,7 @@ def snapshot(base, repo, paths):
     need(repo is not None and paths, 'snapshot requires --repo and explicit --paths')
     repo = Path(str(repo)).resolve()
     try:
-        selected = [str((repo / n).resolve().relative_to(repo)) for n in paths]
+        selected = [str(Path(os.path.abspath(str(repo / n))).relative_to(repo)) for n in paths]
     except ValueError:
         raise BfError('snapshot path outside the repository')
 
@@ -63,10 +72,15 @@ def snapshot(base, repo, paths):
     for raw in git('ls-files', '-z', '--others', '--exclude-standard', '--', *selected).split(b'\0'):
         if raw:
             name = os.fsdecode(raw)
-            need(not (repo / name).is_symlink(), 'untracked symlink: use an explicit export tool')
-            untracked[name] = base64.b64encode((repo / name).resolve().read_bytes()).decode('ascii')
+            if not (repo / name).is_symlink():
+                untracked[name] = base64.b64encode((repo / name).read_bytes()).decode('ascii')
+    from .snap import file_state
+    names = {os.fsdecode(n) for n in git('ls-files', '-z', '--', *selected).split(b'\0') if n}
+    names.update(untracked)
+    names.update(os.fsdecode(n) for n in git('ls-files', '-z', '--others', '--exclude-standard', '--', *selected).split(b'\0') if n)
     return {'ok': True, 'evidence': _save(base, {'repository': str(repo), 'base_commit': head, 'paths': selected,
-                                                   'diff': diff, 'untracked_base64': untracked})}
+             'diff': diff, 'untracked_base64': untracked, 'comparison': 'HEAD to working tree; not a per-run delta',
+             'files': {name: dict(file_state(repo / name), **({'target': os.readlink(repo / name)} if (repo / name).is_symlink() else {})) for name in sorted(names)}})}
 
 
 def doctor(base):
@@ -89,15 +103,3 @@ def doctor(base):
                     if not (SKILL / 'scripts' / ref).exists():
                         missing.append({'file': str(path), 'line': n, 'ref': 'scripts/' + ref})
     return {'missing': missing}
-
-
-def fresh_pass(paths, since, elsewhere=()):
-    """True when some cited record has exit_code 0, was written at or after `since`, and is not another run's evidence."""
-    for p in paths:
-        try:
-            ok = json.loads(Path(p).read_text(encoding='utf-8')).get('exit_code') == 0 and os.path.getmtime(p) >= since
-        except (OSError, ValueError, AttributeError):
-            continue
-        if ok and p not in elsewhere:
-            return True
-    return False

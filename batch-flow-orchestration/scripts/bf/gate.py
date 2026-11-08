@@ -19,7 +19,7 @@ ACTION_FIELDS = {
     'authorize': {'authorize', 'paths'}, 'retry': {'retry', 'reason', 'fresh_session'},
     'supersede': {'supersede', 'reason'}, 'grant': {'grant'}, 'ask_user': {'ask_user', 'options', 'user_request'},
     'blocked': {'blocked', 'reason', 'missing'},
-    'plan_revision': {'plan_revision', 'within_authorization'}, 'refresh_design': {'refresh_design'},
+    'plan_revision': {'plan_revision', 'within_authorization', 'revalidate'}, 'refresh_design': {'refresh_design'},
 }
 
 
@@ -44,16 +44,20 @@ def candidates(text, label='候选新项'):
     return []
 
 
-def cited_evidence(base, text):
-    """Existing files under <base>/records cited on the evidence lines."""
+def evidence_references(base, text):
+    """Preserve cited record paths even when missing or malformed; roles assess their significance."""
     records = os.path.normpath(str(Path(base) / 'records'))
     out = []
     for name in ('验证证据', '复跑与证据'):
         for tok in re.findall(r'(?:/|records/)[^\s,;，；、"\'`()（）|<>]+', field(text, name)):
             path = os.path.normpath(tok.rstrip('.。') if tok.startswith('/') else str(Path(base) / tok.rstrip('.。')))
-            if path.startswith(records + os.sep) and os.path.isfile(path) and path not in out and evidence_mod.is_evidence(path):
+            if path.startswith(records + os.sep) and path not in out:
                 out.append(path)
     return out
+
+
+def cited_evidence(base, text):
+    return [p for p in evidence_references(base, text) if evidence_mod.is_evidence(p)]
 
 
 def parse(text, base):
@@ -65,6 +69,7 @@ def parse(text, base):
             'findings': [{'id': a, 'target': b, 'plan_level': c == '是', 'closure': d}
                          for a, b, c, d in FINDING.findall(text or '')],
             'candidates': candidates(text), 'suggestions': candidates(text, '非阻断建议'), 'evidence': cited_evidence(base, text),
+            'citations': [{'path': p, 'valid_record': evidence_mod.is_evidence(p)} for p in evidence_references(base, text)],
             'fixed': field(text, '固定版本'), 'not_rerun': field(text, '未复跑原因'),
             'version': (field(text, '改动与版本') or field(text, '固定版本'))[:1000]}
 
@@ -76,12 +81,28 @@ def direct_entry(command, entries):
     try:
         words = shlex.split(command)
         if len(words) == 3 and Path(words[0]).name in ('bash', 'sh') and words[1] in ('-c', '-lc'):
-            if re.search(r'[;&|<>`$()\n]', words[2]):
-                return False
-            words = shlex.split(words[2])
+            command = words[2]
+            words = shlex.split(command)
     except ValueError:
         return False
-    return bool(words) and any(words[0].startswith(e) for e in entries)
+    return bool(words) and not re.search(r'[;&|<>`$()\n]', command) and words[0] in entries
+
+
+def controlled_wrapper(command, entries):
+    """Recognize execution wrappers, without confusing reads of a runner file with executing it."""
+    try:
+        words = shlex.split(command)
+        if len(words) == 3 and Path(words[0]).name in ('bash', 'sh') and words[1] in ('-c', '-lc'):
+            command = words[2]
+            words = shlex.split(command)
+        if not words or direct_entry(command, entries):
+            return False
+        if words[0] in entries:
+            return True
+        wrappers = ('python', 'python3', 'python3.8', 'bash', 'sh', 'env', 'timeout', 'sudo')
+        return Path(words[0]).name in wrappers and any(e in words[1:] for e in entries)
+    except ValueError:
+        return False
 
 
 def scan(run, events, env):
@@ -94,60 +115,16 @@ def scan(run, events, env):
             edited = True
         elif item.get('type') == 'command_execution' and item.get('exit_code') is not None:
             run['commands_seen'] = run.get('commands_seen', 0) + 1
-            if not readonly_command(item.get('command') or ''):
-                run['non_readonly_command'] = True
             if item['exit_code'] != 0:
                 run['failed'] = True
             if env and direct_entry(item.get('command') or '', env.get('entry') or []):
                 run['entry'] = {'exit_code': item['exit_code'], 'output': (item.get('aggregated_output') or '')[-4000:]}
+                run.pop('controlled_wrapper', None)
+            elif env and controlled_wrapper(item.get('command') or '', env.get('entry') or []):
+                run['controlled_wrapper'] = True
+                run['entry'] = None
     run['edited'] = run.get('edited', False) or edited
     return edited
-
-
-def readonly_command(command):
-    """Conservative proof of diagnostic-only activity; opaque scripts remain chargeable."""
-    try:
-        words = shlex.split(command)
-        if len(words) == 3 and Path(words[0]).name in ('bash', 'sh') and words[1] in ('-c', '-lc'):
-            command = words[2]
-            words = shlex.split(command)
-        if (len(words) > 5 and Path(words[0]).name in ('python', 'python3', 'python3.8')
-                and Path(words[1]).is_absolute() and Path(words[1]).resolve() == Path(__file__).with_name('cli.py').resolve()
-                and words[2] == '--base' and words[4] == 'record' and '--' in words[5:]):
-            split = words.index('--', 5)
-            options = words[5:split]
-            if options and (len(options) != 2 or options[0] != '--cwd'):
-                return False
-            # Writing the raw diagnostic record does not turn a read-only child into implementation.
-            return readonly_command(shlex.join(words[split + 1:]))
-        if re.search(r'[;&|<>`$()\n]', command) or not words:
-            return False
-        name = Path(words[0]).name
-        if name == 'rg' and any(w == '--pre' or w.startswith('--pre=') for w in words[1:]):
-            return False
-        if name == 'git':
-            return len(words) > 1 and words[1] in ('status', 'diff', 'show', 'rev-parse', 'log') and not any(
-                w.startswith(('--output', '--ext-diff', '--textconv')) for w in words[2:])
-        return name in ('cat', 'rg', 'ls', 'pwd', 'sha256sum', 'head', 'tail', 'wc', 'stat')
-    except ValueError:
-        return False
-
-
-def new_records(base, since):
-    try:
-        return any(p.stat().st_mtime >= since for p in (Path(base) / 'records').iterdir() if p.is_file())
-    except OSError:
-        return False
-
-
-def environment_blocked(env, run):
-    """The claim stands only on the latest direct controlled-entry run failing with the entry's environment output."""
-    if not env:
-        return bool(run.get('failed'))
-    entry = run.get('entry')
-    if not entry or entry['exit_code'] == 0:
-        return False
-    return not env.get('blocked_output') or bool(re.search(env['blocked_output'], entry['output']))
 
 
 # ---- legality -------------------------------------------------------------------------------------
@@ -241,6 +218,9 @@ def validate_decision(state, decision, order=None):
             return 'refresh_design 须为 true'
         if k == 'plan_revision' and not isinstance(a['plan_revision'], str):
             return 'plan_revision 须为草案路径'
+        if k == 'plan_revision' and ('revalidate' in a):
+            if not isinstance(a['revalidate'], list) or any(d not in plan['deliverables'] for d in a['revalidate']):
+                return 'revalidate 须列出现有交付目标，影响范围由负责人明确选择'
         if k == 'plan_revision' and 'within_authorization' in a:
             from . import changes
             if a['within_authorization'] is not True or not changes.internal_revision(plan, a['plan_revision']):
@@ -251,19 +231,10 @@ def validate_decision(state, decision, order=None):
 def judge(state, order, run, p, decision, text):
     """Returns (legal, reason)."""
     t, res, why = order['type'], p['result'], p['why']
+    if run.get('controlled_wrapper'):
+        return False, '受控入口必须以绝对路径直接调用；不要外套 bf record、Python、timeout 或 shell。入口自行留证；请纠正调用后重试，包装调用不能证明宿主环境故障。'
     if res in SUCCESS.get(t, ()):
         reason = ''
-        if t in ('implement', 'repair') or (t == 'review' and res == 'RELEASE'):
-            reason = '' if p['evidence'] else '须引用 bf record / bf snapshot 生成的 records/ 证据文件（手写文件不算证据）'
-            elsewhere = set(path for o in state.orders.values() for r in o['runs'] if r['run_id'] != run['run_id'] for path in r['evidence'])
-            if not reason and not (res == 'RELEASE' and p['not_rerun']) and not evidence_mod.fresh_pass(
-                    p['evidence'], run['started_ts'] - 2, elsewhere):
-                reason = '须至少引用一份本次运行内生成、退出码为 0 的 record（审阅 RELEASE 不能只引用他人记录，否则写“未复跑原因：”）'
-        if not reason and t == 'review':
-            need_paths = [x for d in state.plan['review_groups'].get(order['target'], {}).get('deliverables', [])
-                          for x in routing.latest_snapshots(state, d)]
-            missing = [x for x in need_paths if x not in p['fixed']]
-            reason = '固定版本须包含被审交付目标的最近快照路径：%s' % '、'.join(missing) if missing else ''
         if not reason and t == 'repair':
             tail = text[text.find('阻断关闭'):] if '阻断关闭' in text else ''
             missing = [f['id'] for f in order['input'].get('findings', [])
@@ -297,8 +268,7 @@ def judge(state, order, run, p, decision, text):
     if why.startswith('外部阻塞'):
         if res != 'WAIT_EVIDENCE':
             return False, '外部阻塞须为 WAIT_EVIDENCE'
-        return (environment_blocked(model.env_for(state.plan, run['tool']), run),
-                '最近一次直接调用受控入口未运行、已成功或不是环境失败，环境阻塞依据不足')
+        return bool(p['has_issue']), '外部阻塞须说明原因；诊断与恢复由技术负责人判断'
     if why.startswith('完成'):
         return False, '停止原因为完成但结果不符'
     return False, '停止原因为“%s”：尚未完成' % (why or '缺失')

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Linux CLI adapter. No model defaults, ledger writes, retries or daemonization."""
+import hashlib
 import argparse
 import datetime as dt
 import json
@@ -17,7 +18,7 @@ REQUIRED = {
     'agy': ['--mode', '--model', '--effort', '--output-format', '--conversation', '--settings'],
     'codex': ['--sandbox', '--model', '--config', '--json', '--add-dir', '--skip-git-repo-check'],
     'claude': ['--permission-mode', '--permission-prompts', '--disallowedTools', '--model', '--effort', '--resume', '--output-format'],
-    'opencode': ['--model', '--format', '--session', '--agent', '--standalone'],
+    'opencode': ['--model', '--format', '--session', '--agent', '--standalone', '--file'],
 }
 EFFORTS = {
     'agy': {'low', 'medium', 'high', 'xhigh', 'max'},
@@ -130,7 +131,8 @@ def build_command(profile, args, prompt):
         argv = [binary, 'run', '--standalone', '--format', 'json', '--agent', 'build', '--model', args.model]
         if args.conversation:
             argv += ['--session', args.conversation]
-        return argv + ['--', prompt], None
+        return argv + ['--file', str(Path(args.prompt_file).resolve()), '--',
+                       '先完整阅读附带的工单文件及其指定必读范围，再按工单执行和交付。'], None
     if backend == 'agy':
         # Read roles must rerun builds/tests: plan mode only plans writing commands (verified
         # 1.5.0), so read access is accept-edits plus a session deny on every file write/edit.
@@ -152,7 +154,8 @@ def build_command(profile, args, prompt):
                 deny.append('write_file(*)')
         if settings:
             argv += ['--settings', json.dumps(settings, ensure_ascii=False)]
-        return argv + ['-p', prompt], None
+        return argv + ['-p', '先完整读取工单文件 ' + str(Path(args.prompt_file).resolve()) +
+                       ' 及其指定必读范围，再按完整工单执行和交付。'], None
     if backend == 'claude':
         # Read roles must still rerun builds/tests: plan mode refuses writing shell commands
         # (verified 2.1.318), so use default mode and remove only the file-edit tools.
@@ -171,9 +174,19 @@ def build_command(profile, args, prompt):
         return argv, prompt
     sandbox = 'read-only' if args.access == 'read' else 'workspace-write'
     # Options precede resume: resume itself does not accept -s or -C.
-    argv = [binary, 'exec', '-C', args.cwd, '-s', sandbox,
+    auto_review = getattr(args, 'approval_policy', None) == 'on-request' and args.access == 'write'
+    argv = [binary, 'exec', '-C', args.cwd,
             '-m', args.model, '--json', '--skip-git-repo-check']
+    if auto_review:
+        # Same explicit boundary through the documented config key: this CLI rejects -s with --approve-for-me.
+        argv += ['-c', 'sandbox_mode=' + json.dumps(sandbox)]
+    else:
+        argv += ['-s', sandbox]
     if getattr(args, 'approval_policy', None):
+        if auto_review:
+            if '--approve-for-me' not in profile.get('help', ''):
+                raise ValueError('Codex profile does not verify --approve-for-me; probe this CLI before dispatch')
+            argv.append('--approve-for-me')
         argv += ['-c', 'approval_policy=' + json.dumps(args.approval_policy)]
     if effort is not None:
         argv += ['-c', 'model_reasoning_effort=' + json.dumps(effort)]
@@ -407,11 +420,17 @@ def run(profile_path, args):
     output.mkdir(mode=0o700)  # Exclusive: never overwrite or rerun a previous call.
     request = dict(task=args.task, backend=profile['backend'], version=profile['version'],
                    cwd=args.cwd, model=args.model, effort=args.effort, access=args.access,
-                   conversation=args.conversation, argv=argv, stdin=input_text, started_at=now())
+                   conversation=args.conversation, argv=argv, stdin=input_text, started_at=now(),
+                   prompt_file=str(Path(args.prompt_file).resolve()),
+                   prompt_sha256=hashlib.sha256(prompt.encode('utf-8')).hexdigest())
     request.update(effort_override=effort_override(profile['backend'], args.effort),
                    resume_from=getattr(args, 'resume_from', None))
     request['execution'] = dict(require_host=getattr(args, 'require_host', False), add_dirs=args.add_dir,
                                 approval_policy=getattr(args, 'approval_policy', None))
+    if profile['backend'] == 'codex' and getattr(args, 'approval_policy', None):
+        request['execution']['verify_actual'] = True
+        request['execution']['expected_sandbox'] = 'read-only' if args.access == 'read' else 'workspace-write'
+        request['execution']['expected_reviewer'] = 'auto_review' if '--approve-for-me' in argv else None
     env, fds, token = None, (), None
     if profile['backend'] == 'opencode':
         env = opencode_env
@@ -421,14 +440,25 @@ def run(profile_path, args):
     if auth:
         source, token_path = auth
         request['auth'] = dict(source=source, token_file=str(token_path) if token_path else None)
-        if token_path:
+    save(output / 'request.json', request)
+    stdout = stderr = None
+    try:
+        if auth and token_path:
             token = os.open(token_path, os.O_RDONLY)
             env = dict(os.environ, CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR=str(token)); fds = (token,)
-    save(output / 'request.json', request)
-    try:
-        stdout, stderr = (output / 'stdout').open('x'), (output / 'stderr').open('x')
+        stdout = (output / 'stdout').open('x')
+        stderr = (output / 'stderr').open('x')
         proc = subprocess.Popen(argv, cwd=args.cwd, stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
                                 stdout=stdout, stderr=stderr, text=True, env=env, pass_fds=fds)
+    except OSError as error:
+        if stdout is not None:
+            stdout.close()
+        if stderr is not None:
+            stderr.close()
+        save(output / 'exit.json', dict(returncode=None, ended_at=now(),
+             launch_error={'phase': 'cli_spawn', 'started': False, 'errno': error.errno, 'message': str(error), 'type': type(error).__name__}))
+        print(json.dumps(dict(event='CLI_LAUNCH_FAILED', run_dir=str(output), error=str(error)), ensure_ascii=False), flush=True)
+        return 2
     finally:
         if token is not None:
             os.close(token)
@@ -439,7 +469,11 @@ def run(profile_path, args):
         print(json.dumps(receipt, ensure_ascii=False), flush=True)
         # Keep the supervisor in a host-managed background job, never detach it.
         try:
-            proc.communicate(input=input_text)
+            if request['execution'].get('verify_actual'):
+                import codex_execution
+                codex_execution.communicate(proc, input_text, output, request)
+            else:
+                proc.communicate(input=input_text)
         except KeyboardInterrupt:
             # Do not retry or kill possibly-writing descendants automatically.
             print(json.dumps(dict(event='CLI_INTERRUPTED', pid=proc.pid, run_dir=str(output),
@@ -457,11 +491,33 @@ def collect(output):
         return dict(event='CLI_INCOMPLETE', run_dir=str(output), usable=False,
                     instruction='Inspect host handle and raw output; absence of exit.json does not prove process liveness. Do not redispatch.')
     request = read(output / 'request.json'); end = read(output / 'exit.json')
+    if end.get('launch_error'):
+        return dict(event='CLI_LAUNCH_FAILED', usable=False, task=request['task'], run_dir=str(output),
+                    launch_error=end['launch_error'], problems=[end['launch_error']['message']], returncode=None)
     result = inspect_result(request['backend'], (output / 'stdout').read_text(),
                             (output / 'stderr').read_text(), end['returncode'], request['conversation'])
+    if request.get('execution', {}).get('verify_actual'):
+        import codex_execution
+        problem, actual = codex_execution.verify_receipt(output, request)
+        result['execution_actual'] = actual
+        if problem:
+            result['usable'] = False
+            result['problems'].append(problem)
     result.update(task=request['task'], run_dir=str(output), returncode=end['returncode'],
                   started_at=request['started_at'], ended_at=end['ended_at'])
     return result
+
+
+def record_preflight_failure(args, error):
+    """CLI entrypoint only: exclusive diagnostic dir; never overwrite a previous invocation."""
+    output = Path(args.run_dir).resolve()
+    output.mkdir(mode=0o700)
+    save(output / 'request.json', dict(task=args.task, started_at=now(), model=args.model,
+         effort=args.effort, access=args.access, cwd=args.cwd, prompt_file=args.prompt_file))
+    failure = dict(phase='preflight', started=False, type=type(error).__name__,
+                   errno=getattr(error, 'errno', None), message=str(error))
+    save(output / 'exit.json', dict(returncode=None, ended_at=now(), launch_error=failure))
+    return failure
 
 
 def main():
@@ -525,6 +581,14 @@ def main():
         print(json.dumps(result, ensure_ascii=False), flush=True)
         return 0 if args.command in {'probe', 'check'} or result.get('usable') else 2
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        if args.command == 'run' and not Path(args.run_dir).exists():
+            try:
+                failure = record_preflight_failure(args, error)
+            except OSError:
+                pass  # A concurrent/existing dir is never replaced; console still reports the cause.
+            else:
+                print(json.dumps(dict(event='CLI_LAUNCH_FAILED', run_dir=args.run_dir, launch_error=failure), ensure_ascii=False), flush=True)
+                return 2
         print(json.dumps(dict(event='CLI_ADAPTER_ERROR', error=str(error)), ensure_ascii=False), flush=True)
         return 2
 

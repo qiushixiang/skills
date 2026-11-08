@@ -99,7 +99,6 @@ class UserBoundary(Base):
 
     def test_declared_internal_revision_cannot_change_acceptance_budget_or_review(self):
         for mutate in (
-            lambda p: p['deliverables']['D1'].update(acceptance=['weaker']),
             lambda p: p['policy']['rounds'].update(implement=99),
             lambda p: p['review_groups']['R12'].update(focus='different approved coverage'),
             lambda p: p['envelope'].update(protected={'D1': ['tests/runner.sh']}),
@@ -127,7 +126,7 @@ class UserBoundary(Base):
         path = Path(self.tmp.name) / 'race-plan.json'; path.write_text(json.dumps(plan))
         action = {'plan_revision': str(path), 'within_authorization': True}
         self.assertFalse(register._needs_user(s, action))
-        plan['deliverables']['D1']['acceptance'] = ['changed after check']
+        plan['policy']['rounds']['implement'] = 99
         path.write_text(json.dumps(plan))
         with self.assertRaises(api.BfError):
             register._execute(s, s.orders[self.impl('D1')], action, self.impl('D1'))
@@ -137,5 +136,5 @@ class UserBoundary(Base):
         for _ in range(2):
             routing.open_decide(s, obj, 'technical_conflict')['state'] = 'done'
         routing.open_decide(s, obj, 'technical_conflict')
-        self.assertEqual(obj['ops']['kind'], 'no_progress')
+        self.assertEqual(obj['ops']['kind'], 'coordination_limit')
         self.assertFalse(any(o['type'] == 'ask_user' for o in s.orders.values()))

@@ -19,6 +19,15 @@ def _tool(role, name):
     role.setdefault('effort', 'default')
 
 
+def validate_required_read(rows):
+    need(isinstance(rows, list), 'required_read must be a list')
+    for row in rows:
+        need(isinstance(row, dict) and all(isinstance(row.get(k), str) and row[k].strip()
+             for k in ('path', 'section', 'purpose')), 'required_read needs path, section and purpose')
+        need(not row.get('sha256') or bool(re.fullmatch(r'[0-9a-f]{64}', row['sha256'])),
+             'required_read sha256 must be a SHA256 digest')
+
+
 def normalize(plan):
     """Validate a plan and return a normalised deep copy (defaults filled in)."""
     need(isinstance(plan, dict), 'plan must be an object')
@@ -48,6 +57,8 @@ def normalize(plan):
     need(dels, 'plan.deliverables required')
     for d, spec in dels.items():
         need(spec.get('batch') in ids, 'deliverable %s: unknown batch' % d)
+        validate_required_read(spec.get('required_read', []))
+        need(isinstance(spec.get('constraints', []), list) and all(isinstance(x, str) for x in spec.get('constraints', [])), 'constraints must be text list')
         spec.setdefault('title', '')
         spec.setdefault('instruction', '')
         spec.setdefault('acceptance', [])
@@ -61,6 +72,7 @@ def normalize(plan):
         need(spec['acceptance'] and all(str(x).strip() for x in spec['acceptance']), 'deliverable %s: acceptance is empty' % d)
     groups = p.setdefault('review_groups', {})
     for g, spec in groups.items():
+        validate_required_read(spec.get('required_read', []))
         need(g not in dels, 'name %s is both a deliverable and a review group' % g)
         members = spec.get('deliverables') or []
         need(members and all(m in dels for m in members), 'review group %s: unknown deliverable' % g)
