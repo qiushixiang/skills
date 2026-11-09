@@ -115,11 +115,11 @@ class PlanChecks(Base):  # §24.3
         result = self.init()
         self.assertEqual(self.st().plan['design']['sha256'], __import__('hashlib').sha256(self.design.read_bytes()).hexdigest())
 
-    def test_review_rounds_warning(self):
+    def test_review_rounds_shortfall_is_rejected(self):
         p = self.plan()
         p['policy']['rounds']['review'] = 1
-        result = self.init(p)
-        self.assertTrue(any('review' in w for w in self.st().plan.get('warnings', [])))
+        with self.assertRaisesRegex(api.BfError, 'review budget coverage'):
+            self.init(p)
 
 
 class DesignDrift(Base):  # §24.4

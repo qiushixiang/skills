@@ -139,7 +139,7 @@ class IntentControl(Base):
         self.assertEqual(self.st().orders[oid]['state'], 'done')
 
     def test_reservations_share_budget_across_orders_and_reloads(self):
-        self.reinit(policy={'rounds':{'implement':1,'backup':1,'lead':1,'repair':1,'review':2},'continue_limit':2})
+        self.reinit(policy={'rounds':{'implement':1,'backup':1,'lead':1,'repair':1,'review':7},'continue_limit':2})
         oid, rid = self.start_work(); self.send(oid, rid, '交付')
         from bf.store import transact
         extra = transact(self.base, 'test_open', 'test', lambda st: routing.new_order(st, 'implement', 'D1', {'by':'test','ref':oid})['id'])

@@ -3,7 +3,7 @@ import re
 import time
 from pathlib import Path
 
-from . import evidence as evidence_mod, gate, model, policy, register, routing, context, snap, permissions
+from . import evidence as evidence_mod, gate, model, policy, register, routing, context, snap, permissions, review_budget
 from .store import BfError, State, load, need, now, transact
 
 __all__ = ['driver_event', 'watch', 'watch_lines', 'driver_status', 'retry', 'escalate', 'report_text', 'abandon', 'cli_failed', 'report', 'BfError', 'init', 'load', 'orders', 'runnable', 'assign', 'start', 'deliver', 'release', 'answer',
@@ -53,6 +53,7 @@ def start(base, order_id, conversation_id=None, expected_revision=None, request_
         need(not st.stopped, 'stopped by user')
         o = routing.get(st, order_id)
         need(not permissions.missing(st.plan, o), 'required protected permissions are not installed')
+        review_budget.require_dispatch(st, o)
         a = policy.assign(st, order_id)
         if o['type'] == 'review':
             need(conversation_id not in context.author_sessions(st, o), 'a session that authored the work cannot review it (I4)')
@@ -83,7 +84,7 @@ def start(base, order_id, conversation_id=None, expected_revision=None, request_
 def preflight(base):
     """Resolve known dispatch deficiencies without spending a role run."""
     state = load(base)
-    candidates = [oid for oid in runnable(state, 1000) if permissions.missing(state.plan, state.orders[oid])]
+    candidates = [oid for oid in runnable(state, 1000) if permissions.missing(state.plan, state.orders[oid]) or review_budget.dispatch_shortfalls(state, state.orders[oid])]
     if not candidates:
         return False
     def fn(st):
@@ -92,7 +93,11 @@ def preflight(base):
             paths = permissions.missing(st.plan, o)
             if paths:
                 routing.open_decide(st, o, 'authorization_required', {'paths': paths})
-        return bool(st.opened)
+            deficits = review_budget.dispatch_shortfalls(st, o)
+            if deficits:
+                routing.pause(st, o, 'review budget coverage: %s' % deficits, 'review_budget_shortfall',
+                              missing='补齐独立审阅配套预算后恢复；不先消耗实施或返修轮次')
+        return True
     return transact(base, 'preflight', 'driver', fn)
 
 

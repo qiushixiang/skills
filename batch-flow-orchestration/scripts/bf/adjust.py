@@ -25,7 +25,11 @@ def _edit(base, op, approval, fn):
     ref = model.approval_ref(approval)
 
     def run(st):
+        import copy
+        from . import review_budget
+        prior = copy.deepcopy(st.plan)
         result = fn(st)
+        review_budget.validate_revision(prior, st.plan)
         st.plan['revision'] += 1
         st.plan.setdefault('adjustments', []).append({'revision': st.plan['revision'], 'op': op, 'approval': ref})
         st.plan_dirty = True

@@ -3,7 +3,7 @@ from . import model
 
 
 def internal_revision(old, path):
-    new = model.normalize(path if isinstance(path, dict) else model.load_plan_file(path))
+    new = model.normalize(path if isinstance(path, dict) else model.load_plan_file(path), enforce_review_budget=False)
     # These are explicit user/runtime controls, not a claim about instruction semantics.
     for key in ('roles', 'workspace', 'repos', 'batches', 'review_groups', 'protected', 'envelope', 'env', 'holds', 'policy'):
         if new.get(key) != old.get(key):

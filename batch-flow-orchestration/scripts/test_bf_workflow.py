@@ -332,7 +332,7 @@ class Workflow(Base):
         self.assertEqual(policy.spent(self.st(), fresh), {'reviewer': 1})
         from bf import adjust
         adjust.grant(self.base, 'R12', self.approval, review=1)
-        self.assertEqual(policy.rounds(self.st().plan, 'R12', 'review'), 4)
+        self.assertEqual(policy.rounds(self.st().plan, 'R12', 'review'), make_plan()['policy']['rounds']['review'] + 1)
 
     def test_driver_singleton_and_stop_boundary(self):
         fake = FakeAdapter(self.base, {('implement', 'D1'): [{'hang': True}]})

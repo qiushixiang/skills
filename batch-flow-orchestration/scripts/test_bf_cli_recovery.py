@@ -17,7 +17,7 @@ class CliRecovery(Base):
                               not_started=not_started, source='cli-%d' % segment)
 
     def test_one_retry_same_round_and_second_failure_switches_without_decision(self):
-        self.reinit(policy={'rounds': {'implement': 1, 'backup': 1, 'lead': 1, 'review': 3}})
+        self.reinit(policy={'rounds': {'implement': 1, 'backup': 1, 'lead': 1, 'review': 32}})
         oid = self.impl('D1')
         before = copy.deepcopy(self.st().orders[oid])
         rid = api.start(self.base, oid)
@@ -82,7 +82,7 @@ class CliRecovery(Base):
         self.assertIsNone(policy.charge(self.st().orders[oid], run))
 
     def test_no_backup_allowance_skips_to_lead(self):
-        self.reinit(policy={'rounds': {'implement': 1, 'backup': 0, 'lead': 1, 'review': 3}})
+        self.reinit(policy={'rounds': {'implement': 1, 'backup': 0, 'lead': 1, 'review': 32}})
         oid = self.impl('D1'); rid = api.start(self.base, oid)
         self.fail(oid, rid, 1); self.fail(oid, rid, 2)
         self.assertEqual(api.assign(self.st(), oid)['stage'], 'lead')

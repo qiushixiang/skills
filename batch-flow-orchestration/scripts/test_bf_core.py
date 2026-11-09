@@ -32,7 +32,7 @@ def make_plan(**over):
             'reviewer': {'tool': 'claude', 'model': 'rev-m', 'effort': 'medium'},
         },
         'policy': {
-            'rounds': {'implement': 3, 'backup': 1, 'lead': 1, 'repair': 2, 'review': 3, 'decide_per_source': 2},
+            'rounds': {'implement': 3, 'backup': 1, 'lead': 1, 'repair': 2, 'review': 32, 'decide_per_source': 2},
             'context': {'max_session_kb': 300},
             'continue_limit': 2,
         },
@@ -346,7 +346,7 @@ class Routing(Base):
 
     def test_repair_escalates_when_finding_stays_open(self):  # §8
         policy = make_plan()['policy']
-        policy['rounds']['review'] = 10
+        policy['rounds']['review'] = 32
         self.reinit(policy=policy)
         self.verify_batch1()
         review = self.one('review', 'R12')['id']

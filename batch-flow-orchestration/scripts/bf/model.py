@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .store import BfError, need, sha256_file, now
 
-DEFAULT_ROUNDS = {'implement': 3, 'backup': 1, 'lead': 1, 'repair': 2, 'review': 3, 'decide_per_source': 2, 'invalid_retry': 2,
+DEFAULT_ROUNDS = {'implement': 3, 'backup': 1, 'lead': 1, 'repair': 2, 'review': 7, 'decide_per_source': 2, 'invalid_retry': 2,
                   'coordination_attempts': 2, 'coordination_no_progress': 6}
 CLI_TOOLS = {'agy': 'agy', 'agy-cli': 'agy', 'codex': 'codex', 'codex-cli': 'codex', 'claude': 'claude',
              'claude-cli': 'claude', 'claude-code': 'claude', 'opencode': 'opencode', 'opencode-cli': 'opencode'}
@@ -28,7 +28,7 @@ def validate_required_read(rows):
              'required_read sha256 must be a SHA256 digest')
 
 
-def normalize(plan):
+def normalize(plan, enforce_review_budget=True):
     """Validate a plan and return a normalised deep copy (defaults filled in)."""
     need(isinstance(plan, dict), 'plan must be an object')
     p = copy.deepcopy(plan)
@@ -47,7 +47,10 @@ def normalize(plan):
     rounds.update(pol.get('rounds') or {})
     need(all(isinstance(v, int) and v >= 0 for v in rounds.values()), 'policy.rounds must be non-negative integers')
     pol['rounds'] = rounds
-    pol.setdefault('overrides', {})
+    overrides = pol.setdefault('overrides', {})
+    need(isinstance(overrides, dict) and all(isinstance(v, dict) and
+         all(k in rounds and isinstance(n, int) and not isinstance(n, bool) and n >= 0 for k, n in v.items())
+         for v in overrides.values()), 'policy.overrides must contain non-negative round counts')
     pol.setdefault('context', {}).setdefault('max_session_kb', 300)
     pol.setdefault('continue_limit', 2)
     batches = p.get('batches') or []
@@ -113,9 +116,10 @@ def normalize(plan):
          'envelope.protected: deliverable -> exact repository-relative paths required')
     p.setdefault('env', {})
     pin_design(p, strict=True)
-    chain = rounds['repair'] + rounds['backup'] + rounds['lead']
-    p['warnings'] = (['policy.rounds.review (%d) < 1 + 返修链长度 (%d)：审阅额度可能不够走完返修链，请与用户确认或预留 grant' % (rounds['review'], 1 + chain)]
-                     if rounds['review'] < 1 + chain else [])
+    from . import review_budget
+    if enforce_review_budget:
+        review_budget.validate(p)
+    p['warnings'] = []
     holds = p.setdefault('holds', [])
     need(all(h in dels or h in groups or h in ids for h in holds), 'holds: unknown deliverable, group or batch')
     return p

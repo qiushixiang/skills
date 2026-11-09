@@ -74,7 +74,7 @@ goal:        项目目标与约束（现 goal_contract）
 deliverables: {id: {batch, title, acceptance, depends_on, design_ref, instruction}}
 roles:       {executor, backup_executor, lead, reviewer, third_party: {tool, model, effort}}
 policy:
-  rounds:    {implement: 3, backup: 1, lead: 1, repair: 2, review: 3}   # 每个交付目标的默认额度
+  rounds:    {implement: 3, backup: 1, lead: 1, repair: 2, review: 7}   # 每个交付目标的默认额度
   overrides: {<deliverable>: {...}}                                     # 个别调整，需用户批准
   context:   §9 的可调参数
 env:         {<backend>: {require_host, add_dirs, approval_policy, entry, preflight, blocked_output, guide}}
@@ -340,7 +340,7 @@ scripts/agent_cli.py      保留（CLI 适配器，已验证的宿主细节）
 ## 16. 用户决定记录
 
 1. 驱动器：脚本 `bf run` + 保留聊天前端，负责 10 分钟汇报与转交回答（§6.3）——已定。
-2. 默认额度：implement 3 / backup 1 / lead 1 / repair 2 / review 3，同一触发源 decide 上限 2——已同意。
+2. 默认额度：implement 3 / backup 1 / lead 1 / repair 2 / review 7（恢复完整路径配套后），同一触发源 decide 上限 2——已同意。
 3. 候选新项分诊位置：每批 release 前——待确认。
 4. 并发：计划阶段声明依赖与独占资源，运行时选择是否并发，默认串行（§6.4）——已定。
 
@@ -474,7 +474,7 @@ scripts/agent_cli.py      保留（CLI 适配器，已验证的宿主细节）
 
 1. **自动快照**：`plan.repos`（绝对路径列表）存在时，`start` 记录各仓库脏文件及其哈希作基线；登记交付时算出本次运行改动的文件（不含运行前已脏且未变的文件），自动 `snapshot`，写入 `run.changed {repo: [相对路径]}` 与 `run.version`（快照记录路径）。审阅卡片列出被审交付目标最近一次实施/返修的快照；审阅的“固定版本”行必须包含这些快照路径。
 2. **受保护路径**：`plan.protected`（相对仓库根的 glob）。运行改动命中受保护路径而工单 `input.allow_protected` 未覆盖 → 交付不合法，直接按 FAILED 登记（不续跑），开 decide（trigger `protected_change`，附路径与快照）。decide 的 `open` 动作带 `allow_protected` 视为超出授权包络 → 问用户，批准后写入新工单。审阅运行改动源码仓库 → 同样处理（trigger `review_modified`），完整改动与快照保留。技能不按项目日志路径豁免仓库变化；验证方案及副作用边界归批次设计与设计审阅。有 `plan.repos` 时审阅以可写模式运行（为写 record），否则只读。
-3. **计划校验**：每个交付目标至少属于一个审阅组，或写 `no_review: <理由>`；`instruction`、`acceptance` 非空；有 `plan.design` 时设计文件必须存在，记录 `sha256` 与每个 `design_ref` 所指章节（以标题行匹配，至下一个同级或更高级标题为止）的哈希，`design_ref` 必须存在；`rounds.review < 1 + 返修链长度` 时在 `plan.warnings` 中提示。
+3. **计划校验**：每个交付目标至少属于一个审阅组，或写 `no_review: <理由>`；`instruction`、`acceptance` 非空；有 `plan.design` 时设计文件必须存在，记录 `sha256` 与每个 `design_ref` 所指章节（以标题行匹配，至下一个同级或更高级标题为止）的哈希，`design_ref` 必须存在；审阅额度按实际目标/审阅组 override 及可用角色计算完整路径覆盖，登记/修订/增额硬校验；实施与返修派发前核对剩余配套额度，不足不消费技术调用。计算、合并组和历史兼容规则见 references/plan.md「审阅预算配套脚本门禁」。
 4. **设计漂移**：`design_ref` 所指章节哈希变化 → 该章节的交付目标暂停派发；`check_design`（驱动器每次派发前调用）为漂移开一张 decide（trigger `design_drift`，列出受影响交付目标）。负责人处置：`refresh_design`（措辞调整，重钉哈希，授权包络内）或 `plan_revision`（实质变化，问用户）。
 5. **审阅完整性**：所有后续实施与返修统一联入覆盖该目标的每个审阅组；已 RELEASE 的组重新开审阅，相关放行恢复等待（第三方及跨批组同理）。已有历史结论保留，不能代替当前工作通过。自动版本快照与验证记录统一登记哈希，变更后阻断依赖方及放行。decide 的 `supersede` 指向审阅、放行或有依赖方的工单 → 问用户。审阅 RELEASE 须至少引用一份本次运行内生成、退出码 0 的 record，否则须写“未复跑原因”。审阅的“非阻断建议”逐条进入本批分诊。
 6. **证据时效**：实施/返修 VERIFIED 与审阅 RELEASE 须至少引用一份本次运行开始之后（允许 2 秒时钟粒度）生成、退出码 0 的 record。

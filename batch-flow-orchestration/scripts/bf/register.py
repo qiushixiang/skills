@@ -1,5 +1,5 @@
 """Registering finished runs and executing decisions: routing table of design 5.2 and decide mechanism of design 7."""
-from . import model, policy, routing, permissions, questions
+from . import model, policy, routing, permissions, questions, review_budget
 from .store import need, sha256_file
 
 
@@ -63,6 +63,8 @@ def _needs_user(state, a):
 
 def apply_actions(state, source, actions, waiter, forced=False, diagnosis=''):
     """Execute decision actions; those beyond the envelope (grant, plan revision, out-of-envelope open) wait for the user (I6)."""
+    import copy
+    prior_plan = copy.deepcopy(state.plan)
     from .gate import validate_decision
     need(not validate_decision(state, {'diagnosis': diagnosis or '处置', 'actions': actions}, source),
          'invalid decision action bundle')
@@ -85,6 +87,7 @@ def apply_actions(state, source, actions, waiter, forced=False, diagnosis=''):
     for obj in state.orders.values():
         if obj['type'] in ('implement', 'repair', 'review'):
             need(not policy.over_budget(state.plan, obj, state), 'settlement exceeds authorized technical budget')
+    review_budget.validate_revision(prior_plan, state.plan)
     from . import execution
     execution.ensure_settlements(state)
     for obj in list(state.orders.values()):
@@ -209,7 +212,8 @@ def revise(state, new_plan, approval, source='user', revalidate=()):
     for o in state.orders.values():
         if o['target'] in old['review_groups']:
             o.setdefault('contract', model.review_contract(old, o['target']))
-    plan = model.normalize(new_plan)
+    plan = model.normalize(new_plan, enforce_review_budget=False)
+    review_budget.validate_revision(old, plan, revalidate)
     plan['revision'] = old['revision'] + 1
     plan['approval'] = approval or old.get('approval')
     need(isinstance(revalidate, (list, tuple)) and all(d in plan['deliverables'] for d in revalidate),

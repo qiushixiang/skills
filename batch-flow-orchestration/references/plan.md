@@ -23,7 +23,7 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow init --plan plan.
     "third_party": {"tool": "codex", "model": "…", "effort": "medium"}
   },
   "policy": {
-    "rounds": {"implement": 3, "backup": 1, "lead": 1, "repair": 2, "review": 3, "decide_per_source": 2, "invalid_retry": 2, "coordination_attempts": 2},
+    "rounds": {"implement": 3, "backup": 1, "lead": 1, "repair": 2, "review": 7, "decide_per_source": 2, "invalid_retry": 2, "coordination_attempts": 2},
     "overrides": {"<交付目标>": {"implement": 4}},
     "context": {"max_session_kb": 300},
     "continue_limit": 2
@@ -57,7 +57,7 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow init --plan plan.
 - **授权包络**：`envelope.batches` 是用户批准可自主推进的批次；可选 `envelope.protected: {"目标": ["精确仓库相对路径"]}` 预授限定路径权限。预授权只覆盖指定目标和路径，仍遵守设计中的修改内容、验收和审阅要求。包络外的工作由脚本转交用户。
 - **派发需求**：已知实施需要改保护路径时，在交付目标的 `required_protected` 列出精确路径，驱动器在派发前检查。它声明需求，不授予权限；不要把已知需求只藏在指令文字里。
 - **环境**：需要宿主权限的验证只经 `env.entry` 受控入口；`blocked_output` 写入口自身的环境失败输出，作为环境诊断事实，由角色判断是否阻塞。
-- 默认额度通常够用；个别交付目标需要更多轮次时写 `overrides`，并在审阅计划时向用户说明。
+- 编制时必须配套审阅预算，不能依赖默认额度或运行中再追加。单目标保守预留 `max(1, implement) + repair + backup + lead`；未配置备用角色时不计 backup。合并审阅组按 `1 + Σ(各目标预留 - 1)` 预留，联合首审只计一次，各目标返修机会分别覆盖；第三方审阅组独立配额。所有值使用目标/审阅组 override 后的实际额度。
 
 ## 修订、额度与版本
 
@@ -73,7 +73,7 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow init --plan plan.
 - `no_review`：交付目标不属于任何审阅组时必须写明原因，否则计划不通过。
 - `design_ref`：设计章节引用。保存章节哈希，变化作为事实送达角色，不自动暂停实施；负责人判断影响与需要重做的目标。
 - 可选 `deliverables.*.non_goals`（字符串列表，卡片目标节列出“不要做”）与 `review_groups.*.focus`（字符串，审阅卡列出审阅重点）。计划编制方法见 [技术负责人](technical-lead.md)。
-- `instruction`、`acceptance` 不得为空。`policy.rounds.review < 1 + 返修链长度` 时写入 `plan.warnings`，审阅轮次可能不够。
+- `instruction`、`acceptance` 不得为空。完整路径审阅额度不足时登记失败，不再仅写 `plan.warnings`。修订/增额不得新增或扩大缺口；新建、重做或改变成员的审阅路径必须全额覆盖。历史不变缺口保留原批准与用量，派发前仍受硬门禁约束，不自动追加额度。
 
 ## 协调与额度
 
@@ -98,3 +98,7 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow init --plan plan.
 
 
 执行控制、预算结算和换人原则见 [技术负责人](technical-lead.md#预算结算)。历史协议保留，不自动迁移任务。
+
+### 审阅预算配套脚本门禁
+
+`bf/review_budget.py` 统一计算计划覆盖和派发保留。实施/返修派发前按同一预算账本扣除已用及待结算技术机会，保留剩余独立审阅（至少一次）；审阅使用量按组累计，修订/换单不重置，免扣/冲正按账本处理。缺口由 preflight 记录为 `review_budget_shortfall`，不调用执行角色；直接 start 同样拒绝。追加实施/返修额度须先配足审阅，或在同一批准动作包内同时追加；历史计划不会被静默改额度。

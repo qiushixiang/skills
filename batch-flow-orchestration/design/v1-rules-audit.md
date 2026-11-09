@@ -272,3 +272,7 @@
 | `references/operations.md`、`references/cli-adapter.md`（现有） | 不变；前端提示词补 J4/J5 两句 |
 
 合计新增 3 个文件。v1 的 protocol-*.md、orchestrator.md、contexts.md、prompts.md、hosts 文档不恢复：其中的角色规范已在上表拆到这几个文件，其余是脚本已经承担的机制。
+
+## B17 恢复记录
+
+v2 曾将 v1 审阅预算硬门禁降为可选警告，这是规则迁移退化。现恢复完整路径配套检查：实际目标/审阅组 override、合并审阅及第三方独立预算，登记/修订/增额校验与实施/返修派发门禁；不足先处理配套，不先消耗作者轮次。历史原批准不静默增额，预算账本及待结算继续累计。行为回归见 scripts/test_bf_review_budget.py；此前 B17“改写”和第 10 条“可选警告”仅保留为历史审计事实。
