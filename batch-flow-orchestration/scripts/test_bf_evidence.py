@@ -25,6 +25,8 @@ SCHEMA = {'command': list, 'cwd': str, 'started_at': str, 'ended_at': str, 'exit
 
 class Base(unittest.TestCase):
     def setUp(self):
+        from test_bf_legacy_support import legacy_runtime
+        legacy_runtime(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.base = self.root / 'task' / '.batch-flow'

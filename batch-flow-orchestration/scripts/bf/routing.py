@@ -30,6 +30,10 @@ def new_order(state, type_, target, origin, input_=None, needs=None, key=None):
     state.seq += 1
     o = {'id': 'WO-%04d' % state.seq, 'key': key, 'type': type_, 'target': target, 'origin': origin,
          'input': input_ or {}, 'needs': list(needs or []), 'runs': [], 'state': 'open', 'output': None}
+    if type_ in ('implement', 'repair', 'review'):
+        o['control_protocol'] = 'review-v1' if type_ == 'review' else 'intent-v1'
+        if type_ != 'review':
+            o['performer'] = next((s for s, n in policy.ladder(state.plan, o)), None)
     if target in state.plan['deliverables']:
         o['contract_version'] = state.plan['deliverables'][target].get('contract_version', 1)
         if type_ in ('implement', 'repair') and state.plan['deliverables'][target].get('required_protected'):
@@ -54,6 +58,8 @@ def broken_paths(state):
 
 
 def _resources(plan, order):
+    if order['input'].get('accounting_only'):
+        return set()
     members = model.deliverables_of(plan, order['target'])
     return set('deliverable:' + d for d in members) | set(
         x for d in members for x in plan['deliverables'][d]['resources'])
@@ -61,6 +67,8 @@ def _resources(plan, order):
 
 def current_work(state, order):
     """Historical deliveries remain intact, but cannot satisfy a changed contract."""
+    if order['input'].get('accounting_only'):
+        return True
     if order['target'] in state.plan['deliverables'] or order['type'] in ('implement', 'repair'):
         spec = state.plan['deliverables'].get(order['target'])
         return bool(spec) and order.get('contract_version', 1) == spec.get('contract_version', 1)
@@ -80,6 +88,17 @@ def review_needs(state, group):
     return [o['id'] for d in state.plan['review_groups'][group]['deliverables'] for o in work_for(state, d)]
 
 
+def refresh_review_recovery(state, submitted):
+    """A new delivery ends recovery instructions for an earlier review version."""
+    for review in state.orders.values():
+        if (review['type'] == 'review' and review['state'] == 'open'
+                and review['target'] in state.plan['review_groups']
+                and submitted['target'] in state.plan['review_groups'][review['target']]['deliverables']):
+            recovery = review['input'].pop('recovery', None)
+            if recovery:
+                review.setdefault('recovery_history', []).append(recovery)
+
+
 def _position(plan, order):
     dels, tg = list(plan['deliverables']), order['target']
     members = model.deliverables_of(plan, tg)
@@ -88,17 +107,21 @@ def _position(plan, order):
     return (ids.index(batch) if batch else len(ids), dels.index(members[0]) if members else len(dels))
 
 
+def _busy_target(order):
+    return None if order['input'].get('accounting_only') else order['target']
+
+
 def runnable(state, parallel=1):
     if state.stopped:
         return []
     plan = state.plan
     held = set(plan.get('holds') or [])
     running = [o for o in state.orders.values() if o['state'] == 'running']
-    busy_targets = set(o['target'] for o in running if o['target'])
+    busy_targets = set(_busy_target(o) for o in running if _busy_target(o))
     busy_res = set()
     for o in running:
         busy_res |= _resources(plan, o)
-    deciding = set(o['target'] for o in state.orders.values() if o['type'] == 'decide' and o['state'] in ('open', 'running'))
+    deciding = set(o['target'] for o in state.orders.values() if o['type'] == 'decide' and o['state'] in ('open', 'running') and not o['input'].get('accounting_only'))
 
     def dep_ok(d):
         if d in plan['review_groups']:
@@ -108,7 +131,7 @@ def runnable(state, parallel=1):
         return bool(impls) and all(i['state'] in SATISFIED for i in impls)
     cands = []
     for o in state.orders.values():
-        if o['state'] != 'open' or o['type'] == 'ask_user' or o.get('ops'):
+        if o['state'] != 'open' or o['type'] == 'ask_user' or o.get('ops') or o.get('awaiting_disposition'):
             continue
         if not current_work(state, o):
             continue
@@ -120,7 +143,7 @@ def runnable(state, parallel=1):
             continue
         if held & set(model.deliverables_of(plan, o['target']) + [o['target'], batch]):
             continue
-        if o['target'] in plan['deliverables'] and not all(dep_ok(d) for d in plan['deliverables'][o['target']]['depends_on']):
+        if not o['input'].get('accounting_only') and o['target'] in plan['deliverables'] and not all(dep_ok(d) for d in plan['deliverables'][o['target']]['depends_on']):
             continue
         if o['type'] != 'decide' and o['target'] in deciding:
             continue
@@ -129,14 +152,19 @@ def runnable(state, parallel=1):
         cands.append(o)
     cands.sort(key=lambda o: (PRIORITY.index(o['type']), _position(plan, o), seqno(o)))
     chosen = []
+    decision_targets = {o['target'] for o in running if o['type'] == 'decide'}
     for o in cands:
         if len(chosen) + len(running) >= parallel:
             break
+        if o['type'] == 'decide' and o['target'] in decision_targets:
+            continue  # Technical decisions and accounting share one target session.
         res = _resources(plan, o)
-        if (o['target'] and o['target'] in busy_targets) or res & busy_res:
+        if (_busy_target(o) and _busy_target(o) in busy_targets) or res & busy_res:
             continue
         chosen.append(o['id'])
-        busy_targets.add(o['target'])
+        if o['type'] == 'decide':
+            decision_targets.add(o['target'])
+        busy_targets.add(_busy_target(o))
         busy_res |= res
     return chosen
 
@@ -170,9 +198,9 @@ def open_decide(state, subject, trigger, extra=None, force=False):
     details = extra or {}
     issue.append(details.get('blocker') or sorted(details.get('paths') or []))
     count = len([o for o in state.orders.values() if o['type'] == 'decide'
-                 and o['input'].get('issue_key') == issue])
+                 and not o['input'].get('accounting_only') and o['input'].get('issue_key') == issue])
     stalled = len([o for o in state.orders.values() if o['type'] == 'decide'
-                   and o['input'].get('issue_key', [])[:3] == issue[:3]])
+                   and not o['input'].get('accounting_only') and o['input'].get('issue_key', [])[:3] == issue[:3]])
     active = next((o for o in state.orders.values() if o['type'] == 'decide' and
                    o['state'] in ('open', 'running') and o['input'].get('subject') == subject['id'] and
                    o['input'].get('issue_key') == issue), None)
@@ -194,6 +222,8 @@ def open_decide(state, subject, trigger, extra=None, force=False):
 
 def check_exhausted(state, order):
     """Chain used up: the only exit is decide (decide/triage themselves exit to the user)."""
+    if order.get('awaiting_disposition') or (order['type'] in ('implement', 'repair', 'review') and policy.unsettled(state, order)):
+        return
     if order['state'] != 'open' or order.get('ops') or order['type'] not in policy.STAFFED or policy.stage(state.plan, order, state) is not None:
         return
     if any(state.orders[n]['state'] not in SATISFIED for n in order['needs'] if n in state.orders):
@@ -249,6 +279,10 @@ def open_repairs(state, review, run, p):
         inp = {'findings': [{'id': f['id'], 'closure': f['closure'], 'plan_level': f['plan_level']} for f in fs],
                'review_order': review['id'], 'review_run': run['run_id'], 'plan_level': any(f['plan_level'] for f in fs)}
         if rep:  # same order reopened: the chain keeps escalating
+            if rep['state'] == 'done' and rep.get('control_protocol') == 'intent-v1':
+                # A new review cycle starts with the executor; old fallback selection
+                # is not an instruction to keep the lead implementing indefinitely.
+                rep['performer'] = 'primary'
             inp['cycle'] = rep['input'].get('cycle', 1) + 1
             rep['input'] = inp
             rep['state'] = 'open'
@@ -340,7 +374,7 @@ def sync_plan(state):
         if o['state'] in ('done', 'superseded'):
             continue
         batch = model.batch_of(plan, o['target'])
-        if o['target'] is not None and (batch is None or not current_work(state, o)):
+        if not o['input'].get('accounting_only') and o['target'] is not None and (batch is None or not current_work(state, o)):
             o['state'] = 'superseded'  # target removed by a plan revision
     for b in plan['batches']:
         release = by_key(state, 'release:' + b['id'])

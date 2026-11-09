@@ -2,6 +2,8 @@
 
 ## 启动
 
+计划已配置角色的后端声明 `env.<backend>.require_host=true` 时，驱动器在前台入口、后台创建和 ensure-run 恢复入口检查自身 NoNewPrivs。受限父进程（非 0）或无法读取状态时直接返回 `DRIVER_ENVIRONMENT_BLOCKED`，不 probe profile、不创建后台驱动器、不派发角色、不登记无效角色轮次。通过平台批准机制在既有授权宿主重新启动；不自动提权，不修改子 CLI 沙箱或计划中的宿主要求。未声明 require_host 的任务不增加该限制。现有角色启动前检仍保留。
+
 聊天前端支持 **Claude Code、Codex CLI、agy、OpenCode V2**。用 `--backend` 选择，默认 Claude；前端选择不改变计划中执行者、审阅者等角色的工具和模型。
 
 项目根目录的 `start-batch-flow.sh` 软链接指向技能的同名脚本，可从任意工作目录调用：
@@ -79,8 +81,8 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow answer WO-0012 --
 
 - `stop`：不再派发新工单，已在运行的调用结束后照常回收。`resume` 恢复。
 - 驱动器没有可派发或在途工作时退出，包括等待用户时。前端在 `answer / resume / retry / escalate / unhold / grant / envelope / set-role / supersede` 成功后统一运行 `ensure-run`：复用上次 `run` 保存的配置，在需要时后台启动；不会解除用户 stop，单实例锁防止重复派发。首次运行仍用 `run`。直接使用 CLI 的用户也应在这些操作后运行 `ensure-run`。
-- 驱动器随时可以重启：状态全部在文件里；上次未回收的调用会被接管或登记为无效（免扣）后重派。
-- CLI 工具失败（无结果、认证错误）登记为无效、免扣；同一工单连续失败达到上限标记 ops，由前端运维处理或上升技术负责人。
+- 驱动器随时可以重启：状态全部在文件里；上次未回收的调用会被接管或登记为无效；新版技术调用若不能证明整次未启动，转负责人裁决与结算。
+- CLI 工具失败登记为无效。新版整次未启动有机械证明才免扣并有界重试；其他技术调用立即移交负责人，不按无回复推断免扣。
 - profile 缺失时 `run` 自动 probe（不调用模型），见 [CLI 适配器](cli-adapter.md)。
 
 ## 调整
@@ -94,16 +96,28 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow answer WO-0012 --
 
 ## 运维（聊天前端）
 
-- Codex 启动参数与实际权限策略不一致、或缺少本次原生会话回执，属于 CLI 不可用，免扣技术轮次并按 invalid_retry 有界重试后暂停；不能派角色反复核查权限来消耗实施额度。详见 [CLI 适配器](cli-adapter.md)。宿主父进程 NoNewPrivs=0 不代表每个工具命令都已出沙箱；受控入口须直接命中既有规则，不外套 bf record。
+新实施/返修交付后，旧审阅的一次性 recovery 指令失效并保留在历史中，下一次审阅续用原审阅会话并核对当前交付，不应用日志大小阈值。新审阅周期回到主执行者，不继承上周期的负责人兜底选择；已用额度仍累计。
+
+负责人技术裁决与纯预算结算按同一交付目标共用会话，不应用输出日志大小阈值；不同目标分别保持会话。同目标裁决/结算串行派发，结算仍只做记账，不复审质量。会话缺失、工具/模型变化、作者独立性冲突或明确要求 fresh_session 时仍按实际原因处理。
+
+历史任务若已被“仅修旧报告格式”的指令误送到旧快照，且该旧报告重新打开了已交付返修，可用受控入口恢复：
+
+```text
+bf/cli.py --base <任务>/.batch-flow restore-review WO-n --run WO-n-rN --approval <用户原话文件>
+```
+
+该操作只恢复最新已交付、已结算的返修并送原独立审阅；检查原恢复指令早于返修、审阅明确绑定另一已知旧版本、无在途或未决依赖。不改历史调用、预算、阻断或审阅结论，不将交付标为质量通过。已审当前交付的真实否决不可用此入口撤销。恢复后用 ensure-run 继续；用户 stop 保持有效。
+
+- Codex 启动参数与实际权限策略不一致、或缺少本次原生会话回执，属于 CLI 不可用；新版按实际启动事实决定机械免扣还是交负责人结算，历史协议按 invalid_retry 有界重试后暂停；不能派角色反复核查权限来消耗实施额度。详见 [CLI 适配器](cli-adapter.md)。宿主父进程 NoNewPrivs=0 不代表每个工具命令都已出沙箱；受控入口须直接命中既有规则，不外套 bf record。
 - `report --text`：给人看的中文进展（正在做、下一步、待你决定、角色、批次），不含工单号；`report` 输出完整 JSON（含 roles、next、batches、ops）。
 - 计划来源的实施卡采用当前计划指令；裁决新开的实施卡保留专用指令，并附当前计划作为上下文。验证副作用和版本差异作为事实交角色判断；前端不维护路径豁免或替代审阅。
 - 所有入口创建的审阅均等待审阅组覆盖目标的当前实施/返修；校验、开单和派发使用相同依赖。需要实施前设计审阅时，由负责人在计划中建立独立设计交付与设计审阅组。
-- 同一工单连续 CLI 不可用达到 `invalid_retry` 次，工单被标记 `ops` 并暂停（其余照常推进），不再自动开裁决。前端读故障原文后：`retry WO-n --note T`（如切换 codex 账号后重试，免扣额度）、`escalate WO-n --note T`（交技术负责人，trigger `tool_failure`），或告诉用户。
+- 新版实施/返修确认 CLI 未启动或已结束但返回不可用时，同轮重试一次，连续两次异常后自动沿计划阶梯切换到有额度的下一执行者；无下一执行者才转负责人。仍在运行则等待，状态不明不自动重派。历史协议和其他角色仍在连续 `invalid_retry` 次异常后标记 `ops` 暂停；前端读故障原文后用 `retry WO-n --note T` 或 `escalate WO-n --note T` 留下处置。
 - 前端可读任何文件、运行只读命令和已配置的账号切换命令；写入只限 `answers/` 下的新文件；不改代码、不做技术判断。
 
 ## 修复历史登记（reconcile）
 
-协调调用不占技术轮次；report.recent 的 budget_charge 区分 technical、coordination、exempt、credited。调用记录仍保留。当前有在途工作时禁止迁移。
+协调调用不占技术轮次；report.recent 的 budget_charge 区分 technical、coordination、pending、exempt、credited。调用记录仍保留。当前有在途工作时禁止迁移。
 
 只有已获用户授权的历史修复才使用：
 
@@ -124,7 +138,7 @@ bf/cli.py --base <任务>/.batch-flow reconcile --file <base>/answers/repair.jso
 
 - `watch [--since N] [--once]`：把值得关注的事件（驱动器启停、待你决定、运维暂停、交付结果、批次放行、停止）逐条输出为一行中文；前端用 Monitor 挂着它。`report` 的 `driver.alive` 表示驱动器是否在运行。
 - `doctor`：列出任务目录里引用了、但技能中已不存在的脚本（`{"missing": [{file, line, ref}]}`）；切换或升级技能前运行。
-- `stop` 同时阻止续跑（不合法交付暂存，`resume` 后继续）；`stop --now` 立即按进程组终止在途调用，登记为无效、免扣，驱动器退出。
+- `stop` 同时阻止续跑（不合法交付暂存，`resume` 后继续）；`stop --now` 立即按进程组终止在途调用，登记为无效，驱动器退出；新版已启动技术调用待负责人结算。
 
 ## 判断职责调整后的维护
 
@@ -136,3 +150,8 @@ bf/cli.py --base <任务>/.batch-flow reconcile --file <base>/answers/repair.jso
 
 reconcile 支持 paths=[] 且 credits 非空：只审计冲正指定的纯协调误记，不安装任何路径权限，不夹带 resolve_asks 批准或 execution_notes 计划变更。仍须本次修复的用户原话文件、同目标既有批准、当前 revision、完整且未漂移的运行证据；真实源码改动、受控测试及已有冲正不得再冲正。仅此模式可引用同目标旧契约批准作为历史来源，不能借此授予新权限。先 dry-run 核对，原运行与总额度保留。
 前端帮助使用完整绑定命令 `<Python> <技能>/scripts/bf/cli.py --base <绑定目录> reconcile --help`；不支持 flow 简写或任意 Python heredoc。读取状态用 Read/Grep/cat，工单在 orders.json 的 orders 字段中。report.ops 不应转成用户选择，只有 report.ask_user 是当前待决。
+
+
+新版技术调用恢复与结算见 [技术负责人](technical-lead.md#执行恢复与执行者选择)。CLI 异常的有限重试和阶梯切换不依赖选人裁决；未结算占原角色额度，结算不成为下一角色或审阅的前置条件。历史协议和运维记录保留，不自动迁移或重启，旧阻塞不会因技能升级自行解除。
+
+驱动器按 run/segment 在同一事务保存交付或 CLI 异常回执。重启按回执恢复待启动续作或一次异常重试，不重复回收或重置重试次数；启动交接若状态不明则交负责人，不冒充未启动后自动重派。inflight 原子写入，启动意图先于实际启动保存。

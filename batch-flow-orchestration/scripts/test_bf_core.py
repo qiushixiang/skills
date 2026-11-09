@@ -74,6 +74,8 @@ def cmd(command, code, output=''):
 
 class Base(unittest.TestCase):
     def setUp(self):
+        from test_bf_legacy_support import legacy_runtime
+        legacy_runtime(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name) / '.batch-flow'
         self.base.mkdir()

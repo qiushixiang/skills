@@ -30,10 +30,11 @@ def _last_session(runs, kb, cfg, samples=None):
         return None, 'no-session'
     if cfg and (last['tool'], last['model']) != (cfg['tool'], cfg['model']):
         return None, 'tool-change'
-    size = sum(r.get('session_kb') or 0 for r in (samples if samples is not None else runs)
-               if r.get('session') == last['session'])
-    if size > kb:
-        return None, 'size-limit'
+    if kb is not None:
+        size = sum(r.get('session_kb') or 0 for r in (samples if samples is not None else runs)
+                   if r.get('session') == last['session'])
+        if size > kb:
+            return None, 'size-limit'
     return last['session'], None
 
 
@@ -54,7 +55,7 @@ def session_for(state, order, stage, cfg=None):
         cid, why = _last_session(runs, kb, cfg, samples)
         return _resume(cid, 'implement-continue') if cid else _fresh(why)
     if t == 'review':
-        cid, why = _last_session(runs, kb, cfg, samples)
+        cid, why = _last_session(runs, None, cfg, samples)
         if cid and cid in author_sessions(state, order):
             return _fresh('review-author-session')
         return _resume(cid, 'review-resume') if cid else _fresh('review-first' if why == 'first' else why)
@@ -62,7 +63,7 @@ def session_for(state, order, stage, cfg=None):
         prior = [o for o in state.orders.values() if o['type'] == 'decide' and o['target'] == order['target']]
         finished = [r for o in prior for r in o['runs'] if r['ended'] and r['result'] != 'INVALID']
         finished.sort(key=lambda r: r.get('ended_ts', r['started_ts']))
-        cid, why = _last_session(finished, kb, cfg, samples)
+        cid, why = _last_session(finished, None, cfg, samples)
         if cid and cid in author_sessions(state, order):
             return _fresh('decide-author-session')
         return _resume(cid, 'decide-resume') if cid else _fresh('decide-first' if why == 'first' else why)

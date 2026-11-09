@@ -15,6 +15,8 @@ REFS = HERE.parent / 'references'
 
 class Cards(unittest.TestCase):
     def setUp(self):
+        from test_bf_legacy_support import legacy_runtime
+        legacy_runtime(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name) / '.batch-flow'
         (self.base / 'records').mkdir(parents=True)
@@ -63,6 +65,56 @@ class Cards(unittest.TestCase):
             text = (REFS / name).read_text(encoding='utf-8')
             for s in sections:
                 self.assertIn('## ' + s, text)
+
+    def test_decision_exports_backup_configuration_and_shared_budget(self):
+        oid = api.orders(api.load(self.base), type='implement', target='D1')[0]['id']
+        run = api.start(self.base, oid)
+        api.deliver(self.base, oid, run, NEEDS_DECISION, conversation_id='c')
+        st = api.load(self.base)
+        decision = api.orders(st, type='decide', target='D1')[0]
+        data = cards.prepare(st, decision['id'])
+        options = data['input']['execution_options']
+        self.assertEqual(options['subject'], oid)
+        self.assertEqual(options['budget_owner'], ['implement', 'D1'])
+        candidates = {row['performer']: row for row in options['candidates']}
+        self.assertEqual(candidates['backup']['configuration'], st.plan['roles']['backup_executor'])
+        self.assertEqual(candidates['primary']['budget_spent'], 1)
+        self.assertEqual(candidates['primary']['budget_remaining'], 2)
+        self.assertEqual(candidates['backup']['budget_remaining'], 1)
+        self.assertEqual(candidates['primary']['environment']['entry'], st.plan['env']['codex']['entry'])
+        text = cards.render(st, decision['id'], api.assign(st, decision['id']), prepared=data)
+        self.assertIn('backup-m', text)
+        self.assertIn('缺少预先成功调用证明不等于备用未授权或不可用', text)
+        with self.assertRaises(api.BfError):
+            cards.validate_export(data, text.replace('backup-m', 'missing'))
+
+    def test_options_respect_shared_repair_budget_pending_and_plan_level(self):
+        st = api.load(self.base)
+        original = api.orders(st, type='implement', target='D1')[0]
+        subject = dict(original, type='repair', input={'review_order': 'R', 'plan_level': False})
+        prior = dict(subject, id='prior', runs=[{'run_id': 'prior-r1', 'performer': 'backup',
+                                               'ended': 'now', 'exempt': False}])
+        pending = dict(subject, id='pending', runs=[{'run_id': 'pending-r1', 'performer': 'primary',
+                            'ended': 'now', 'budget_managed': True}])
+        st.orders.update(prior=prior, pending=pending)
+        rows = {r['performer']: r for r in cards._execution_options(st, subject)['candidates']}
+        self.assertEqual(rows['backup']['budget_remaining'], 0)
+        self.assertEqual(rows['primary']['pending_runs'], ['pending-r1'])
+        self.assertEqual(rows['primary']['budget_remaining'], 1)
+        subject['input'] = dict(subject['input'], plan_level=True)
+        rows = {r['performer']: r for r in cards._execution_options(st, subject)['candidates']}
+        self.assertEqual(rows['primary']['budget_limit'], 0)
+        self.assertEqual(rows['backup']['budget_limit'], 0)
+        self.assertEqual(rows['lead']['budget_remaining'], 1)
+
+    def test_accounting_only_does_not_receive_execution_selection(self):
+        st = api.load(self.base)
+        original = api.orders(st, type='implement', target='D1')[0]
+        # Inspect a settlement card without mutating live state or authorizing recovery.
+        decision = dict(original, id='WO-9999', type='decide',
+                        input={'accounting_only': True, 'subject': original['id'], 'run': 'r1'})
+        st.orders[decision['id']] = decision
+        self.assertNotIn('execution_options', cards.prepare(st, decision['id'])['input'])
 
 
 if __name__ == '__main__':

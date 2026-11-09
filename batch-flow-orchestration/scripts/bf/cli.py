@@ -29,6 +29,10 @@ def main(argv=None):
     rc.add_argument('--file', required=True)
     rc.add_argument('--approval', required=True)
     rc.add_argument('--dry-run', action='store_true')
+    rr = sub.add_parser('restore-review')
+    rr.add_argument('order')
+    rr.add_argument('--run', required=True)
+    rr.add_argument('--approval', required=True)
     for name in ('retry', 'escalate'):
         p = sub.add_parser(name)
         p.add_argument('order')
@@ -92,6 +96,8 @@ def main(argv=None):
         elif args.cmd == 'reconcile':
             from bf import reconcile
             out = reconcile.apply(base, args.file, args.approval, dry_run=args.dry_run)
+        elif args.cmd == 'restore-review':
+            out = api.restore_review(base, args.order, args.run, args.approval)
         elif args.cmd in ('retry', 'escalate'):
             out = {args.cmd: getattr(api, args.cmd)(base, args.order, args.note)}
         elif args.cmd == 'record':
@@ -146,6 +152,7 @@ def main(argv=None):
                               api.revise_plan(base, plan, args.approval, revalidate=args.revalidate))}
         else:
             from bf import adapter, runner
+            runner.check_driver_environment(api.load(base))
             profiles = adapter.ensure_profiles(base, args.agent_cli, dict(p.split('=', 1) for p in args.profile))
             ad = adapter.AgentCliAdapter(base, profiles, agent_cli=args.agent_cli)
             command = [sys.executable, str(Path(__file__).resolve()), '--base', str(base.resolve()),

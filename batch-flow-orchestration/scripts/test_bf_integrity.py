@@ -25,6 +25,8 @@ def git(repo, *args):
 
 class Base(unittest.TestCase):
     def setUp(self):
+        from test_bf_legacy_support import legacy_runtime
+        legacy_runtime(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.repo = self.root / 'src'

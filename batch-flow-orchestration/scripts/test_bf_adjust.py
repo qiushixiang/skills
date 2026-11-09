@@ -40,6 +40,8 @@ def fake_resolver(calls):
 
 class Adjust(unittest.TestCase):
     def setUp(self):
+        from test_bf_legacy_support import legacy_runtime
+        legacy_runtime(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.base = self.root / '.batch-flow'
@@ -154,6 +156,8 @@ class Adjust(unittest.TestCase):
 
 class FrontAdjust(unittest.TestCase):
     def setUp(self):
+        from test_bf_legacy_support import legacy_runtime
+        legacy_runtime(self)
         self.cli = str(HERE / 'bf' / 'cli.py')
         self.base = '/t/.batch-flow'
 

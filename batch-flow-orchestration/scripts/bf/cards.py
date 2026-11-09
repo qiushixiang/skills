@@ -4,14 +4,16 @@ import os
 import sys
 from pathlib import Path
 
-from . import model, routing, permissions, snap
+from . import model, routing, permissions, snap, policy
 from .store import BfError, need, sha256_file
 
-EXECUTOR = ['结果：VERIFIED | FAILED | ARCH_DECISION_REQUIRED | WAIT_EVIDENCE',
+LEGACY_EXECUTOR = ['结果：VERIFIED | FAILED | ARCH_DECISION_REQUIRED | WAIT_EVIDENCE',
             '停止原因：完成 | 未完成 | 技术不可行 | 待裁决 | 外部阻塞',
             '改动与版本：<提交或快照>', '验证证据：<records/ 下证据文件的绝对路径>', '未运行/失败：...',
             '上升问题：...（无则写“无”）', '候选新项：（可选，下接逐行“- ”）', '限制：...']
-EXECUTOR.insert(-2, '问题标识：<待裁决时可选，复用同一问题标识>')
+LEGACY_EXECUTOR.insert(-2, '问题标识：<待裁决时可选，复用同一问题标识>')
+EXECUTOR = ['下一步：继续 | 交付 | 移交', '改动与版本：<提交或快照>', '验证证据：<records/ 下记录路径>',
+            '未完成与限制：...', '移交说明：<移交时说明原因、已尝试方法和所需处置>', '候选新项：（可选）']
 REVIEWER = ['结果：RELEASE | FIX_REQUIRED', '固定版本：<被审版本>', '复跑与证据：<records/ 下证据文件的绝对路径>', '未复跑原因：（沿用执行者记录而未亲自复跑时必填）',
             '阻断：B1 | 返修:<交付目标> | 方案级:是/否 | 关闭条件:...（FIX_REQUIRED 时每项一行）',
             '非阻断建议：...', '候选新项：（可选）']
@@ -19,7 +21,7 @@ REFS = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.absp
 NORMS = {
     'implement': [('engineering.md', '必要验证、证据标准、复杂度与最小改动'), ('roles.md', '执行者、当前工单与必读')],
     'review': [('engineering.md', '审阅边界与问题处置、证据标准'), ('roles.md', '审阅者')],
-    'decide': [('technical-lead.md', '裁决（decide）、工单上下文编制')],
+    'decide': [('technical-lead.md', '裁决（decide）、工单上下文编制、执行恢复与执行者选择、预算结算')],
     'triage': [('technical-lead.md', '分诊（triage）')],
 }
 NORMS['repair'] = NORMS['implement']
@@ -28,7 +30,8 @@ SCHEMA = (
     '- {"open": "implement|repair|review|triage", "target": "<交付目标/审阅组/批次>", "input": {"instruction": "..."}, '
     '"allow_protected": ["<glob>"], "fresh_session": false}  开立工单；allow_protected 放开受保护路径 → 转用户；目标在授权包络外 → 转用户\n'
     '- {"supersede": "WO-n", "reason": "..."}  作废工单；对象是审阅、放行或有依赖方的工单 → 转用户\n'
-    '- {"retry": "WO-n", "reason": "...", "fresh_session": false}  重新开放失败/开立中的工单\n'
+    '- {"settle": "WO-n-rN", "charge": 0, "reason": "..."}  结算同预算已结束技术调用，charge 仅 0/1；不改写运行事实\n'
+    '- {"retry": "WO-n", "performer": "primary|backup|lead", "reason": "可执行下一步及能力依据", "fresh_session": false}  实施/返修显式选人；审阅不填 performer；先结算待定调用\n'
     '- {"grant": {"<目标>": {"implement": 1}}}  追加额度 → 转用户\n'
     '- {"authorize": "WO-n", "paths": ["<精确仓库相对路径>"]}  给原实施/返修单登记限定权限；超出现有授权 → 转用户\n'
     '- {"plan_revision": "<草案路径>", "within_authorization": true, "revalidate": ["<需重做的交付目标>"]}  负责人判断调整是否在授权内，说明依据和影响；脚本仅核对显式策略边界。revalidate 明确选择重做目标，不自动传播；新增承诺转用户\n'
@@ -41,7 +44,7 @@ SCHEMA = (
 
 
 def _norms(o):
-    rows = NORMS.get(o['type'])
+    rows = [('technical-lead.md', '预算结算')] if o['input'].get('accounting_only') else NORMS.get(o['type'])
     if not rows:
         return ''
     return _lines('%s：%s' % (os.path.join(REFS, f), s) for f, s in rows)
@@ -53,7 +56,7 @@ def _lines(xs):
 
 def _last_done(state, deliverable):
     runs = [r for o in routing.work_for(state, deliverable) for r in o['runs']
-            if r['ended'] and r['result'] == 'VERIFIED']
+            if r['ended'] and r['result'] in ('VERIFIED', 'SUBMITTED')]
     return max(runs, key=lambda r: r.get('ended_ts', r['started_ts'])) if runs else None
 
 
@@ -62,9 +65,11 @@ def _goal(state, o):
     lead = '本次仅审阅下列交付目标；不承担实施工作：' if o['type'] == 'review' else '本次负责下列交付目标：'
     return lead + '\n' + _lines('%s：%s' % (d, state.plan['deliverables'][d]['title'] or d) for d in targets)
 
+
 def _acceptance(state, o):
     return '\n'.join('%s.A%d 验收：%s' % (d, i, text) for d in model.deliverables_of(state.plan, o['target'])
                      for i, text in enumerate(state.plan['deliverables'][d]['acceptance'], 1))
+
 
 def _contracts(state, o):
     if o['type'] not in ('review', 'repair') and not (o['type'] == 'implement' and o['origin'].get('by') != 'plan'):
@@ -72,9 +77,11 @@ def _contracts(state, o):
     return '\n\n'.join('### %s\n%s' % (d, state.plan['deliverables'][d]['instruction'])
                         for d in model.deliverables_of(state.plan, o['target']))
 
+
 def _non_goals(state, o):
     return '\n'.join('- %s：%s' % (d, text) for d in model.deliverables_of(state.plan, o['target'])
                      for text in state.plan['deliverables'][d].get('non_goals', []))
+
 
 def _review_scope(state, o):
     if o['type'] != 'review':
@@ -93,6 +100,7 @@ def _review_scope(state, o):
     if focus:
         out.append('本组重点（不新增验收）：' + focus)
     return _lines(out)
+
 
 def _environment(state, assignment, run_dir):
     env = model.env_for(state.plan, assignment['tool'])
@@ -165,6 +173,9 @@ def _body(state, o, run_dir):
         elif not inp.get('instruction'):
             out.append('首审：独立核对验收和证据，判断必要复跑，不沿用作者结论。')
         return '\n'.join(out)
+    if t == 'decide' and inp.get('accounting_only'):
+        return ('仅结算指定调用是否占一个技术轮次（0/1），不复审实现、不改变工程状态。\n'
+                '写入 %s/decision.json：{"diagnosis":"结算依据","actions":[{"settle":"%s","charge":0,"reason":"依据"}]}。' % (run_dir or '<运行目录>', inp['run']))
     if t == 'decide':
         out = ['触发：%s；对象工单 %s，运行 %s。' % (inp.get('trigger'), inp.get('subject'), inp.get('run')),
                '问题：%s' % (inp.get('issue') or inp.get('answer') or ''), '证据：%s' % (', '.join(inp.get('evidence', [])) or '无')]
@@ -184,13 +195,13 @@ def _body(state, o, run_dir):
 
 def _delivery(o):
     if o['type'] in ('implement', 'repair'):
-        rows = EXECUTOR[:]
+        rows = (EXECUTOR if o.get('control_protocol') == 'intent-v1' else LEGACY_EXECUTOR)[:]
         if o['type'] == 'repair':
             rows.insert(3, '阻断关闭：B1=已关闭 说明')
         return '按固定行回复，无内容写“无”；可选项无内容可省略：\n' + '\n'.join(rows)
     if o['type'] == 'review':
         return '最终回复按下列固定行交付：\n' + '\n'.join(REVIEWER)
-    return '最终回复写：\n结果：VERIFIED\n停止原因：完成\n（处置已写入 decision.json；无法处置时写 待裁决 并说明上升问题。）'
+    return '最终回复写：\n结果：VERIFIED\n停止原因：完成\n（处置已写入 decision.json，按本单结构交付。）'
 
 
 def _current_input(state, o):
@@ -204,12 +215,38 @@ def _current_input(state, o):
     return inp
 
 
+def _execution_options(state, subject):
+    """Plan facts for lead selection, never a backend health or capability verdict."""
+    limits = dict(policy.ladder(state.plan, subject))
+    used = policy.spent(state, subject)
+    pending = policy.unsettled(state, subject)
+    rows = []
+    for performer in ('primary', 'backup', 'lead'):
+        role = policy.STAGE_ROLE[performer]
+        cfg = state.plan['roles'].get(role)
+        if cfg is None:
+            continue
+        held = [r['run_id'] for o, r in pending if r['performer'] == performer]
+        limit = limits.get(performer, 0)
+        env = model.env_for(state.plan, cfg['tool'])
+        rows.append({'performer': performer, 'role': role, 'configuration': dict(cfg),
+                     'budget_limit': limit, 'budget_spent': used.get(performer, 0),
+                     'pending_runs': held, 'budget_remaining': max(0, limit - used.get(performer, 0) - len(held)),
+                     'environment': {k: env[k] for k in ('require_host', 'entry', 'preflight', 'guide') if k in env}})
+    return {'subject': subject['id'], 'budget_owner': list(policy.budget_key(subject)),
+            'candidates': rows,
+            'notice': '这是当前计划配置与共享预算事实，不是服务健康或能力证明，也不是自动换人指令。'
+                      '缺少预先成功调用证明不等于备用未授权或不可用。CLI 异常的有限重试与阶梯切换由驱动器处理；'
+                      '需要技术裁决时负责人显式选人并先结算所涉待定调用；预算为零或方案级限制仍须遵守。'}
+
+
 def prepare(state, order_id):
     """One resolved input for every role. The Markdown card is only its export."""
     o = state.orders[order_id]
     need(isinstance(o['input'], dict), 'order.input must be an object')
     inp = _current_input(state, o)
-    if o['type'] == 'decide':
+    accounting = o['input'].get('accounting_only', False)
+    if o['type'] == 'decide' and not accounting:
         historical_input = o['input'].get('subject_input')
         subject = state.orders.get(inp.get('subject'))
         if subject:
@@ -217,6 +254,8 @@ def prepare(state, order_id):
             inp['subject_task'] = {'instruction': target.get('instruction'), 'acceptance': target.get('acceptance'),
                 'constraints': _constraints(state, subject),
                 'current_work': _current_input(state, subject)}
+            if subject['type'] in ('implement', 'repair'):
+                inp['execution_options'] = _execution_options(state, subject)
         elif historical_input:
             inp['historical_subject'] = {'notice': '历史输入，仅供诊断；当前任务不可用，不作为执行要求', 'input': historical_input}
     if 'instruction' in inp:
@@ -245,15 +284,17 @@ def prepare(state, order_id):
                               'started': run.get('started'), 'ended': run.get('ended'),
                               'dispatch': run.get('dispatch'),
                               'observations': run.get('observations', []), 'citations': run.get('citations', [])})
-    return {'goal': _goal(state, o), 'order': o['id'], 'type': o['type'], 'target': o['target'], 'input': inp,
-            'acceptance': _acceptance(state, o), 'contracts': _contracts(state, o),
-            'non_goals': _non_goals(state, o), 'review_scope': _review_scope(state, o),
-            'constraints': _constraints(state, o), 'versions_and_evidence': facts if o['type'] in ('review', 'decide') else [],
-            'required_read': required_read(state, o),
+    return {'goal': '' if accounting else _goal(state, o), 'order': o['id'], 'type': o['type'], 'target': o['target'], 'input': inp,
+            'acceptance': '' if accounting else _acceptance(state, o),
+            'contracts': '' if accounting else _contracts(state, o),
+            'non_goals': '' if accounting else _non_goals(state, o),
+            'review_scope': '' if accounting else _review_scope(state, o),
+            'constraints': '' if accounting else _constraints(state, o), 'versions_and_evidence': facts if not accounting and o['type'] in ('review', 'decide') else [],
+            'required_read': [] if accounting else required_read(state, o),
             'control': {'held': bool({o['target'], model.batch_of(state.plan, o['target'])} & set(state.plan.get('holds', []))),
                         'in_envelope': model.batch_of(state.plan, o['target']) in state.plan['envelope']['batches'],
                         'dependencies': {n: state.orders[n]['state'] for n in o['needs'] if n in state.orders}},
-            'design_changes': model.drifted(state.plan),
+            'design_changes': [] if accounting else model.drifted(state.plan),
             'plan_revision': state.plan.get('revision')}
 
 
@@ -302,6 +343,7 @@ def _facts_text(data):
                        if ref.get('registered_sha256') != ref.get('current_sha256') or not ref.get('current_sha256') else ''))
     return '\n'.join(out)
 
+
 def validate_export(data, text):
     for key in ('goal', 'acceptance', 'contracts', 'non_goals', 'review_scope', 'constraints'):
         need(data.get(key, '') in text, 'card export omitted or changed ' + key)
@@ -338,7 +380,8 @@ def render(state, order_id, assignment, run_dir=None, prepared=None):
     return text
 
 
-def continue_prompt(order_id, reason, k, limit, original=None):
-    return ('尚未合法结束：工单 %s 的协议交付不完整（%s）。这是同一轮次续作 %d/%d，不另扣额度。\n'
+def continue_prompt(order_id, reason, k, limit, original=None, legacy=False):
+    prefix = '尚未合法结束：工单' if legacy else '同一工单'
+    return (prefix + ' %s 继续执行（%s）。这是同一轮次续作 %d/%d，不另扣额度。\n'
             '完整原工单与约束：%s；继续完成剩余工作，按原工单交付格式回复。\n'
             % (order_id, reason, k, limit, original or '当前会话的原始工单'))

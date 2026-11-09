@@ -24,8 +24,12 @@ def on_registered(state, order, run, p, legal, decision):
     elif t == 'triage' and legal:
         order['state'] = 'done'
         apply_triage(state, order, decision)
-    if legal:
+    if legal and not order['input'].get('accounting_only'):
         routing.add_candidates(state, order, p['candidates'] + p['suggestions'])
+    from . import execution
+    if legal and t == 'review' and run.get('budget_managed'):
+        execution.coordinate(state, order, run, '审阅调用预算结算', accounting=True)
+    execution.ensure_settlements(state)
     # A completed child may unblock another order that shares an exhausted budget.
     for pending in list(state.orders.values()):
         routing.check_exhausted(state, pending)
@@ -78,13 +82,24 @@ def apply_actions(state, source, actions, waiter, forced=False, diagnosis=''):
             obj = state.orders[a['retry']]
             need(not permissions.missing(state.plan, obj), 'retry still lacks required protected permissions')
             need(policy.stage(state.plan, obj, state) is not None, 'retry still has no execution allowance')
+    for obj in state.orders.values():
+        if obj['type'] in ('implement', 'repair', 'review'):
+            need(not policy.over_budget(state.plan, obj, state), 'settlement exceeds authorized technical budget')
+    from . import execution
+    execution.ensure_settlements(state)
     for obj in list(state.orders.values()):
         routing.check_exhausted(state, obj)
 
 
 def _execute(state, source, a, waiter):
     plan = state.plan
-    if 'authorize' in a:
+    if 'settle' in a:
+        owner, run = next((o, r) for o in state.orders.values() for r in o['runs'] if r['run_id'] == a['settle'])
+        owner.setdefault('settlements', {}).setdefault(run['run_id'], {'charge': a['charge'], 'reason': a['reason'], 'source': source['id']})
+        for pending in state.orders.values():
+            if pending['input'].get('accounting_only') and pending['input'].get('run') == run['run_id'] and pending['state'] == 'open':
+                pending['state'] = 'done'
+    elif 'authorize' in a:
         permissions.install(state, routing.get(state, a['authorize']), a['paths'], source['id'])
     elif 'blocked' in a:
         routing.pause(state, routing.get(state, a['blocked']), a['reason'], missing=a['missing'])
@@ -116,6 +131,17 @@ def _execute(state, source, a, waiter):
         if o['state'] in ('open', 'failed'):
             o['state'] = 'open'
             o['fresh_next'] = bool(a.get('fresh_session'))
+            o.pop('awaiting_disposition', None)
+            problem = o.pop('ops', None)
+            if problem:
+                o.setdefault('ops_log', []).append({'op': 'decide_retry', 'note': a.get('reason', ''),
+                    'problem': problem['problem'], 'source': source['id']})
+            if a.get('reason'):
+                o['input']['recovery'] = {'instruction': a['reason'], 'source': source['id']}
+
+            if 'performer' in a:
+                o['control_protocol'] = 'intent-v1'
+                o['performer'] = a['performer']
     elif 'grant' in a:
         for key, spec in a['grant'].items():
             target = state.orders[key]['target'] if key in state.orders else key
@@ -218,5 +244,7 @@ def revise(state, new_plan, approval, source='user', revalidate=()):
             need(not over, 'revision would take back used budget of %s (%s)' % (o['id'], ', '.join(over)))
     state.plan_dirty = True
     routing.sync_plan(state)
+    from . import execution
+    execution.ensure_settlements(state)
     for pending in list(state.orders.values()):
         routing.check_exhausted(state, pending)

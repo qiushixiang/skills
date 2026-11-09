@@ -10,12 +10,27 @@ from .adapter import LaunchNotStarted
 from .store import BfError, now
 
 
+def check_driver_environment(state):
+    """Reject an unsuitable driver parent before profiles, runs or children exist."""
+    backends = {role['tool'] for role in state.plan['roles'].values()}
+    if not any(state.plan.get('env', {}).get(backend, {}).get('require_host') for backend in backends):
+        return
+    from agent_cli import check_execution
+    try:
+        check_execution({'require_host': True})
+    except ValueError as error:
+        raise BfError('DRIVER_ENVIRONMENT_BLOCKED: 当前任务要求宿主启动，当前环境未通过检查。'
+                      '请通过平台批准机制在已授权宿主重新运行 bf run/ensure-run；'
+                      '不要修改 NoNewPrivs、子 CLI 沙箱或计划要求。未派发工单。原因：%s' % error) from error
+
+
 def ensure_running(base, command=None):
     """Front-owned restart using the last explicit run configuration; never resumes a user stop."""
     base = api.load(base).base.resolve()
     state = api.load(base)
     if state.stopped or not (api.runnable(state) or api.orders(state, state_='running')):
         return {'started': False, 'reason': 'stopped or no runnable work'}
+    check_driver_environment(state)
     with open(str(base / '.driver.lock'), 'a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -50,6 +65,7 @@ class Runner(object):
 
     def _begin(self):
         if self.started is None:
+            check_driver_environment(api.load(self.base))
             self.lock = open(str(self.base / '.driver.lock'), 'a')
             try:
                 fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -80,7 +96,8 @@ class Runner(object):
 
     def _persist(self, run_id):
         info = self.inflight[run_id]
-        (self._dir(run_id) / 'inflight.json').write_text(json.dumps(info, ensure_ascii=False), encoding='utf-8')
+        from .store import _atomic_write
+        _atomic_write(self._dir(run_id) / 'inflight.json', json.dumps(info, ensure_ascii=False).encode('utf-8'))
 
     def _pend(self, run_id, order_id, assignment, text, resume, n):
         """Stopped: keep the continuation for a later driver (resume) instead of launching it."""
@@ -104,19 +121,37 @@ class Runner(object):
         rd = self._dir(run_id)
         card = rd / ('card-%d.md' % n)
         card.write_text(text, encoding='utf-8')
+        self.inflight[run_id] = {'handle': None, 'order': order_id, 'assignment': assignment, 'n': n, 'launching': True}
+        self._persist(run_id)
         try:
             handle = self.adapter.launch(st.orders[order_id], assignment, str(card), str(rd), resume=resume)
         except LaunchNotStarted as error:
             record = rd / ('launch-error-%d.json' % n)
             record.write_text(json.dumps(dict(order=order_id, run=run_id, **error.details), ensure_ascii=False), encoding='utf-8')
-            api.abandon(self.base, order_id, run_id, 'CLI未启动：%s；详情：%s' % (error, record))
-            self.inflight.pop(run_id, None)
-            saved = rd / 'inflight.json'
-            if saved.exists():
-                saved.unlink()
+            self._cli_failed(order_id, run_id, assignment, n,
+                             'CLI未启动：%s；详情：%s' % (error, record), True, str(record))
             return
         self.inflight[run_id] = {'handle': handle, 'order': order_id, 'assignment': assignment, 'n': n}
         self._persist(run_id)
+
+    def _retry_text(self, order_id, run_id):
+        return ('上次 CLI 调用异常结束，在同一轮中重试一次。原工单：%s；调用记录：%s。\n'
+                '先核对当前文件和可能遗留的任务，再继续原工单；上次输出不代表交付或验证通过。\n' %
+                (self._dir(run_id) / 'card-1.md', self._dir(run_id)))
+
+    def _cli_failed(self, order_id, run_id, assignment, n, reason, not_started=False, source=None):
+        st = api.load(self.base)
+        if st.orders[order_id].get('control_protocol') == 'intent-v1':
+            out = api.cli_failed(self.base, order_id, run_id, reason, n, not_started, source)
+            if out['outcome'] == 'continue':
+                self._pend(run_id, order_id, assignment, self._retry_text(order_id, run_id), None, n + 1)
+                return
+        else:
+            api.abandon(self.base, order_id, run_id, reason, not_started=not_started)
+        self.inflight.pop(run_id, None)
+        saved = self._dir(run_id) / 'inflight.json'
+        if saved.exists():
+            saved.unlink()
 
     def _recover(self, st):
         """Open runs without a live handle were lost with the previous driver: adopt them or mark them INVALID."""
@@ -126,7 +161,18 @@ class Runner(object):
                 continue
             saved = self._dir(run['run_id']) / 'inflight.json'
             if saved.is_file():
-                self.inflight[run['run_id']] = json.loads(saved.read_text(encoding='utf-8'))
+                info = json.loads(saved.read_text(encoding='utf-8'))
+                receipt = run.get('segment_receipts', {}).get(str(info['n']))
+                if receipt and receipt['outcome'] == 'continue':
+                    retry = receipt.get('kind') == 'cli_retry'
+                    text = self._retry_text(o['id'], run['run_id']) if retry else cards.continue_prompt(
+                        o['id'], receipt['reason'], run['continuations'], st.plan['policy']['continue_limit'],
+                        str(self._dir(run['run_id']) / 'card-1.md'), legacy=run.get('delivery_protocol') != 'intent-v1')
+                    self._pend(run['run_id'], o['id'], info['assignment'], text, None if retry else run.get('session'), info['n'] + 1)
+                elif info.get('launching'):
+                    api.abandon(self.base, o['id'], run['run_id'], 'CLI启动交接状态不明；核实运行记录后由负责人处置')
+                else:
+                    self.inflight[run['run_id']] = info
             else:
                 api.abandon(self.base, o['id'], run['run_id'], 'driver lost the run before launch')
 
@@ -139,24 +185,29 @@ class Runner(object):
             if res is None:
                 continue
             progress = True
-            if res.get('invalid'):  # tool failure, not a technical result: free of charge, bounded by invalid_retry
-                api.abandon(self.base, info['order'], run_id, 'CLI unusable: %s' % '; '.join(res.get('problems') or ['unknown']))
-                del self.inflight[run_id]
-                saved = self._dir(run_id) / 'inflight.json'
-                if saved.exists():
-                    saved.unlink()
+            if res.get('invalid'):  # A failed invocation, never an engineering result.
+                reason = 'CLI unusable: %s' % '; '.join(res.get('problems') or ['unknown'])
+                if res.get('uncertain'):
+                    api.abandon(self.base, info['order'], run_id, reason)
+                    del self.inflight[run_id]
+                    saved = self._dir(run_id) / 'inflight.json'
+                    if saved.exists():
+                        saved.unlink()
+                else:
+                    self._cli_failed(info['order'], run_id, info['assignment'], info['n'], reason,
+                                     res.get('not_started', False), res.get('source'))
                 continue
             out = api.deliver(self.base, info['order'], run_id, res.get('text') or '', events=res.get('events') or (),
                               decision=res.get('decision'), conversation_id=res.get('conversation_id'),
-                              session_kb=res.get('session_kb'))
+                              session_kb=res.get('session_kb'), segment=info['n'])
             st = api.load(self.base)
             if out['outcome'] == 'continue':
                 k = next(r for r in st.orders[info['order']]['runs'] if r['run_id'] == run_id)['continuations']
                 text = cards.continue_prompt(info['order'], out['reason'], k, st.plan['policy']['continue_limit'],
-                                             str(self._dir(run_id) / 'card-1.md'))
-                if st.stopped:
-                    self._pend(run_id, info['order'], info['assignment'], text, res.get('conversation_id'), info['n'] + 1)
-                else:
+                                             str(self._dir(run_id) / 'card-1.md'),
+                                             legacy=st.orders[info['order']].get('control_protocol') != 'intent-v1')
+                self._pend(run_id, info['order'], info['assignment'], text, res.get('conversation_id'), info['n'] + 1)
+                if not st.stopped:
                     self._launch(st, info['order'], run_id, info['assignment'], text, res.get('conversation_id'), info['n'] + 1)
             else:
                 del self.inflight[run_id]

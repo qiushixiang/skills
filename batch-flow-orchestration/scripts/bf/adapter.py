@@ -139,7 +139,9 @@ class AgentCliAdapter(object):
             except (ValueError, IndexError):
                 report = {}
         if not report.get('usable'):
-            return {'invalid': True, 'text': '', 'problems': report.get('problems') or ['no usable result (exit.json missing or collect failed)']}
+            return {'invalid': True, 'not_started': report.get('launch_error', {}).get('started') is False,
+                    'source': str(cli_dir), 'uncertain': not finished, 'text': '',
+                    'problems': report.get('problems') or ['no usable result (exit.json missing or collect failed)']}
         cid = report.get('conversation_id')
         if cid:
             sessions = self._sessions()

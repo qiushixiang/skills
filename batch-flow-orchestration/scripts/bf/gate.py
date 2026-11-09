@@ -12,11 +12,12 @@ FINDING = re.compile(_LEAD + r'阻断' + _SEP + r'(\S+?)[ \t]*[|｜][ \t]*返修
                      r'方案级[ \t]*[:：][ \t]*(是|否)[ \t]*[|｜][ \t]*关闭条件[ \t]*[:：][ \t]*(.+?)\s*$', re.M)
 SUCCESS = {'implement': ('VERIFIED',), 'repair': ('VERIFIED',), 'review': ('RELEASE', 'FIX_REQUIRED'),
            'decide': ('VERIFIED',), 'triage': ('VERIFIED',)}
-ACTIONS = ('open', 'supersede', 'retry', 'plan_revision', 'grant', 'ask_user', 'refresh_design', 'authorize', 'blocked')
+ACTIONS = ('settle', 'open', 'supersede', 'retry', 'plan_revision', 'grant', 'ask_user', 'refresh_design', 'authorize', 'blocked')
 OPENABLE = ('implement', 'repair', 'review', 'triage')
 ACTION_FIELDS = {
+    'settle': {'settle', 'charge', 'reason'},
     'open': {'open', 'target', 'input', 'needs', 'allow_protected', 'fresh_session'},
-    'authorize': {'authorize', 'paths'}, 'retry': {'retry', 'reason', 'fresh_session'},
+    'authorize': {'authorize', 'paths'}, 'retry': {'retry', 'reason', 'fresh_session', 'performer'},
     'supersede': {'supersede', 'reason'}, 'grant': {'grant'}, 'ask_user': {'ask_user', 'options', 'user_request'},
     'blocked': {'blocked', 'reason', 'missing'},
     'plan_revision': {'plan_revision', 'within_authorization', 'revalidate'}, 'refresh_design': {'refresh_design'},
@@ -65,7 +66,8 @@ def parse(text, base):
     issue = field(text, '上升问题')
     return {'result': m.group(1) if m else None, 'why': field(text, '停止原因'), 'issue': issue,
             'blocker': field(text, '问题标识')[:200],
-            'has_issue': bool(issue) and not issue.startswith('无'),
+            'has_issue': bool(issue) and issue not in ('无', '无。'),
+            'intent': field(text, '下一步'), 'handoff': field(text, '移交说明'),
             'findings': [{'id': a, 'target': b, 'plan_level': c == '是', 'closure': d}
                          for a, b, c, d in FINDING.findall(text or '')],
             'candidates': candidates(text), 'suggestions': candidates(text, '非阻断建议'), 'evidence': cited_evidence(base, text),
@@ -137,6 +139,18 @@ def validate_decision(state, decision, order=None):
         return '解除阻塞的裁决须有结构化处置；空动作不能宣布恢复'
     if len(decision['actions']) > 1 and any(isinstance(a, dict) and 'ask_user' in a for a in decision['actions']):
         return 'ask_user 用于独立方向问题；状态变更用结构化动作整包自动请求批准，不能混合重复提问'
+    settlements = {}
+    for a in decision['actions']:
+        if isinstance(a, dict) and 'settle' in a:
+            rid = a['settle']
+            if not isinstance(rid, str) or type(a.get('charge')) is not int or a['charge'] not in (0, 1):
+                return 'settle 需要 run_id 与 charge 整数 0/1'
+            if rid in settlements and settlements[rid] != a['charge']:
+                return '同一运行结算冲突'
+            settlements[rid] = a['charge']
+    if order and order['input'].get('accounting_only'):
+        if len(decision['actions']) != 1 or list(settlements) != [order['input']['run']]:
+            return '预算结算单仅可结算指定运行，不得审阅或恢复工程工作'
     for a in decision['actions']:
         kinds = [k for k in ACTIONS if isinstance(a, dict) and k in a]
         if len(kinds) != 1:
@@ -144,6 +158,20 @@ def validate_decision(state, decision, order=None):
         k = kinds[0]
         if set(a) - ACTION_FIELDS[k]:
             return '%s 含不支持的动作字段，不能静默忽略处置要求' % k
+        if k == 'settle':
+            from . import policy
+            found = [(o, r) for o in state.orders.values() for r in o['runs'] if r['run_id'] == a[k]]
+            subject = state.orders.get(order['input'].get('subject')) if order else None
+            if len(found) != 1 or not subject:
+                return 'settle 须引用本裁决对象的运行'
+            owner, run = found[0]
+            if owner['type'] not in ('implement', 'repair', 'review') or not run.get('budget_managed') or not run['ended'] or policy.budget_key(owner) != policy.budget_key(subject):
+                return 'settle 须为同预算已结束的新预算协议技术运行；旧记录沿用历史修复流程'
+            old = owner.get('settlements', {}).get(run['run_id'])
+            if old and old['charge'] != a['charge']:
+                return '已结算运行不能改写'
+            if not isinstance(a.get('reason'), str) or not a['reason'].strip():
+                return '结算须说明依据'
         if k == 'ask_user':
             reason = questions.validate(a.get('user_request'))
             if reason:
@@ -176,6 +204,8 @@ def validate_decision(state, decision, order=None):
                      'review': plan['review_groups'], 'triage': {b['id'] for b in plan['batches']}}
             if target not in known[kind] or not isinstance(inp, dict):
                 return 'open 动作的类型与目标不匹配'
+            if 'accounting_only' in inp:
+                return 'accounting_only 是内部结算单标记，open 不能声明'
             for paths in (a.get('allow_protected'), inp.get('allow_protected'), inp.get('required_protected')):
                 if paths is not None and (not isinstance(paths, list) or any(not model.valid_exact_path(p) for p in paths)):
                     return 'open 的权限清单须为精确仓库相对路径'
@@ -203,6 +233,16 @@ def validate_decision(state, decision, order=None):
                     pending.extend(state.orders[n]['needs'])
         if k in ('supersede', 'retry') and a[k] not in state.orders:
             return '%s 指向不存在的工单' % k
+        if k == 'retry':
+            from . import policy
+            obj = state.orders[a[k]]
+            if obj['state'] not in ('open', 'failed'):
+                return 'retry 只能恢复未完成且未运行的工单'
+            if any(not r['ended'] or r['run_id'] not in settlements for _, r in policy.unsettled(state, obj)):
+                return 'retry 前须明确结算全部待定运行'
+            if obj.get('control_protocol') == 'intent-v1' or 'performer' in a:
+                if obj['type'] not in ('implement', 'repair') or a.get('performer') not in dict(policy.ladder(plan, obj)) or not isinstance(a.get('reason'), str) or not a['reason'].strip():
+                    return '实施/返修 retry 须显式选择 performer 并说明继续依据'
         if k == 'grant' and not isinstance(a['grant'], dict):
             return 'grant 须为 {目标: {额度项: 增量}}'
         if k == 'grant':
@@ -225,7 +265,25 @@ def validate_decision(state, decision, order=None):
             from . import changes
             if a['within_authorization'] is not True or not changes.internal_revision(plan, a['plan_revision']):
                 return '包络内计划调整不得改变目标、验收、权限、预算、资源或必需审阅；实质变化转用户'
+    subject = state.orders.get(order['input'].get('subject')) if order else None
+    if subject and subject.get('awaiting_disposition') and not order['input'].get('accounting_only'):
+        if not any(a.get(k) == subject['id'] for a in decision['actions'] for k in ('retry', 'blocked', 'supersede')) and not any('ask_user' in a for a in decision['actions']):
+            return '移交须明确恢复、保留阻塞或替换原单，不能只结算后自动恢复'
     return ''
+
+
+def judge_intent(order, text, run=None):
+    if run and run.get('controlled_wrapper'):
+        return False, '受控入口须按工单直接调用；包装调用先纠正，不能据此判定环境故障'
+    rows = re.findall(_LEAD + '下一步' + _SEP + r'(.*)$', text or '', re.M)
+    intent = field(text, '下一步')
+    if len(rows) != 1 or intent not in ('继续', '交付', '移交') or field(text, '结果') or field(text, '停止原因'):
+        return False, '须恰有一个下一步：继续/交付/移交，不混用旧协议'
+    if order['type'] == 'repair' and intent == '交付':
+        tail = text[text.find('阻断关闭'):] if '阻断关闭' in text else ''
+        if any(not re.search(r'(?<![\w])%s\s*=' % re.escape(f['id']), tail) for f in order['input'].get('findings', [])):
+            return False, '交付须逐项报告阻断关闭'
+    return True, intent
 
 
 def judge(state, order, run, p, decision, text):

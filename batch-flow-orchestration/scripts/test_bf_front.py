@@ -19,6 +19,8 @@ SWAP = '/home/u/.local/bin/codex-swap'
 
 class Base(unittest.TestCase):
     def setUp(self):
+        from test_bf_legacy_support import legacy_runtime
+        legacy_runtime(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.base = self.root / 'task' / '.batch-flow'
@@ -161,6 +163,8 @@ class Prompt(unittest.TestCase):  # §22.4
 
 class Launcher(Base):
     def setUp(self):
+        from test_bf_legacy_support import legacy_runtime
+        legacy_runtime(self)
         super().setUp()
         self.shortcut = self.root / 'start-batch-flow.sh'
         self.shortcut.symlink_to(HERE / 'start-batch-flow.sh')

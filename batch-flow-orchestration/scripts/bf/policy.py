@@ -33,13 +33,34 @@ def ladder(plan, order, strict=True):
     return [(s, n) for s, n in chain if n > 0 and STAGE_ROLE[s] in plan['roles']]
 
 
+def charge(order, run):
+    entry = order.get('settlements', {}).get(run['run_id'])
+    if entry is not None:
+        return entry['charge']
+    if run.get('budget_managed'):
+        return None
+    return int(not run.get('exempt') and run['run_id'] not in order.get('budget_credits', {}))
+
+
+def unsettled(state, order):
+    return [(o, r) for o in state.orders.values() if budget_key(o) == budget_key(order)
+            for r in o['runs'] if r.get('budget_managed') and charge(o, r) is None]
+
+
+def committed(state, order):
+    out = spent(state, order)
+    for o, r in unsettled(state, order):
+        out[r['performer']] = out.get(r['performer'], 0) + 1
+    return out
+
+
 def used(order):
     """Charged runs per performer stage (exempt runs are free)."""
     out = {}
     if order['type'] in ('decide', 'triage'):
         return out
     for run in order['runs']:
-        if run['ended'] and not run.get('exempt') and run['run_id'] not in order.get('budget_credits', {}):
+        if run['ended'] and charge(order, run) == 1:
             out[run['performer']] = out.get(run['performer'], 0) + 1
     return out
 
@@ -69,7 +90,10 @@ def stage(plan, order, state=None):
         consumed = {'lead': sum(bool(r['ended']) and not r.get('exempt')
                                for r in order['runs'][order.get('coordination_floor', 0):])}
     else:
-        consumed = spent(state, order) if state is not None else used(order)
+        consumed = committed(state, order) if state is not None else used(order)
+    if order.get('control_protocol') == 'intent-v1':
+        selected = order.get('performer')
+        return next((s for s, n in ladder(plan, order) if s == selected and consumed.get(s, 0) < n), None)
     for s, n in ladder(plan, order):
         if consumed.get(s, 0) < n:
             return s
@@ -81,8 +105,16 @@ def over_budget(plan, order, state=None):
     allowed = {}
     for s, n in ladder(plan, order, strict=False):
         allowed[s] = allowed.get(s, 0) + n
-    consumed = spent(state, order) if state is not None else used(order)
+    consumed = committed(state, order) if state is not None else used(order)
     return [s for s, n in consumed.items() if n > allowed.get(s, 0)]
+
+
+def next_performer(state, order, current):
+    """Advance the configured ladder; pending charges reserve their original stage only."""
+    stages = ('primary', 'backup', 'lead')
+    consumed = committed(state, order)
+    return next((s for s, n in ladder(state.plan, order)
+                 if stages.index(s) > stages.index(current) and consumed.get(s, 0) < n), None)
 
 
 def assign(state, order_id):
@@ -90,6 +122,7 @@ def assign(state, order_id):
     order = state.orders[order_id]
     need(order['type'] in STAFFED, '%s orders are not dispatched to a role' % order['type'])
     need(order['state'] == 'open', 'order %s is %s, not open' % (order_id, order['state']))
+    need(not order.get('awaiting_disposition'), 'order awaits technical lead disposition')
     s = stage(state.plan, order, state)
     need(s is not None, 'order %s: performer chain exhausted' % order_id)
     role = STAGE_ROLE[s]

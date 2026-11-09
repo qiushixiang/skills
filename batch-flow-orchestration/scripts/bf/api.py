@@ -6,7 +6,7 @@ from pathlib import Path
 from . import evidence as evidence_mod, gate, model, policy, register, routing, context, snap, permissions
 from .store import BfError, State, load, need, now, transact
 
-__all__ = ['driver_event', 'watch', 'watch_lines', 'driver_status', 'retry', 'escalate', 'report_text', 'abandon', 'report', 'BfError', 'init', 'load', 'orders', 'runnable', 'assign', 'start', 'deliver', 'release', 'answer',
+__all__ = ['driver_event', 'watch', 'watch_lines', 'driver_status', 'retry', 'escalate', 'report_text', 'abandon', 'cli_failed', 'report', 'BfError', 'init', 'load', 'orders', 'runnable', 'assign', 'start', 'deliver', 'release', 'answer',
            'revise_plan', 'stop', 'resume', 'broken_evidence']
 
 
@@ -58,6 +58,10 @@ def start(base, order_id, conversation_id=None, expected_revision=None, request_
             need(conversation_id not in context.author_sessions(st, o), 'a session that authored the work cannot review it (I4)')
         run = new_run(order_id, len(o['runs']) + 1, a['stage'], a['tool'], a['model'], a['effort'], conversation_id,
                       a['session']['mode'], a['session']['rule'])
+        protocol = o.get('control_protocol')
+        if protocol in ('intent-v1', 'review-v1'):
+            run['delivery_protocol'] = protocol
+            run['budget_managed'] = True
         if dispatch is not None:
             run['dispatch'] = {key: {'path': str(Path(path).resolve()), 'sha256': gate_hash(path)}
                                for key, path in dispatch.items()}
@@ -93,8 +97,8 @@ def preflight(base):
 
 
 def deliver(base, order_id, run_id, text, events=(), decision=None, conversation_id=None, session_kb=None,
-            version=None, card=None, expected_revision=None, request_id=None, actor='driver'):
-    def fn(st):
+            version=None, card=None, expected_revision=None, request_id=None, actor='driver', segment=None):
+    def register_segment(st):
         previous_pauses = {key: value.get('ops') for key, value in st.orders.items()}
         o = routing.get(st, order_id)
         run = next((r for r in o['runs'] if r['run_id'] == run_id), None)
@@ -111,6 +115,20 @@ def deliver(base, order_id, run_id, text, events=(), decision=None, conversation
             run['session_kb'] = (run.get('session_kb') or 0) + session_kb
         run['card'] = card or run['card']
         run['last_ts'] = time.time()
+        run['evidence'].update((path, gate_hash(path)) for path in p['evidence'])
+        run['citations'] = p['citations']
+        run['version'] = p['version'] or version or (' '.join(run['snapshot']) if run['snapshot'] else run.get('version'))
+        if run.get('delivery_protocol') == 'intent-v1':
+            from . import execution
+            return execution.deliver(st, o, run, p, text, version)
+        if run.get('delivery_protocol') == 'review-v1' and p['result'] not in ('RELEASE', 'FIX_REQUIRED'):
+            legal, reason = False, '新审阅协议须交付 RELEASE/FIX_REQUIRED；其他结果需负责人处置'
+        if run.get('delivery_protocol') == 'review-v1' and not legal:
+            from . import execution
+            run.update(ended=now(), ended_ts=time.time(), delivery=text, result='HANDOFF', stop_reason=reason)
+            o['state'] = 'open'
+            execution.coordinate(st, o, run, reason)
+            return {'run_id': run_id, 'legal': False, 'reason': reason, 'outcome': 'registered', 'result': 'HANDOFF', 'opened': list(st.opened)}
         k = run['continuations'] + 1
         out = {'run_id': run_id, 'legal': legal, 'reason': reason if not legal else p['result'], 'opened': []}
         if not legal and k <= st.plan['policy']['continue_limit']:
@@ -130,6 +148,20 @@ def deliver(base, order_id, run_id, text, events=(), decision=None, conversation
         register.on_registered(st, o, run, p, legal, decision)
         out.update(outcome='registered', result=run['result'], opened=list(st.opened),
                    paused=[key for key, value in st.orders.items() if value.get('ops') and value['ops'] != previous_pauses.get(key)])
+        return out
+    def fn(st):
+        if segment is None:
+            return register_segment(st)
+        need(type(segment) is int and segment > 0, 'segment must be a positive integer')
+        o = routing.get(st, order_id)
+        run = next((r for r in o['runs'] if r['run_id'] == run_id), None)
+        need(run is not None, 'unknown run')
+        receipts = run.setdefault('segment_receipts', {})
+        if str(segment) in receipts:
+            return receipts[str(segment)]
+        need(segment == run['segments'] + 1, 'segment is out of sequence')
+        out = register_segment(st)
+        receipts[str(segment)] = out
         return out
     return transact(base, 'deliver', actor, fn, expected_revision, request_id)
 
@@ -221,7 +253,7 @@ def driver_event(base, kind, pid=None):
     return transact(base, kind, 'driver', lambda st: pid or os.getpid())
 
 
-def abandon(base, order_id, run_id, reason, expected_revision=None, request_id=None, actor='driver'):
+def abandon(base, order_id, run_id, reason, expected_revision=None, request_id=None, actor='driver', not_started=False):
     """A lost process is INVALID; prior received segments retain their charge and normal recovery routing."""
     def fn(st):
         o = routing.get(st, order_id)
@@ -230,6 +262,14 @@ def abandon(base, order_id, run_id, reason, expected_revision=None, request_id=N
         _capture(st, run)
         run.update(ended=now(), result='INVALID', stop_reason=reason, exempt=not bool(run.get('segments')))
         o['state'] = 'open'
+        if run.get('budget_managed'):
+            from . import execution
+            run['exempt'] = bool(not_started and not run.get('segments'))
+            if run['exempt']:
+                o.setdefault('settlements', {})[run_id] = {'charge': 0, 'reason': reason, 'source': 'mechanical_not_started'}
+            else:
+                execution.coordinate(st, o, run, reason)
+                return run_id
         tail = 0
         for r in reversed(o['runs'][o.get('invalid_floor', 0):]):
             if r['result'] != 'INVALID':
@@ -241,6 +281,104 @@ def abandon(base, order_id, run_id, reason, expected_revision=None, request_id=N
         routing.check_exhausted(st, o)
         return run_id
     return transact(base, 'abandon', actor, fn, expected_revision, request_id)
+
+
+def cli_failed(base, order_id, run_id, reason, segment, not_started=False, source=None):
+    """Confirmed failed CLI invocation: retry once in this run, then advance the executor ladder.
+
+    Unknown/lost processes and explicit user stops still use abandon, never this recovery path.
+    """
+    def fn(st):
+        from . import execution
+        o = routing.get(st, order_id)
+        need(o.get('control_protocol') == 'intent-v1', 'CLI recovery requires an execution intent order')
+        run = next((r for r in o['runs'] if r['run_id'] == run_id), None)
+        need(run is not None, 'unknown run')
+        receipts = run.setdefault('segment_receipts', {})
+        if str(segment) in receipts:
+            return receipts[str(segment)]
+        need(run['ended'] is None and o['state'] == 'running', 'no running call')
+        need(type(segment) is int and segment == run['segments'] + 1, 'segment is out of sequence')
+        _capture(st, run)
+        failures = run.setdefault('cli_failures', [])
+        consecutive = bool(failures and failures[-1]['segment'] == segment - 1)
+        failures.append({'segment': segment, 'reason': reason, 'not_started': bool(not_started),
+                         'source': source, 'ended': now()})
+        run['segments'] = segment
+        if not consecutive:
+            out = {'outcome': 'continue', 'kind': 'cli_retry', 'reason': reason}
+        else:
+            whole_unstarted = len(failures) == run['segments'] and all(f['not_started'] for f in failures)
+            run.update(ended=now(), ended_ts=time.time(), result='INVALID', stop_reason=reason, exempt=whole_unstarted)
+            o['state'] = 'open'
+            if whole_unstarted:
+                o.setdefault('settlements', {})[run_id] = {
+                    'charge': 0, 'reason': reason, 'source': 'mechanical_not_started'}
+            selected = policy.next_performer(st, o, run['performer'])
+            if selected:
+                if not whole_unstarted:
+                    execution.coordinate(st, o, run, reason, accounting=True)
+                o['performer'] = selected
+                o['fresh_next'] = True
+                o['input']['recovery'] = {'source': run_id, 'instruction':
+                    '上一执行者连续两次 CLI 调用异常结束；按计划阶梯接手原工单。'
+                    '先核对原始调用记录、当前文件及可能遗留的任务，确认已做与未完成事项后继续；'
+                    '不把异常结束视作交付或验证通过。调用记录：%s' % (st.base.resolve() / 'records' / 'runs' / run_id)}
+            else:
+                execution.coordinate(st, o, run, '连续两次 CLI 调用异常结束，已无下一执行者：' + reason)
+            out = {'outcome': 'registered', 'result': 'INVALID', 'next_performer': selected}
+        receipts[str(segment)] = out
+        return out
+    return transact(base, 'cli_failed', 'driver', fn)
+
+
+def restore_review(base, order_id, run_id, approval, expected_revision=None, request_id=None, actor='user'):
+    """Recover a submitted repair reopened by a review pinned to a pre-repair version.
+
+    This repairs routing only: the submitted work still requires independent review.
+    Run facts, settlements, findings and all budget limits remain unchanged.
+    """
+    ref = model.approval_ref(approval)
+
+    def fn(st):
+        repair = routing.get(st, order_id)
+        need(repair['type'] == 'repair' and repair['state'] == 'open', 'expected an open repair')
+        need(not any(o['state'] == 'running' for o in st.orders.values()), 'collect running calls first')
+        need(repair['runs'] and repair['runs'][-1]['run_id'] == run_id, 'only the latest repair call can be restored')
+        run = repair['runs'][-1]
+        need(run['ended'] and run['result'] == 'SUBMITTED', 'latest repair must already be submitted')
+        need(not policy.unsettled(st, repair), 'settle pending calls first')
+        need((repair.get('output') or {}).get('run') == run_id, 'repair output does not match submitted call')
+        review = routing.get(st, repair['input']['review_order'])
+        need(review['type'] == 'review' and review['state'] == 'open', 'expected an open independent review')
+        need(routing.current_work(st, repair) and routing.current_work(st, review), 'obsolete contract')
+        recovery = review['input'].get('recovery') or {}
+        source = st.orders.get(recovery.get('source'))
+        need(source is not None and source['type'] == 'decide' and source['state'] == 'done' and source['runs'],
+             'missing prior recovery instruction source')
+        need(source['runs'][-1]['ended'] <= run['started'], 'recovery instruction is not older than repair')
+        need(review['runs'] and review['runs'][-1]['result'] == 'FIX_REQUIRED', 'expected a failed stale review')
+        fixed = re.search(r'固定版本[：:]\s*([^\n]+)', review['runs'][-1].get('delivery', ''))
+        def refs(text):
+            return set(re.findall(r'/[^\s\[\]()，；。]+', text or ''))
+        reviewed = refs(fixed.group(1)) if fixed else set()
+        submitted = refs(run.get('version')) | set(run.get('snapshot', []))
+        need(reviewed and submitted and not reviewed & submitted,
+             'review is not demonstrably pinned to a different version')
+        older = [r for o in st.orders.values() if o['target'] == repair['target'] and o['type'] in ('implement', 'repair')
+                 for r in o['runs'] if r.get('ended') and r['ended'] <= run['started'] and r.get('version')]
+        need(any(reviewed & (refs(r['version']) | set(r.get('snapshot', []))) for r in older),
+             'review version is not a known older delivery')
+        need(all(st.orders[n]['state'] in routing.SATISFIED for n in repair['needs'] if n in st.orders),
+             'repair still has unresolved dependencies')
+        prior = repair.pop('ops', None)
+        repair.pop('awaiting_disposition', None)
+        repair['state'] = 'done'
+        repair.setdefault('ops_log', []).append({'op': 'restore_review', 'run': run_id,
+            'review': review['id'], 'prior_problem': prior, 'approval': ref, 'at': now()})
+        routing.refresh_review_recovery(st, repair)
+        return {'repair': order_id, 'run': run_id, 'review': review['id'], 'budget_changed': False}
+    return transact(base, 'restore_review', actor, fn, expected_revision, request_id)
 
 
 def retry(base, order_id, note, expected_revision=None, request_id=None, actor='front'):
@@ -306,13 +444,15 @@ def report(base, recent=10):
     for o in routing.sorted_orders(st):
         for r in o['runs']:
             item = {'observations': r.get('observations', []), 'order': o['id'], 'type': o['type'], 'target': o['target'], 'run': r['run_id'],
-                    'performer': r['performer'], 'started': r['started']}
+                    'performer': r['performer'], 'started': r['started'],
+                    'budget_pending': bool(r.get('budget_managed') and policy.charge(o, r) is None)}
             if r['ended']:
                 if r['performer'] == 'imported':
                     continue
                 charge = ('coordination' if o['type'] in ('decide', 'triage') else
                           'credited' if r['run_id'] in o.get('budget_credits', {}) else
-                          'exempt' if r['exempt'] else 'technical')
+                          'pending' if r.get('budget_managed') and policy.charge(o, r) is None else
+                          'exempt' if policy.charge(o, r) == 0 else 'technical')
                 item.update(result=r['result'], stop_reason=r['stop_reason'], ended=r['ended'], exempt=r['exempt'],
                             budget_charge=charge)
                 ended.append(item)
@@ -330,7 +470,7 @@ def report(base, recent=10):
             finished.add(d)
             continue
         owner = impls[-1] if impls else next((o for o in orders(st, type='implement', target=d)), None)
-        budgets[d] = sum(max(n - policy.spent(st, owner).get(s, 0), 0) for s, n in policy.ladder(plan, owner)) if owner else 0
+        budgets[d] = sum(max(n - policy.committed(st, owner).get(s, 0), 0) for s, n in policy.ladder(plan, owner)) if owner else 0
     for item in running:
         item['label'] = label(plan, item['target'])
         item.update(_who_run(st, item))
@@ -363,7 +503,7 @@ def report(base, recent=10):
         item['label'] = label(plan, item['target'])
     ended.sort(key=lambda x: x['ended'])
     return {'revision': st.revision, 'stopped': st.stopped, 'running': running, 'recent': ended[-recent:], 'ask_user': ask,
-            'budgets': budgets, 'runnable': runnable_ids, 'roles': plan['roles'], 'next': nxt, 'batches': batches,
+            'budgets': budgets, 'budget_pending': [r for r in running + ended if r['budget_pending']], 'runnable': runnable_ids, 'roles': plan['roles'], 'next': nxt, 'batches': batches,
             'ops': ops, 'name': plan.get('name', ''), 'driver': driver_status(base), 'broken_evidence': routing.broken_paths(st)}
 
 
