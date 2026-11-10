@@ -12,7 +12,7 @@ def internal_revision(old, path):
         return False
     for target, spec in new['deliverables'].items():
         before = old['deliverables'][target]
-        for key in ('batch', 'depends_on', 'resources', 'no_review', 'required_protected'):
+        for key in ('batch', 'depends_on', 'resources', 'no_review', 'required_protected', 'execution'):
             if spec.get(key) != before.get(key):
                 return False
     return True

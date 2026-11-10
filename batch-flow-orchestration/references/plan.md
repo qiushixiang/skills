@@ -8,6 +8,8 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow init --plan plan.
 
 修订用 `revise`，同样需要用户原话文件。已经用掉的额度不能被修订收回。
 
+执行轮次以[统一轮次模型](execution-cycles.md)为准；新计划不配置独立实施、返修或审阅额度。已有计划可在新增交付目标的 `execution` 中声明 cycles-v1 及 primary/backup/lead 轮次，同一份计划管理新旧批次，不改变旧目标计数；示例见轮次指南。
+
 ## 结构
 
 ```json
@@ -23,8 +25,9 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow init --plan plan.
     "third_party": {"tool": "codex", "model": "…", "effort": "medium"}
   },
   "policy": {
-    "rounds": {"implement": 3, "backup": 1, "lead": 1, "repair": 2, "review": 7, "decide_per_source": 2, "invalid_retry": 2, "coordination_attempts": 2},
-    "overrides": {"<交付目标>": {"implement": 4}},
+    "execution_model": "cycles-v1",
+    "rounds": {"primary": 2, "backup": 1, "lead": 1, "decide_per_source": 2, "invalid_retry": 2, "coordination_attempts": 2},
+    "overrides": {"<交付目标>": {"primary": 3}},
     "context": {"max_session_kb": 300},
     "continue_limit": 2
   },
@@ -58,11 +61,11 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow init --plan plan.
 - **授权包络**：`envelope.batches` 是用户批准可自主推进的批次；可选 `envelope.protected: {"目标": ["精确仓库相对路径"]}` 预授限定路径权限。预授权只覆盖指定目标和路径，仍遵守设计中的修改内容、验收和审阅要求。包络外的工作由脚本转交用户。
 - **派发需求**：已知实施需要改保护路径时，在交付目标的 `required_protected` 列出精确路径，驱动器在派发前检查。它声明需求，不授予权限；不要把已知需求只藏在指令文字里。
 - **环境**：需要宿主权限的验证只经 `env.entry` 受控入口；`blocked_output` 写入口自身的环境失败输出，作为环境诊断事实，由角色判断是否阻塞。
-- 编制时必须配套审阅预算，不能依赖默认额度或运行中再追加。单目标保守预留 `max(1, implement) + repair + backup + lead`；未配置备用角色时不计 backup。合并审阅组按 `1 + Σ(各目标预留 - 1)` 预留，联合首审只计一次，各目标返修机会分别覆盖；第三方审阅组独立配额。所有值使用目标/审阅组 override 后的实际额度。
+- 配置各目标 primary/backup/lead 执行轮次；每轮最多两次交付，审阅容量按 `1 + Σ(2 × 目标可用轮次合计 - 1)` 自动计算，各独立审阅组分别配套。不得额外填写 repair/review，也不设置审阅组作者轮次 override。
 
 ## 修订、额度与版本
 
-- 实施额度由同一交付目标的全部实施单共享；返修额度由同一审阅周期与返修目标共享；审阅额度由同一审阅组共享。换单、换上下文和修订计划不重置用量。追加审阅额度用 `grant <审阅组> --review N --approval F`。
+- 执行轮次由同一交付目标全部实施/返修单共享，返修引用原轮 ID；各审阅组共享自身调用用量。增额用 `grant <交付目标> --primary|--backup|--lead N --approval F`，审阅容量自动配套；换单、换上下文和修订不重置用量。legacy-v1 的分账和审阅增额只用于历史任务。
 - `contract_version` 记录契约版本。文字或引用变化不自动重做工作；负责人用 `revalidate` 明确选择需重做目标，其余历史结论保留，由角色判断适用性。
 - 有受影响工单正在运行时先停止派发并完成回收，再修订；脚本拒绝混用运行中的旧输入与新契约。新契约仍沿用已消耗的额度，必要时在本次批准中追加。
 - 后续实施与返修统一使覆盖该目标的审阅等待当前工作，已通过的常规/第三方审阅需重新确认；放行等待相应工单完成。
@@ -78,11 +81,11 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow init --plan plan.
 
 ## 协调与额度
 
-`lead` 为兜底实施轮次。decide/triage 使用独立 coordination_attempts（默认每单 2 次）。decide_per_source（默认 2 次）及历史字段 coordination_no_progress（默认 6 次）现仅表示协调调用次数上限，不推断技术进展；额度与权限变化不自动重置次数，运维处置后显式 retry/escalate 开放有界恢复。
+`lead` 为负责人亲自兜底的执行轮次（同样含一次返修），协调不占此数。decide/triage 使用独立 coordination_attempts（默认每单 2 次）。decide_per_source（默认 2 次）及历史字段 coordination_no_progress（默认 6 次）现仅表示协调调用次数上限，不推断技术进展；额度与权限变化不自动重置次数，运维处置后显式 retry/escalate 开放有界恢复。
 
 达到协调上限只暂停受影响路径并报告，不自动询问用户。[六类新增用户决定](user-decisions.md)之外的技术问题由负责人和运维处理。纯技术方案调整可由负责人声明 plan_revision.within_authorization，脚本检查目标、验收、授权、预算、资源、依赖和必需审阅不变后执行；真正改变用户承诺的计划修订仍须批准。
 
-技术调用按 performer 记录；负责人结算 0/1 后计入对应轮次，未结算先占位，不自动爬升执行者。只有明确整次未启动可机械免扣；其余由负责人判断。协调单独记账，历史原记录保留。
+cycles-v1 的初次实施预占一轮，原作者返修引用同一轮 ID；只有明确整次未启动可免扣。新建 delivery-v2 工单已交付直接审阅，未交付进入负责人执行去向与轮次结算裁决，不做质量预审；continue_run 同轮继续不另扣轮次、无正常续作次数上限。continue_limit 仅约束历史协议及审阅/裁决的非法协议修正。复审失败后按配置进入下一轮或换人。legacy-v1 保留原有分账与结算，历史原记录不变。
 
 ## 修订影响
 
@@ -102,4 +105,4 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow init --plan plan.
 
 ### 审阅预算配套脚本门禁
 
-`bf/review_budget.py` 统一计算计划覆盖和派发保留。实施/返修派发前按同一预算账本扣除已用及待结算技术机会，保留剩余独立审阅（至少一次）；审阅使用量按组累计，修订/换单不重置，免扣/冲正按账本处理。缺口由 preflight 记录为 `review_budget_shortfall`，不调用执行角色；直接 start 同样拒绝。追加实施/返修额度须先配足审阅，或在同一批准动作包内同时追加；历史计划不会被静默改额度。
+cycles-v1 的作者轮次和审阅容量来自同一配置，配置/增额自动计算，不维护独立返修账。`review_budget.py` 保留统一容量查询；legacy-v1 的历史缺口与派发门禁保持原样。整个计划默认模型及旧目标计数不原地切换；新增目标可独立声明新模型，不通过修订暗改历史计数。

@@ -90,13 +90,14 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow answer WO-0012 --
 用户随时可以调整，每条都带 `--approval <base>/answers/<n>.txt`（用户原话，一次调整 = 一次修订 + 一条事件）。命令均为 `bf/cli.py --base <任务>/.batch-flow ...`：
 
 - `models <后端>`：只读，查询模型目录；`set-role <角色> --backend B --name '<说法>' [--effort E]`：换角色模型，见 [CLI 适配器](cli-adapter.md)。
-- `envelope --add|--remove <批次>...`：自动推进范围；`grant <交付目标> --implement|--backup|--lead|--repair|--review N` 或 `grant <审阅组> --review N`：只增不减。
+- cycles-v1 增额用 `grant <交付目标> --primary|--backup|--lead N --approval F`，审阅自动配套、不单独增额；旧目标不原地切换模型；新批次可在原计划追加目标级 execution 配置。见[执行轮次](execution-cycles.md)。
+- legacy-v1 历史任务：`envelope --add|--remove <批次>...`：自动推进范围；`grant <交付目标> --implement|--backup|--lead|--repair|--review N` 或 `grant <审阅组> --review N`：只增不减。
 - `hold <交付目标或批次>...` / `unhold ...`：只暂停这一部分；`supersede WO-n --reason R`：作废开立中的工单。
 - 新增或改写交付目标属于计划修订，由技术负责人起草（`revise`），聊天前端不运行 `init`/`revise`。
 
 ## 运维（聊天前端）
 
-新实施/返修交付后，旧审阅的一次性 recovery 指令失效并保留在历史中，下一次审阅续用原审阅会话并核对当前交付，不应用日志大小阈值。新审阅周期回到主执行者，不继承上周期的负责人兜底选择；已用额度仍累计。
+新实施/返修交付后，旧审阅的一次性 recovery 指令失效并保留在历史中，下一次审阅续用原审阅会话并核对当前交付，不应用日志大小阈值。cycles-v1 首次否决交原作者本轮唯一返修，复审失败才进入下一轮或换人；legacy-v1 新审阅周期回到主执行者，已用额度仍累计。
 
 负责人技术裁决与纯预算结算按同一交付目标共用会话，不应用输出日志大小阈值；不同目标分别保持会话。同目标裁决/结算串行派发，结算仍只做记账，不复审质量。会话缺失、工具/模型变化、作者独立性冲突或明确要求 fresh_session 时仍按实际原因处理。
 
@@ -152,6 +153,6 @@ reconcile 支持 paths=[] 且 credits 非空：只审计冲正指定的纯协调
 前端帮助使用完整绑定命令 `<Python> <技能>/scripts/bf/cli.py --base <绑定目录> reconcile --help`；不支持 flow 简写或任意 Python heredoc。读取状态用 Read/Grep/cat，工单在 orders.json 的 orders 字段中。report.ops 不应转成用户选择，只有 report.ask_user 是当前待决。
 
 
-新版技术调用恢复与结算见 [技术负责人](technical-lead.md#执行恢复与执行者选择)。CLI 异常的有限重试和阶梯切换不依赖选人裁决；未结算占原角色额度，结算不成为下一角色或审阅的前置条件。历史协议和运维记录保留，不自动迁移或重启，旧阻塞不会因技能升级自行解除。
+cycles-v1 轮次记账见[执行轮次](execution-cycles.md)。新建 delivery-v2 实施/返修只报告已交付/未交付：已交付直接审阅，未交付由负责人结算裁决执行去向与轮次归属，不做质量预审。同轮继续由 continue_run 绑定原作者和原轮，不另扣轮次，无正常续作次数上限。历史 intent-v1 和在途调用仍按原协议回收；continue_limit 仍约束历史协议及审阅/裁决的非法协议修正。legacy-v1 技术调用恢复与结算见 [技术负责人](technical-lead.md#执行恢复与执行者选择)。CLI 异常的有限重试和阶梯切换独立保留。历史协议和运维记录保留，不自动迁移或重启，旧阻塞不会因技能升级自行解除。
 
 驱动器按 run/segment 在同一事务保存交付或 CLI 异常回执。重启按回执恢复待启动续作或一次异常重试，不重复回收或重置重试次数；启动交接若状态不明则交负责人，不冒充未启动后自动重派。inflight 原子写入，启动意图先于实际启动保存。

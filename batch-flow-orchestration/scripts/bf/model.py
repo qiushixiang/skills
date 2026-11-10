@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 from .store import BfError, need, sha256_file, now
+from . import cycles
 
 DEFAULT_ROUNDS = {'implement': 3, 'backup': 1, 'lead': 1, 'repair': 2, 'review': 7, 'decide_per_source': 2, 'invalid_retry': 2,
                   'coordination_attempts': 2, 'coordination_no_progress': 6}
@@ -43,9 +44,21 @@ def normalize(plan, enforce_review_budget=True):
     p['roles'] = roles
     p.setdefault('workspace', None)
     pol = p.setdefault('policy', {})
-    rounds = dict(DEFAULT_ROUNDS)
+    need(isinstance(pol, dict) and isinstance(pol.get('rounds', {}), dict)
+         and isinstance(pol.get('overrides', {}), dict), 'policy round settings must be objects')
+    legacy_keys = {'implement', 'repair', 'review'}
+    configured = set(pol.get('rounds') or {}) | set(
+        k for row in (pol.get('overrides') or {}).values() if isinstance(row, dict) for k in row)
+    version = pol.setdefault('execution_model', 'legacy-v1' if configured & legacy_keys else cycles.MODEL)
+    need(version in ('legacy-v1', cycles.MODEL), 'unknown policy.execution_model')
+    need(version != 'legacy-v1' or 'primary' not in configured,
+         'primary execution rounds cannot be mixed with legacy implement/repair/review budgets')
+    rounds = dict(cycles.DEFAULTS if cycles.enabled(p) else DEFAULT_ROUNDS)
+    if cycles.enabled(p):
+        need(not (set(pol.get('rounds') or {}) - set(rounds)),
+             'cycles-v1 uses primary/backup/lead rounds; implement/repair/review counts are not configurable')
     rounds.update(pol.get('rounds') or {})
-    need(all(isinstance(v, int) and v >= 0 for v in rounds.values()), 'policy.rounds must be non-negative integers')
+    need(all(type(v) is int and v >= 0 for v in rounds.values()), 'policy.rounds must be non-negative integers')
     pol['rounds'] = rounds
     overrides = pol.setdefault('overrides', {})
     need(isinstance(overrides, dict) and all(isinstance(v, dict) and
@@ -60,6 +73,15 @@ def normalize(plan, enforce_review_budget=True):
     need(dels, 'plan.deliverables required')
     for d, spec in dels.items():
         need(spec.get('batch') in ids, 'deliverable %s: unknown batch' % d)
+        if 'execution' in spec:
+            execution = spec['execution']
+            need(isinstance(execution, dict) and set(execution) <= {'model', 'rounds'}
+                 and execution.get('model') == cycles.MODEL,
+                 'deliverable %s: execution must declare cycles-v1' % d)
+            counts = execution.get('rounds', {})
+            need(isinstance(counts, dict) and all(k in cycles.STAGES and type(n) is int and n >= 0
+                 for k, n in counts.items()), 'deliverable %s: invalid execution rounds' % d)
+            need(not overrides.get(d), 'scoped execution uses its own rounds, not policy.overrides: ' + d)
         validate_required_read(spec.get('required_read', []))
         need(isinstance(spec.get('constraints', []), list) and all(isinstance(x, str) for x in spec.get('constraints', [])), 'constraints must be text list')
         spec.setdefault('title', '')
@@ -79,6 +101,8 @@ def normalize(plan, enforce_review_budget=True):
         need(g not in dels, 'name %s is both a deliverable and a review group' % g)
         members = spec.get('deliverables') or []
         need(members and all(m in dels for m in members), 'review group %s: unknown deliverable' % g)
+        if cycles.enabled(p, g):
+            need(not overrides.get(g), 'review group %s: author rounds belong to deliverables; review capacity is derived' % g)
         spans = set(dels[m]['batch'] for m in members)
         need(len(spans) == 1 or spec.get('batch') in ids, 'review group %s spans batches: explicit batch required' % g)
         spec.setdefault('batch', next(iter(spans)))
@@ -93,6 +117,8 @@ def normalize(plan, enforce_review_budget=True):
         need(isinstance(ng, list) and all(isinstance(x, str) for x in ng), 'deliverable %s: non_goals must be a list of strings' % d)
     covered = set(x for g in groups.values() for x in g['deliverables'])
     for d, spec in dels.items():
+        if cycles.enabled(p, d):
+            need(bool(cycles.limits(p, d)), 'deliverable %s: at least one execution round required' % d)
         need(d in covered or str(spec.get('no_review') or '').strip(),
              'deliverable %s belongs to no review group; add it to one or write no_review: <reason>' % d)
     for d, spec in dels.items():

@@ -3,7 +3,7 @@ import re
 import time
 from pathlib import Path
 
-from . import evidence as evidence_mod, gate, model, policy, register, routing, context, snap, permissions, review_budget
+from . import evidence as evidence_mod, gate, model, policy, register, routing, context, snap, permissions, review_budget, cycles
 from .store import BfError, State, load, need, now, transact
 
 __all__ = ['driver_event', 'watch', 'watch_lines', 'driver_status', 'retry', 'escalate', 'report_text', 'abandon', 'cli_failed', 'report', 'BfError', 'init', 'load', 'orders', 'runnable', 'assign', 'start', 'deliver', 'release', 'answer',
@@ -59,10 +59,14 @@ def start(base, order_id, conversation_id=None, expected_revision=None, request_
             need(conversation_id not in context.author_sessions(st, o), 'a session that authored the work cannot review it (I4)')
         run = new_run(order_id, len(o['runs']) + 1, a['stage'], a['tool'], a['model'], a['effort'], conversation_id,
                       a['session']['mode'], a['session']['rule'])
+        if cycles.enabled(st.plan, o['target']):
+            run['execution_model'] = cycles.MODEL
         protocol = o.get('control_protocol')
-        if protocol in ('intent-v1', 'review-v1'):
+        if protocol in ('intent-v1', 'delivery-v2', 'review-v1'):
             run['delivery_protocol'] = protocol
-            run['budget_managed'] = True
+            run['budget_managed'] = not cycles.enabled(st.plan, o['target'])
+        if cycles.enabled(st.plan, o['target']) and o['type'] in ('implement', 'repair'):
+            cycles.reserve(st, o, run)
         if dispatch is not None:
             run['dispatch'] = {key: {'path': str(Path(path).resolve()), 'sha256': gate_hash(path)}
                                for key, path in dispatch.items()}
@@ -123,6 +127,9 @@ def deliver(base, order_id, run_id, text, events=(), decision=None, conversation
         run['evidence'].update((path, gate_hash(path)) for path in p['evidence'])
         run['citations'] = p['citations']
         run['version'] = p['version'] or version or (' '.join(run['snapshot']) if run['snapshot'] else run.get('version'))
+        if run.get('delivery_protocol') == 'delivery-v2':
+            from . import execution
+            return execution.deliver_status(st, o, run, p, text, version)
         if run.get('delivery_protocol') == 'intent-v1':
             from . import execution
             return execution.deliver(st, o, run, p, text, version)
@@ -267,6 +274,8 @@ def abandon(base, order_id, run_id, reason, expected_revision=None, request_id=N
         _capture(st, run)
         run.update(ended=now(), result='INVALID', stop_reason=reason, exempt=not bool(run.get('segments')))
         o['state'] = 'open'
+        if run.get('execution_cycle'):
+            run['exempt'] = bool(not_started and not run.get('segments'))
         if run.get('budget_managed'):
             from . import execution
             run['exempt'] = bool(not_started and not run.get('segments'))
@@ -296,7 +305,7 @@ def cli_failed(base, order_id, run_id, reason, segment, not_started=False, sourc
     def fn(st):
         from . import execution
         o = routing.get(st, order_id)
-        need(o.get('control_protocol') == 'intent-v1', 'CLI recovery requires an execution intent order')
+        need(o.get('control_protocol') in ('intent-v1', 'delivery-v2'), 'CLI recovery requires an execution order')
         run = next((r for r in o['runs'] if r['run_id'] == run_id), None)
         need(run is not None, 'unknown run')
         receipts = run.setdefault('segment_receipts', {})
@@ -316,12 +325,12 @@ def cli_failed(base, order_id, run_id, reason, segment, not_started=False, sourc
             whole_unstarted = len(failures) == run['segments'] and all(f['not_started'] for f in failures)
             run.update(ended=now(), ended_ts=time.time(), result='INVALID', stop_reason=reason, exempt=whole_unstarted)
             o['state'] = 'open'
-            if whole_unstarted:
+            if whole_unstarted and not cycles.enabled(st.plan, o['target']):
                 o.setdefault('settlements', {})[run_id] = {
                     'charge': 0, 'reason': reason, 'source': 'mechanical_not_started'}
             selected = policy.next_performer(st, o, run['performer'])
             if selected:
-                if not whole_unstarted:
+                if not whole_unstarted and not cycles.enabled(st.plan, o['target']):
                     execution.coordinate(st, o, run, reason, accounting=True)
                 o['performer'] = selected
                 o['fresh_next'] = True
@@ -450,6 +459,7 @@ def report(base, recent=10):
         for r in o['runs']:
             item = {'observations': r.get('observations', []), 'order': o['id'], 'type': o['type'], 'target': o['target'], 'run': r['run_id'],
                     'performer': r['performer'], 'started': r['started'],
+                    'execution_cycle': r.get('execution_cycle'),
                     'budget_pending': bool(r.get('budget_managed') and policy.charge(o, r) is None)}
             if r['ended']:
                 if r['performer'] == 'imported':
@@ -471,7 +481,13 @@ def report(base, recent=10):
     budgets, finished = {}, set()
     for d in plan['deliverables']:
         impls = [o for o in routing.work_for(st, d) if o['type'] == 'implement']
-        if impls and all(o['state'] == 'done' for o in impls):
+        complete = impls and all(o['state'] == 'done' for o in impls)
+        if cycles.enabled(plan, d):
+            complete = complete and all(o['state'] == 'done' for o in routing.work_for(st, d)) and all(
+                o['state'] == 'done' for o in orders(st, type='review')
+                if o['target'] in plan['review_groups'] and routing.current_work(st, o)
+                and d in plan['review_groups'][o['target']]['deliverables'])
+        if complete:
             finished.add(d)
             continue
         owner = impls[-1] if impls else next((o for o in orders(st, type='implement', target=d)), None)
@@ -508,6 +524,7 @@ def report(base, recent=10):
         item['label'] = label(plan, item['target'])
     ended.sort(key=lambda x: x['ended'])
     return {'revision': st.revision, 'stopped': st.stopped, 'running': running, 'recent': ended[-recent:], 'ask_user': ask,
+            'execution_rounds': cycles.report(st),
             'budgets': budgets, 'budget_pending': [r for r in running + ended if r['budget_pending']], 'runnable': runnable_ids, 'roles': plan['roles'], 'next': nxt, 'batches': batches,
             'ops': ops, 'name': plan.get('name', ''), 'driver': driver_status(base), 'broken_evidence': routing.broken_paths(st)}
 

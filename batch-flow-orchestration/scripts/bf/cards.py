@@ -14,6 +14,9 @@ LEGACY_EXECUTOR = ['结果：VERIFIED | FAILED | ARCH_DECISION_REQUIRED | WAIT_E
 LEGACY_EXECUTOR.insert(-2, '问题标识：<待裁决时可选，复用同一问题标识>')
 EXECUTOR = ['下一步：继续 | 交付 | 移交', '改动与版本：<提交或快照>', '验证证据：<records/ 下记录路径>',
             '未完成与限制：...', '移交说明：<移交时说明原因、已尝试方法和所需处置>', '候选新项：（可选）']
+DELIVERY_EXECUTOR = ['交付状态：已交付 | 未交付', '改动与版本：<提交或快照>',
+            '验证证据：<records/ 下记录路径>', '未完成与限制：...',
+            '未完成说明：<未交付时列明剩余工作、已尝试办法、结束当前调用的原因及所需处置>', '候选新项：（可选）']
 REVIEWER = ['结果：RELEASE | FIX_REQUIRED', '固定版本：<被审版本>', '复跑与证据：<records/ 下证据文件的绝对路径>', '未复跑原因：（沿用执行者记录而未亲自复跑时必填）',
             '阻断：B1 | 返修:<交付目标> | 方案级:是/否 | 关闭条件:...（FIX_REQUIRED 时每项一行）',
             '非阻断建议：...', '候选新项：（可选）']
@@ -181,8 +184,13 @@ def _body(state, o, run_dir):
                '问题：%s' % (inp.get('issue') or inp.get('answer') or ''), '证据：%s' % (', '.join(inp.get('evidence', [])) or '无')]
         facts = {k: v for k, v in inp.items() if k != 'subject_input'}
         # Trigger details are already present in the resolved input.
-        out.append('把处置写入 %s/decision.json，格式：%s' % (run_dir or '<运行目录>', SCHEMA))
+        out.append('把处置写入 %s/decision.json，格式：%s' % (run_dir or '<运行目录>', _schema(state, o['target'])))
         out.append('包络内技术处置直接执行；只有六类新增用户决定才提问。次数用尽或暂时无解不是用户问题；用 blocked 保留原因和最小缺项。')
+        if inp.get('call_facts', {}).get('delivery_protocol') == 'delivery-v2':
+            out.append('本单只处理未交付的执行去向与轮次归属，不评定交付质量、不放行独立审阅。'
+                       '有可执行下一步且原作者可继续：continue_run 绑定本次运行，同轮继续不另扣轮次；'
+                       '需结束本轮并新开轮次/换人：retry 绑定原工单，由驱动器按剩余轮次选人；'
+                       '无可执行方案：blocked。不得将未交付改为完成或另开同义工单绕过额度。')
         return '\n'.join(out)
     if t == 'triage':
         out = ['为每个候选项给出去向：merge（须给 target 交付目标）、defer、drop。', '候选项：']
@@ -195,10 +203,15 @@ def _body(state, o, run_dir):
 
 def _delivery(o):
     if o['type'] in ('implement', 'repair'):
-        rows = (EXECUTOR if o.get('control_protocol') == 'intent-v1' else LEGACY_EXECUTOR)[:]
+        rows = (DELIVERY_EXECUTOR if o.get('control_protocol') == 'delivery-v2' else
+                EXECUTOR if o.get('control_protocol') == 'intent-v1' else LEGACY_EXECUTOR)[:]
         if o['type'] == 'repair':
             rows.insert(3, '阻断关闭：B1=已关闭 说明')
-        return '按固定行回复，无内容写“无”；可选项无内容可省略：\n' + '\n'.join(rows)
+        instruction = ('在当前调用内持续完成范围内可执行工作，进度通过中间消息汇报。'
+                       '完成本次交付才填已交付，直接交独立审阅；未完成填未交付，交负责人处置。'
+                       '不填下一步、继续或移交，不因阶段性进展而提前结束。\n'
+                       if o.get('control_protocol') == 'delivery-v2' else '')
+        return instruction + '按固定行回复，无内容写“无”；可选项无内容可省略：\n' + '\n'.join(rows)
     if o['type'] == 'review':
         return '最终回复按下列固定行交付：\n' + '\n'.join(REVIEWER)
     return '最终回复写：\n结果：VERIFIED\n停止原因：完成\n（处置已写入 decision.json，按本单结构交付。）'
@@ -212,7 +225,24 @@ def _current_input(state, o):
         inp.update(instruction=spec['instruction'], acceptance=spec['acceptance'])
     inp.pop('authorization_sources', None)
     inp.pop('subject_input', None)
+    from . import cycles
+    if cycles.enabled(state.plan, o['target']) and o['type'] in ('implement', 'repair'):
+        inp['execution_round'] = {'limits': dict(cycles.limits(state.plan, o['target'])),
+            'used': cycles.spent(state, o['target']), 'repair_of': inp.get('execution_cycle'),
+            'rule': '每轮一次实施交付，首次审阅不通过仅允许原作者返修一次；复审仍不通过则下一轮或换人。返修不另扣轮次。'}
     return inp
+
+
+def _schema(state, target=None):
+    from . import cycles
+    if not cycles.enabled(state.plan, target):
+        return SCHEMA
+    return ('- {"continue_run": "WO-n-rN", "reason": "未交付的原作者同轮继续所需具体下一步"} '
+            '只用于本裁决对应的最新未交付运行，不增加轮次、不作质量审阅\n' +
+            '\n'.join(line for line in SCHEMA.splitlines() if '"settle"' not in line)).replace(
+        '"implement": 1', '"primary": 1').replace('；先结算待定调用', '；新实施消耗一轮，原轮返修不另扣').replace(
+        '"performer": "primary|backup|lead", ', '').replace(
+        '实施/返修显式选人；审阅不填 performer', '实施/返修由驱动器选择有剩余轮次者，原轮返修绑定原作者')
 
 
 def _execution_options(state, subject):
@@ -233,6 +263,16 @@ def _execution_options(state, subject):
                      'budget_limit': limit, 'budget_spent': used.get(performer, 0),
                      'pending_runs': held, 'budget_remaining': max(0, limit - used.get(performer, 0) - len(held)),
                      'environment': {k: env[k] for k in ('require_host', 'entry', 'preflight', 'guide') if k in env}})
+    from . import cycles
+    if cycles.enabled(state.plan, subject['target']):
+        facts = cycles.options(state, subject)
+        for row in rows:
+            row['repair_available'] = facts['repair_owner'] == row['performer']
+        return {'subject': subject['id'], 'budget_owner': ['execution_cycle', subject['target']],
+                'execution_round': facts, 'candidates': rows,
+                'notice': '剩余轮次为零仍可执行本轮尚未使用的一次原作者返修；新实施须有剩余轮次。'
+                          '返修不可再返修，不生成预算结算单。技术移交只须明确可执行下一步；'
+                          '恢复由驱动器按主、备、负责人顺序选择有剩余轮次者，不受历史最高阶梯限制。'}
     return {'subject': subject['id'], 'budget_owner': list(policy.budget_key(subject)),
             'candidates': rows,
             'notice': '这是当前计划配置与共享预算事实，不是服务健康或能力证明，也不是自动换人指令。'

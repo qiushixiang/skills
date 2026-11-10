@@ -1,5 +1,5 @@
 """Order creation, selection (design 5.4) and event -> order openers (design 5.2)."""
-from . import model, policy
+from . import model, policy, cycles
 from .store import need, sha256_file
 
 PRIORITY = ['decide', 'repair', 'review', 'implement', 'triage', 'release']
@@ -31,9 +31,12 @@ def new_order(state, type_, target, origin, input_=None, needs=None, key=None):
     o = {'id': 'WO-%04d' % state.seq, 'key': key, 'type': type_, 'target': target, 'origin': origin,
          'input': input_ or {}, 'needs': list(needs or []), 'runs': [], 'state': 'open', 'output': None}
     if type_ in ('implement', 'repair', 'review'):
-        o['control_protocol'] = 'review-v1' if type_ == 'review' else 'intent-v1'
+        o['execution_model'] = cycles.model_for(state.plan, target)
+        o['control_protocol'] = ('review-v1' if type_ == 'review' else
+                                 'delivery-v2' if cycles.enabled(state.plan, target) else 'intent-v1')
         if type_ != 'review':
-            o['performer'] = next((s for s, n in policy.ladder(state.plan, o)), None)
+            o['performer'] = (cycles.select(state, o) if cycles.enabled(state.plan, target) else
+                              next((s for s, n in policy.ladder(state.plan, o)), None))
     if target in state.plan['deliverables']:
         o['contract_version'] = state.plan['deliverables'][target].get('contract_version', 1)
         if type_ in ('implement', 'repair') and state.plan['deliverables'][target].get('required_protected'):
@@ -289,6 +292,8 @@ def open_repairs(state, review, run, p):
         else:
             inp['cycle'] = 1
             rep = new_order(state, 'repair', tg, {'by': 'order', 'ref': review['id'], 'reason': 'FIX_REQUIRED'}, inp, key=key)
+        if cycles.enabled(state.plan, tg):
+            cycles.reopen(state, rep)
         if rep['id'] not in review['needs']:
             review['needs'].append(rep['id'])
         link(state, rep)

@@ -10,7 +10,7 @@
 python3 <技能>/scripts/agent_cli.py probe --backend <agy|codex|claude|opencode> --profile <路径>
 ```
 
-probe 不调用模型，只记录可执行文件路径、版本和 help。每次 run 复查版本；版本变化即停止，删除旧 profile 后重新 probe。probe 不证明认证、远端模型或语义兼容。
+probe 不调用模型，只记录可执行文件路径、版本和 help。每次 run 检查可执行文件可启动并记录当前版本；版本变化不阻止执行，不要求删除或重建 profile。request.json 分别保存本次实际版本 version 和探测时版本 profile_version；实际调用失败按既有异常恢复规则处理。probe 不证明认证、远端模型或语义兼容。
 
 ## 模型
 

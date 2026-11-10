@@ -1,5 +1,5 @@
 """Full-path independent review reservation; configuration and dispatch use the same rules."""
-from . import policy
+from . import policy, cycles, model
 from .store import need
 
 
@@ -10,6 +10,10 @@ def coverage(plan, groups=None):
             continue
         sources = []
         for target in dict.fromkeys(spec['deliverables']):
+            if cycles.enabled(plan, target):
+                limits = dict(cycles.limits(plan, target))
+                sources.append({'target': target, 'rounds': limits, 'delivery_rounds': 2 * sum(limits.values())})
+                continue
             limits = {key: policy.rounds(plan, target, key) for key in ('implement', 'repair', 'backup', 'lead')}
             if 'backup_executor' not in plan['roles']:
                 limits['backup'] = 0
@@ -53,6 +57,15 @@ def dispatch_shortfalls(state, order):
     """Reserve reviews before spending implementation/repair rounds, including pending charges."""
     if order['type'] not in ('implement', 'repair'):
         return []
+    if cycles.enabled(state.plan, order['target']):
+        # Capacity is derived, but an exhausted or missing review must still block dispatch.
+        errors = []
+        for group in model.groups_of(state.plan, order['target']):
+            reviews = [o for o in state.orders.values() if o['type'] == 'review' and o['target'] == group]
+            spent = sum(sum(policy.used(o).values()) for o in reviews)
+            if not reviews or spent >= cycles.review_limit(state.plan, group):
+                errors.append({'group': group, 'reason': 'independent review capacity unavailable'})
+        return errors
     errors = []
     groups = [g for g, spec in state.plan['review_groups'].items() if order['target'] in spec['deliverables']]
     for row in coverage(state.plan, groups):

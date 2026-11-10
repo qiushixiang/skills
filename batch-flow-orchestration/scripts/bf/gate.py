@@ -12,9 +12,10 @@ FINDING = re.compile(_LEAD + r'阻断' + _SEP + r'(\S+?)[ \t]*[|｜][ \t]*返修
                      r'方案级[ \t]*[:：][ \t]*(是|否)[ \t]*[|｜][ \t]*关闭条件[ \t]*[:：][ \t]*(.+?)\s*$', re.M)
 SUCCESS = {'implement': ('VERIFIED',), 'repair': ('VERIFIED',), 'review': ('RELEASE', 'FIX_REQUIRED'),
            'decide': ('VERIFIED',), 'triage': ('VERIFIED',)}
-ACTIONS = ('settle', 'open', 'supersede', 'retry', 'plan_revision', 'grant', 'ask_user', 'refresh_design', 'authorize', 'blocked')
+ACTIONS = ('settle', 'continue_run', 'open', 'supersede', 'retry', 'plan_revision', 'grant', 'ask_user', 'refresh_design', 'authorize', 'blocked')
 OPENABLE = ('implement', 'repair', 'review', 'triage')
 ACTION_FIELDS = {
+    'continue_run': {'continue_run', 'reason'},
     'settle': {'settle', 'charge', 'reason'},
     'open': {'open', 'target', 'input', 'needs', 'allow_protected', 'fresh_session'},
     'authorize': {'authorize', 'paths'}, 'retry': {'retry', 'reason', 'fresh_session', 'performer'},
@@ -68,6 +69,7 @@ def parse(text, base):
             'blocker': field(text, '问题标识')[:200],
             'has_issue': bool(issue) and issue not in ('无', '无。'),
             'intent': field(text, '下一步'), 'handoff': field(text, '移交说明'),
+            'delivery_status': field(text, '交付状态'), 'unfinished': field(text, '未完成说明'),
             'findings': [{'id': a, 'target': b, 'plan_level': c == '是', 'closure': d}
                          for a, b, c, d in FINDING.findall(text or '')],
             'candidates': candidates(text), 'suggestions': candidates(text, '非阻断建议'), 'evidence': cited_evidence(base, text),
@@ -132,6 +134,8 @@ def scan(run, events, env):
 # ---- legality -------------------------------------------------------------------------------------
 
 def validate_decision(state, decision, order=None):
+    from .cycles import continuation_context
+    order = continuation_context(state, order)
     plan = state.plan
     if not isinstance(decision, dict) or not isinstance(decision.get('actions'), list) or not decision.get('diagnosis'):
         return 'decision.json 需要 diagnosis 与 actions'
@@ -158,6 +162,11 @@ def validate_decision(state, decision, order=None):
         k = kinds[0]
         if set(a) - ACTION_FIELDS[k]:
             return '%s 含不支持的动作字段，不能静默忽略处置要求' % k
+        if k == 'continue_run':
+            from . import cycles
+            reason = cycles.validate_continuation(state, order, a)
+            if reason:
+                return reason
         if k == 'settle':
             from . import policy
             found = [(o, r) for o in state.orders.values() for r in o['runs'] if r['run_id'] == a[k]]
@@ -234,13 +243,18 @@ def validate_decision(state, decision, order=None):
         if k in ('supersede', 'retry') and a[k] not in state.orders:
             return '%s 指向不存在的工单' % k
         if k == 'retry':
-            from . import policy
+            from . import policy, cycles
             obj = state.orders[a[k]]
             if obj['state'] not in ('open', 'failed'):
                 return 'retry 只能恢复未完成且未运行的工单'
             if any(not r['ended'] or r['run_id'] not in settlements for _, r in policy.unsettled(state, obj)):
                 return 'retry 前须明确结算全部待定运行'
-            if obj.get('control_protocol') == 'intent-v1' or 'performer' in a:
+            if cycles.enabled(plan, obj['target']) and obj['type'] in ('implement', 'repair'):
+                if not isinstance(a.get('reason'), str) or not a['reason'].strip():
+                    return '实施/返修 retry 须说明可执行下一步'
+                if 'performer' in a and a['performer'] not in cycles.STAGES:
+                    return 'retry performer 无效'
+            elif obj.get('control_protocol') == 'intent-v1' or 'performer' in a:
                 if obj['type'] not in ('implement', 'repair') or a.get('performer') not in dict(policy.ladder(plan, obj)) or not isinstance(a.get('reason'), str) or not a['reason'].strip():
                     return '实施/返修 retry 须显式选择 performer 并说明继续依据'
         if k == 'grant' and not isinstance(a['grant'], dict):
@@ -250,7 +264,10 @@ def validate_decision(state, decision, order=None):
                 target = state.orders[owner]['target'] if owner in state.orders else owner
                 if target not in plan['deliverables'] and target not in plan['review_groups']:
                     return 'grant 目标无效'
-                allowed = {'review'} if target in plan['review_groups'] else {'implement', 'repair', 'backup', 'lead', 'review'}
+                from . import cycles
+                if cycles.enabled(plan, target) and target in plan['review_groups']:
+                    return 'cycle review allowance is derived from author rounds'
+                allowed = set(cycles.STAGES) if cycles.enabled(plan, target) else {'review'} if target in plan['review_groups'] else {'implement', 'repair', 'backup', 'lead', 'review'}
                 if not isinstance(values, dict) or not values or any(
                         key not in allowed or type(n) is not int or n <= 0 for key, n in values.items()):
                     return 'grant 须指定正整数额度；审阅组只能追加 review'
@@ -266,10 +283,34 @@ def validate_decision(state, decision, order=None):
             if a['within_authorization'] is not True or not changes.internal_revision(plan, a['plan_revision']):
                 return '包络内计划调整不得改变目标、验收、权限、预算、资源或必需审阅；实质变化转用户'
     subject = state.orders.get(order['input'].get('subject')) if order else None
+    continuing = [a for a in decision['actions'] if 'continue_run' in a]
+    if continuing and (len(continuing) != 1 or any(a.get(k) == (subject or {}).get('id')
+            for a in decision['actions'] for k in ('retry', 'blocked', 'supersede'))):
+        return '同轮继续不能与原单结束、重派或阻塞混用'
     if subject and subject.get('awaiting_disposition') and not order['input'].get('accounting_only'):
-        if not any(a.get(k) == subject['id'] for a in decision['actions'] for k in ('retry', 'blocked', 'supersede')) and not any('ask_user' in a for a in decision['actions']):
+        continues = any(a.get('continue_run') == order['input'].get('run') for a in decision['actions'])
+        if not continues and not any(a.get(k) == subject['id'] for a in decision['actions'] for k in ('retry', 'blocked', 'supersede')) and not any('ask_user' in a for a in decision['actions']):
             return '移交须明确恢复、保留阻塞或替换原单，不能只结算后自动恢复'
+    if any('retry' in a or 'continue_run' in a for a in decision['actions']):
+        from .register import preview_retries
+        return preview_retries(state, order, decision['actions'])
     return ''
+
+
+def judge_delivery(order, text, run=None):
+    rows = re.findall(_LEAD + '交付状态' + _SEP + r'(.*)$', text or '', re.M)
+    status = field(text, '交付状态')
+    if len(rows) != 1 or status not in ('已交付', '未交付') or any(field(text, k) for k in ('下一步', '结果', '停止原因')):
+        return False, '须恰有一个交付状态：已交付/未交付，不填写下一步或旧结果协议'
+    if run and run.get('controlled_wrapper'):
+        return False, '受控入口须按工单直接调用；包装调用事实交负责人处置'
+    if status == '未交付' and not field(text, '未完成说明').strip():
+        return False, '未交付须说明剩余工作、已尝试办法及需要的处置'
+    if status == '已交付' and order['type'] == 'repair':
+        tail = text[text.find('阻断关闭'):] if '阻断关闭' in text else ''
+        if any(not re.search(r'(?<![\w])%s\s*=' % re.escape(f['id']), tail) for f in order['input'].get('findings', [])):
+            return False, '交付须逐项报告阻断关闭'
+    return True, status
 
 
 def judge_intent(order, text, run=None):

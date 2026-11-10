@@ -265,10 +265,8 @@ def check_profile(profile_path):
     except FileNotFoundError as error:
         raise ValueError('CLI cannot start in this execution environment: ' + profile['binary'] +
                          '; check sandbox mounts and executable interpreter; this does not prove a missing host installation') from error
-    if actual != profile['version']:
-        raise ValueError('CLI version changed; probe a new profile before dispatch')
     out = dict(event='CLI_CHECKED', backend=profile['backend'], binary=profile['binary'],
-               version=actual, validation='version only in current execution environment; no authentication/network/model check')
+               version=actual, validation='executable visibility and version observation only; no compatibility/authentication/network/model check')
     if profile['backend'] == 'claude':
         source, path = claude_auth()
         out['auth'] = dict(source=source, token_file=str(path) if path else None)
@@ -407,7 +405,7 @@ def inspect_result(backend, stdout, stderr, returncode, expected=None):
 def run(profile_path, args):
     profile = read(profile_path)
     validate_call(profile, args)
-    check_profile(profile_path)
+    checked = check_profile(profile_path)
     if not args.model.strip() or not args.effort.strip() or not args.task.strip():
         raise ValueError('task/model/effort must be explicit and non-empty')
     prompt = Path(args.prompt_file).read_text(encoding='utf-8')
@@ -418,7 +416,8 @@ def run(profile_path, args):
     opencode_env = opencode_environment(args) if profile['backend'] == 'opencode' else None
     output = Path(args.run_dir).resolve()
     output.mkdir(mode=0o700)  # Exclusive: never overwrite or rerun a previous call.
-    request = dict(task=args.task, backend=profile['backend'], version=profile['version'],
+    request = dict(task=args.task, backend=profile['backend'], version=checked['version'],
+                   profile_version=profile['version'],
                    cwd=args.cwd, model=args.model, effort=args.effort, access=args.access,
                    conversation=args.conversation, argv=argv, stdin=input_text, started_at=now(),
                    prompt_file=str(Path(args.prompt_file).resolve()),
@@ -535,7 +534,7 @@ def main():
     check.add_argument('--backend', required=True, choices=REQUIRED)
     check.add_argument('--binary')
     check.add_argument('--profile', required=True)
-    verify = commands.add_parser('check', help='version check in the actual dispatch environment; never calls a model')
+    verify = commands.add_parser('check', help='check executable visibility and observe version in the dispatch environment; never calls a model')
     verify.add_argument('--profile', required=True)
     for flag in ['model', 'effort', 'cwd', 'conversation', 'resume-from']:
         verify.add_argument('--'+flag)

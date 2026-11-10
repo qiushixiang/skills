@@ -1,6 +1,6 @@
 """Registering finished runs and executing decisions: routing table of design 5.2 and decide mechanism of design 7."""
-from . import model, policy, routing, permissions, questions, review_budget
-from .store import need, sha256_file
+from . import model, policy, routing, permissions, questions, review_budget, cycles
+from .store import BfError, need, sha256_file
 
 
 def on_registered(state, order, run, p, legal, decision):
@@ -61,6 +61,40 @@ def _needs_user(state, a):
     return 'open' in a and model.batch_of(plan, a['target']) not in plan['envelope']['batches']
 
 
+def check_retries(state, actions):
+    for action in actions:
+        if 'retry' in action:
+            obj = state.orders[action['retry']]
+            if cycles.enabled(state.plan, obj['target']) and obj['type'] in ('implement', 'repair'):
+                obj['performer'] = cycles.retry_performer(state, obj)
+            need(not permissions.missing(state.plan, obj), 'retry still lacks required protected permissions')
+            need(policy.stage(state.plan, obj, state) is not None, 'retry still has no execution allowance')
+        elif 'continue_run' in action:
+            obj = next(o for o in state.orders.values() if o['input'].get('continuation_of') == action['continue_run'])
+            need(not permissions.missing(state.plan, obj), 'continuation still lacks required protected permissions')
+            need(policy.stage(state.plan, obj, state) is not None, 'continuation has no eligible original author')
+
+
+def preview_retries(state, source, actions):
+    """Check retry postconditions on an isolated copy, before accepting a decision.
+
+    Apply the whole bundle so grants, settlements and permissions count regardless
+    of their position. This never writes the task's state or runs a role.
+    """
+    import copy
+    trial = copy.deepcopy(state)
+    src = trial.orders[source['id']] if source else {'id': 'preview', 'input': {}}
+    if source:
+        src['state'] = 'done'
+    try:
+        for action in actions:
+            _execute(trial, src, action, src.get('input', {}).get('subject'))
+        check_retries(trial, actions)
+    except BfError as error:
+        return str(error)
+    return ''
+
+
 def apply_actions(state, source, actions, waiter, forced=False, diagnosis=''):
     """Execute decision actions; those beyond the envelope (grant, plan revision, out-of-envelope open) wait for the user (I6)."""
     import copy
@@ -80,10 +114,7 @@ def apply_actions(state, source, actions, waiter, forced=False, diagnosis=''):
         if 'authorize' in a:
             obj = state.orders[a['authorize']]
             need(all(p in permissions.allowed(state.plan, obj) for p in a['paths']), 'authorization postcondition failed')
-        if 'retry' in a:
-            obj = state.orders[a['retry']]
-            need(not permissions.missing(state.plan, obj), 'retry still lacks required protected permissions')
-            need(policy.stage(state.plan, obj, state) is not None, 'retry still has no execution allowance')
+    check_retries(state, actions)
     for obj in state.orders.values():
         if obj['type'] in ('implement', 'repair', 'review'):
             need(not policy.over_budget(state.plan, obj, state), 'settlement exceeds authorized technical budget')
@@ -96,7 +127,19 @@ def apply_actions(state, source, actions, waiter, forced=False, diagnosis=''):
 
 def _execute(state, source, a, waiter):
     plan = state.plan
-    if 'settle' in a:
+    if 'continue_run' in a:
+        reason = cycles.validate_continuation(state, source, a)
+        need(not reason, reason)
+        ctx = cycles.continuation_context(state, source)
+        o = state.orders[ctx['input']['subject']]
+        run = o['runs'][-1]
+        o['input']['continuation_of'] = run['run_id']
+        o['input']['recovery'] = {'instruction': a['reason'], 'source': source['id']}
+        o['performer'] = run['performer']
+        o['state'] = 'open'
+        o.pop('awaiting_disposition', None)
+        o.pop('ops', None)
+    elif 'settle' in a:
         owner, run = next((o, r) for o in state.orders.values() for r in o['runs'] if r['run_id'] == a['settle'])
         owner.setdefault('settlements', {}).setdefault(run['run_id'], {'charge': a['charge'], 'reason': a['reason'], 'source': source['id']})
         for pending in state.orders.values():
@@ -142,16 +185,16 @@ def _execute(state, source, a, waiter):
             if a.get('reason'):
                 o['input']['recovery'] = {'instruction': a['reason'], 'source': source['id']}
 
-            if 'performer' in a:
+            if cycles.enabled(plan, o['target']) and o['type'] in ('implement', 'repair'):
+                o['performer'] = cycles.retry_performer(state, o)
+            elif 'performer' in a:
                 o['control_protocol'] = 'intent-v1'
                 o['performer'] = a['performer']
     elif 'grant' in a:
         for key, spec in a['grant'].items():
             target = state.orders[key]['target'] if key in state.orders else key
             need(target in plan['deliverables'] or target in plan['review_groups'], 'grant: unknown target %s' % key)
-            ov = plan['policy']['overrides'].setdefault(target, {})
-            for rkey, n in spec.items():
-                ov[rkey] = ov.get(rkey, plan['policy']['rounds'].get(rkey, 0)) + int(n)
+            policy.add_rounds(plan, target, spec)
         plan['revision'] += 1
         state.plan_dirty = True
     elif 'plan_revision' in a:
@@ -213,6 +256,7 @@ def revise(state, new_plan, approval, source='user', revalidate=()):
         if o['target'] in old['review_groups']:
             o.setdefault('contract', model.review_contract(old, o['target']))
     plan = model.normalize(new_plan, enforce_review_budget=False)
+    cycles.require_same_model(old, plan, state.orders)
     review_budget.validate_revision(old, plan, revalidate)
     plan['revision'] = old['revision'] + 1
     plan['approval'] = approval or old.get('approval')

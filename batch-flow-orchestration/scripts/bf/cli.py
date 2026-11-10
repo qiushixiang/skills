@@ -59,7 +59,7 @@ def main(argv=None):
     en.add_argument('--remove', nargs='+', default=[])
     gr = sub.add_parser('grant')
     gr.add_argument('target')
-    for k in ('implement', 'backup', 'lead', 'repair', 'review'):
+    for k in ('primary', 'implement', 'backup', 'lead', 'repair', 'review'):
         gr.add_argument('--' + k, type=int)
     for name in ('hold', 'unhold'):
         sub.add_parser(name).add_argument('targets', nargs='+')
@@ -141,7 +141,7 @@ def main(argv=None):
                 out = {'batches': adjust.envelope(base, args.approval, add=args.add, remove=args.remove)}
             elif args.cmd == 'grant':
                 out = {'overrides': adjust.grant(base, args.target, args.approval, **dict(
-                    (k, getattr(args, k)) for k in ('implement', 'backup', 'lead', 'repair', 'review')))}
+                    (k, getattr(args, k)) for k in ('primary', 'implement', 'backup', 'lead', 'repair', 'review')))}
             elif args.cmd in ('hold', 'unhold'):
                 out = {'holds': getattr(adjust, args.cmd)(base, args.targets, args.approval)}
             else:

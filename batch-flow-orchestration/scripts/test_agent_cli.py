@@ -182,8 +182,14 @@ else:
                 self.args.run_dir=str(self.root/(backend+'-resume'))
                 with patch('builtins.print'):self.assertEqual(cli.run(profile,self.args),0)
                 self.assertEqual(cli.collect(self.args.run_dir)['conversation_id'],report['conversation_id'])
-                binary.write_text('#!'+sys.executable+'\nprint("changed-version")\n')
-                with self.assertRaisesRegex(ValueError,'version changed'):cli.run(profile,self.args)
+                binary.write_text(binary.read_text().replace('fake-1', 'fake-2').replace('v2.fake', 'v2.upgraded'))
+                self.args.run_dir=str(self.root/(backend+'-upgraded'))
+                with patch('builtins.print'):self.assertEqual(cli.run(profile,self.args),0)
+                self.assertTrue(cli.collect(self.args.run_dir)['usable'])
+                request=cli.read(Path(self.args.run_dir)/'request.json')
+                self.assertEqual(request['version'], 'opencode v2.upgraded' if backend=='opencode' else 'fake-2')
+                self.assertEqual(request['profile_version'], 'opencode v2.fake' if backend=='opencode' else 'fake-1')
+                self.assertEqual(cli.read(profile)['version'], request['profile_version'])
 
     def test_entrypoint_preflight_failure_has_exit_cause_and_preserves_exclusive_run(self):
         profile = self.root / 'profile.json'
@@ -191,14 +197,14 @@ else:
         argv = ['agent_cli.py', 'run', '--profile', str(profile), '--task', 'T1',
                 '--cwd', str(self.root), '--model', 'test/model', '--effort', 'default',
                 '--access', 'read', '--prompt-file', str(self.prompt), '--run-dir', self.args.run_dir]
-        with patch.object(sys, 'argv', argv), patch.object(cli, 'check_profile', side_effect=ValueError('version changed')), \
+        with patch.object(sys, 'argv', argv), patch.object(cli, 'check_profile', side_effect=ValueError('CLI cannot start')), \
                 patch.object(cli.subprocess, 'Popen') as spawn, patch('builtins.print'):
             self.assertEqual(cli.main(), 2)
             report = cli.collect(self.args.run_dir)
             self.assertEqual(report['event'], 'CLI_LAUNCH_FAILED')
             self.assertEqual(report['launch_error']['phase'], 'preflight')
             self.assertFalse(report['launch_error']['started'])
-            self.assertIn('version changed', report['problems'][0])
+            self.assertIn('CLI cannot start', report['problems'][0])
             spawn.assert_not_called()
             evidence = (Path(self.args.run_dir) / 'exit.json').read_bytes()
             self.assertEqual(cli.main(), 2)
@@ -210,7 +216,7 @@ else:
         profile = self.root / 'profile.json'
         cli.save(profile, dict(backend='opencode', binary='/missing', version='v2'))
         self.args.model = 'test/model'; self.args.effort = 'default'
-        with patch.object(cli, 'check_profile'), patch.object(cli.subprocess, 'Popen',
+        with patch.object(cli, 'check_profile', return_value={'version': 'v2'}), patch.object(cli.subprocess, 'Popen',
                 side_effect=OSError(errno.E2BIG, 'argument too long')), patch('builtins.print'):
             self.assertEqual(cli.run(profile, self.args), 2)
         report = cli.collect(self.args.run_dir)
@@ -309,8 +315,9 @@ print(json.dumps({'session_id':cid,'subtype':'success','is_error':False,'result'
             self.assertEqual(cli.check_profile(profile)['event'],'CLI_CHECKED')
             with patch.object(sys,'argv',['agent_cli.py','check','--profile',str(profile)]),patch('builtins.print'):
                 self.assertEqual(cli.main(),0)
-        with patch.object(cli,'version',return_value='v2'),self.assertRaisesRegex(ValueError,'version changed'):
-            cli.check_profile(profile)
+        with patch.object(cli,'version',return_value='v2'):
+            self.assertEqual(cli.check_profile(profile)['version'],'v2')
+            self.assertEqual(cli.read(profile)['version'],'v1')
 
     def test_opencode_requires_native_id_final_message_and_completion(self):
         cid='ses_ActualNative012345';msg='msg_final'

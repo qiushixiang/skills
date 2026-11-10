@@ -6,7 +6,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import adapter, model, policy, routing
+from . import adapter, model, policy, routing, cycles
 from .store import BfError, need, now, transact
 
 ROLES = ('executor', 'backup_executor', 'lead', 'reviewer', 'third_party')
@@ -90,13 +90,7 @@ def grant(base, target, approval, **rounds):
 
     def fn(st):
         need(target in st.plan['deliverables'] or target in st.plan['review_groups'], 'unknown target %s' % target)
-        need(asked and all(k in ROUND_KEYS and isinstance(v, int) and v > 0 for k, v in asked.items()),
-             'grant needs positive integer rounds for: %s' % ', '.join(ROUND_KEYS))
-        need(target not in st.plan['review_groups'] or set(asked) == {'review'}, 'review group grants only accept review rounds')
-        ov = st.plan['policy']['overrides'].setdefault(target, {})
-        for k, v in asked.items():
-            ov[k] = policy.rounds(st.plan, target, k) + v
-        return ov
+        return policy.add_rounds(st.plan, target, asked)
     return _edit(base, 'grant', approval, fn)
 
 

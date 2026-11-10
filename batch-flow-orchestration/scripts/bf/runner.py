@@ -141,7 +141,7 @@ class Runner(object):
 
     def _cli_failed(self, order_id, run_id, assignment, n, reason, not_started=False, source=None):
         st = api.load(self.base)
-        if st.orders[order_id].get('control_protocol') == 'intent-v1':
+        if st.orders[order_id].get('control_protocol') in ('intent-v1', 'delivery-v2'):
             out = api.cli_failed(self.base, order_id, run_id, reason, n, not_started, source)
             if out['outcome'] == 'continue':
                 self._pend(run_id, order_id, assignment, self._retry_text(order_id, run_id), None, n + 1)
