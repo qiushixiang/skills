@@ -108,9 +108,38 @@ class AgentCliAdapter(object):
         return {'dir': str(cli_dir), 'pid': proc.pid, 'run_dir': str(run_dir)}
 
     def kill(self, handle, grace=5.0):
-        """Terminate the call's process group (it is a session leader): TERM, then KILL after a grace period."""
+        """Interrupt the actual CLI first, allowing its normal tool cleanup; force only on timeout."""
         import signal
         pid = handle['pid']
+        # The supervisor must stay alive to collect the CLI's interrupted result.
+        # Sending INT to the whole group would interrupt its communicate() too.
+        receipt_path = Path(handle['dir']) / 'receipt.json'
+        cli_pid = None
+        deadline = time.monotonic() + min(grace, 0.5)
+        while True:
+            try:
+                receipt = json.loads(receipt_path.read_text(encoding='utf-8'))
+                candidate = receipt['pid']
+                if (receipt.get('event') == 'CLI_STARTED' and type(candidate) is int
+                        and candidate != pid and os.getpgid(candidate) == pid):
+                    cli_pid = candidate
+                break
+            except (OSError, ValueError, KeyError, TypeError):
+                if time.monotonic() >= deadline or not _alive(pid):
+                    break
+                time.sleep(0.05)
+        if cli_pid is not None:
+            try:
+                os.kill(cli_pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            end = time.monotonic() + grace
+            while time.monotonic() < end:
+                proc = self.procs.get(pid)
+                finished = proc.poll() is not None if proc is not None else not _alive(pid)
+                if finished and not _alive(cli_pid):
+                    return
+                time.sleep(0.05)
         for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 1.0)):
             try:
                 os.killpg(pid, sig)
@@ -119,7 +148,11 @@ class AgentCliAdapter(object):
             end = time.time() + wait
             while time.time() < end:
                 proc = self.procs.get(pid)
-                if (proc.poll() is not None) if proc is not None else not _alive(pid):
+                if proc is not None:
+                    proc.poll()  # Reap the supervisor without mistaking its exit for group exit.
+                try:
+                    os.killpg(pid, 0)
+                except ProcessLookupError:
                     return
                 time.sleep(0.1)
 
