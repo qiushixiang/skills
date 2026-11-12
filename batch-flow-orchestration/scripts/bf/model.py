@@ -102,7 +102,7 @@ def normalize(plan, enforce_review_budget=True):
         members = spec.get('deliverables') or []
         need(members and all(m in dels for m in members), 'review group %s: unknown deliverable' % g)
         if cycles.enabled(p, g):
-            need(not overrides.get(g), 'review group %s: author rounds belong to deliverables; review capacity is derived' % g)
+            need(not overrides.get(g), 'review group %s: cycles-v1 reviews have no separate allowance' % g)
         spans = set(dels[m]['batch'] for m in members)
         need(len(spans) == 1 or spec.get('batch') in ids, 'review group %s spans batches: explicit batch required' % g)
         spec.setdefault('batch', next(iter(spans)))

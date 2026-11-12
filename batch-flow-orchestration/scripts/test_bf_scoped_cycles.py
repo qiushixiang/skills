@@ -65,7 +65,7 @@ class ScopedRounds(Base):
         st=self.st()
         self.assertEqual(st.plan['policy'],before)
         self.assertEqual(cycles.config(st.plan,'N1')['primary'],2)
-        self.assertEqual(policy.rounds(st.plan,'NR','review'),6)
+        self.assertIsNone(policy.rounds(st.plan,'NR','review'))
         with self.assertRaises(BfError):adjust.grant(self.base,'NR',self.approval,review=1)
         with self.assertRaises(BfError):adjust.grant(self.base,'N1',self.approval,repair=1)
 
@@ -106,7 +106,7 @@ class ScopedRounds(Base):
         facts=cards._execution_options(self.st(),self.one('repair','N1'))
         self.assertEqual(facts['budget_owner'],['execution_cycle','N1'])
         rows=review_budget.coverage(self.st().plan)
-        self.assertEqual(next(x['available'] for x in rows if x['group']=='NR'),4)
+        self.assertFalse(any(x['group']=='NR' for x in rows))
         self.assertEqual(next(x['available'] for x in rows if x['group']=='R12'),32)
 
     def test_invalid_scoped_config_rejected(self):

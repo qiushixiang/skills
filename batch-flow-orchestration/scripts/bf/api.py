@@ -399,15 +399,21 @@ def retry(base, order_id, note, expected_revision=None, request_id=None, actor='
     """Operational fault handled (for example the account was switched): clear the mark; failures cost no budget."""
     def fn(st):
         o = routing.get(st, order_id)
-        need(o.get('ops'), 'order %s has no pending operational problem' % order_id)
         need(isinstance(note, str) and note.strip(), 'recovery requires a concrete operational note')
-        ops = o.pop('ops')
+        cycle_work = (cycles.enabled(st.plan, o['target']) and o['type'] in ('implement', 'repair')
+                      and o['state'] == 'open' and not o.get('awaiting_disposition'))
+        stranded = (cycle_work and o.get('performer') is None
+                    and cycles.retry_performer(st, o) is not None)
+        need(o.get('ops') or stranded, 'order %s has no pending operational problem' % order_id)
+        ops = o.pop('ops', {'problem': 'execution performer unset after exhausted rounds'})
         o.setdefault('ops_log', []).append({'op': 'retry', 'note': note, 'problem': ops['problem'], 'at': now()})
         o['invalid_floor'] = len(o['runs'])
         if o['type'] in ('decide', 'triage'):
             o['coordination_floor'] = len(o['runs'])
         elif ops.get('kind') in ('no_progress', 'coordination_limit'):
             routing.open_decide(st, o, 'operational_recovery', {'note': note}, force=True)
+        if stranded:
+            o['performer'] = cycles.retry_performer(st, o)
         return order_id
     return transact(base, 'retry', actor, fn, expected_revision, request_id)
 

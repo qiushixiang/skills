@@ -1,4 +1,4 @@
-"""Full-path independent review reservation; configuration and dispatch use the same rules."""
+"""Legacy review budgets and independent review presence checks."""
 from . import policy, cycles, model
 from .store import need
 
@@ -8,12 +8,10 @@ def coverage(plan, groups=None):
     for group, spec in plan['review_groups'].items():
         if groups is not None and group not in groups:
             continue
+        if cycles.enabled(plan, group):
+            continue
         sources = []
         for target in dict.fromkeys(spec['deliverables']):
-            if cycles.enabled(plan, target):
-                limits = dict(cycles.limits(plan, target))
-                sources.append({'target': target, 'rounds': limits, 'delivery_rounds': 2 * sum(limits.values())})
-                continue
             limits = {key: policy.rounds(plan, target, key) for key in ('implement', 'repair', 'backup', 'lead')}
             if 'backup_executor' not in plan['roles']:
                 limits['backup'] = 0
@@ -58,13 +56,12 @@ def dispatch_shortfalls(state, order):
     if order['type'] not in ('implement', 'repair'):
         return []
     if cycles.enabled(state.plan, order['target']):
-        # Capacity is derived, but an exhausted or missing review must still block dispatch.
+        # Preserve independent review coverage without reserving any call capacity.
         errors = []
         for group in model.groups_of(state.plan, order['target']):
             reviews = [o for o in state.orders.values() if o['type'] == 'review' and o['target'] == group]
-            spent = sum(sum(policy.used(o).values()) for o in reviews)
-            if not reviews or spent >= cycles.review_limit(state.plan, group):
-                errors.append({'group': group, 'reason': 'independent review capacity unavailable'})
+            if not reviews:
+                errors.append({'group': group, 'reason': 'missing independent review order'})
         return errors
     errors = []
     groups = [g for g, spec in state.plan['review_groups'].items() if order['target'] in spec['deliverables']]

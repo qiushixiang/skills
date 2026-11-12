@@ -114,6 +114,32 @@ class ExecutionCycles(Base):
         self.review(); self.submit(rep); self.review()
         self.assertEqual(api.assign(self.st(), rep)['stage'], 'backup')
 
+    def test_grant_and_operational_retry_restore_exhausted_repair(self):
+        self.init_fresh(cycle_plan(primary=1, backup=0, lead=0))
+        self.submit(self.impl('D1')); self.review()
+        self.submit(self.repair()); self.review()
+        rep = self.repair()
+        decision = self.one('decide', 'D1')
+        rid = api.start(self.base, decision['id'], conversation_id='lead-recovery')
+        out = api.deliver(self.base, decision['id'], rid, '结果：VERIFIED', decision={
+            'diagnosis': '原轮返修已耗尽，等待可用实施轮次',
+            'actions': [{'blocked': rep, 'reason': '执行轮次用尽', 'missing': '需可用实施轮次'}]})
+        self.assertTrue(out['legal'], out)
+        self.assertIsNone(self.st().orders[rep]['performer'])
+        api.retry(self.base, rep, '核对当前仍无额度')
+        self.assertNotIn(rep, api.runnable(self.st()))
+        with self.assertRaises(BfError):
+            api.retry(self.base, rep, '仍无可用轮次')
+        adjust.grant(self.base, 'D1', self.approval, primary=1, lead=1)
+        api.retry(self.base, rep, '已批准增额，恢复原工单')
+        self.assertIn(rep, api.runnable(self.st()))
+        self.assertEqual(api.assign(self.st(), rep)['stage'], 'primary')
+        self.assertEqual(cycles.spent(self.st(), 'D1'), {'primary': 1})
+        run = self.submit(rep)
+        self.assertEqual(self.st().orders[rep]['runs'][-1]['execution_cycle'],
+                         {'id': run, 'phase': 'implement'})
+        self.assertEqual(cycles.spent(self.st(), 'D1'), {'primary': 2})
+
     def init_fresh(self, plan):
         self.base = self.base.parent / ('fresh-'+str(self.counter))
         api.init(self.base, plan, self.approval)
@@ -122,7 +148,7 @@ class ExecutionCycles(Base):
         p = cycle_plan(); del p['roles']['backup_executor']; self.init_fresh(p)
         self.submit(self.impl('D1')); self.review(); self.submit(self.repair()); self.review()
         self.assertEqual(api.assign(self.st(), self.repair())['stage'], 'lead')
-        self.assertEqual(policy.rounds(self.st().plan, 'R1', 'review'), 4)
+        self.assertIsNone(policy.rounds(self.st().plan, 'R1', 'review'))
 
     def test_restart_keeps_used_repair(self):
         self.submit(self.impl('D1')); self.review(); self.submit(self.repair()); self.review()
@@ -147,11 +173,11 @@ class ExecutionCycles(Base):
         p['policy'] = {'rounds': {'implement': 3, 'repair': 2, 'review': 20}}
         with self.assertRaisesRegex(BfError, 'fresh task'): api.revise_plan(self.base, p, self.approval)
 
-    def test_review_capacity_derived_and_grant_author_rounds(self):
+    def test_reviews_have_no_capacity_or_grants(self):
         p = self.st().plan
-        self.assertEqual(review_budget.coverage(p)[0]['required'], 6)
+        self.assertEqual(review_budget.coverage(p), [])
         adjust.grant(self.base, 'D1', self.approval, primary=1)
-        self.assertEqual(policy.rounds(self.st().plan, 'R1', 'review'), 8)
+        self.assertIsNone(policy.rounds(self.st().plan, 'R1', 'review'))
         with self.assertRaises(BfError): adjust.grant(self.base, 'R1', self.approval, review=1)
         with self.assertRaises(BfError): adjust.grant(self.base, 'D1', self.approval, repair=1)
 
@@ -243,12 +269,13 @@ class ExecutionCycles(Base):
         self.assertEqual(self.st().orders[dec['id']]['runs'][-1]['continuations'], 1)
         self.assertTrue(self.st().orders[oid]['awaiting_disposition'])
 
-    def test_merged_review_capacity_and_overrides(self):
+    def test_merged_reviews_have_no_capacity(self):
         p=cycle_plan(); p['deliverables']['D2']=copy.deepcopy(p['deliverables']['D1'])
         p['review_groups']['R1']['deliverables'].append('D2')
         p['policy']['overrides']={'D2':{'primary':2,'backup':0,'lead':0}}
         p=model.normalize(p)
-        self.assertEqual(policy.rounds(p,'R1','review'),9)
+        self.assertIsNone(policy.rounds(p,'R1','review'))
+        self.assertEqual(review_budget.coverage(p), [])
 
     def test_report_and_card_show_round_repair(self):
         self.submit(self.impl('D1')); self.review(); oid=self.repair()
@@ -337,15 +364,34 @@ class ExecutionCycles(Base):
         self.submit(pending[0]['id'])
         self.assertEqual(cycles.spent(self.st(),'D1'),{'primary':1,'backup':1})
 
-    def test_missing_or_exhausted_review_blocks_author_before_start(self):
+    def test_prior_review_calls_do_not_block_authors_but_missing_review_does(self):
         oid=self.impl('D1'); st=self.st()
         review=self.one('review','R1')
-        for n in range(6):
+        for n in range(20):
             review['runs'].append({'run_id':'fake-review-%d'%n,'ended':'now','performer':'reviewer','exempt':False})
         st.orders[review['id']]=review
-        self.assertTrue(review_budget.dispatch_shortfalls(st,st.orders[oid]))
+        self.assertEqual(review_budget.dispatch_shortfalls(st,st.orders[oid]), [])
+        self.assertEqual(policy.used(review), {})
+        self.assertEqual(policy.spent(st, review), {})
+        self.assertEqual(policy.stage(st.plan, review, st), 'reviewer')
+        self.assertEqual(cards._execution_options(st, review)['reviewer'], 'reviewer')
         del st.orders[review['id']]
         self.assertTrue(review_budget.dispatch_shortfalls(st,st.orders[oid]))
+
+    def test_many_prior_calls_do_not_block_actual_review_or_reset_author_rounds(self):
+        self.submit(self.impl('D1'))
+        review = self.one('review', 'R1')
+        def history(st):
+            for n in range(20):
+                st.orders[review['id']]['runs'].append({
+                    'run_id': 'archived-review-%d' % n, 'ended': 'now', 'result': 'FIX_REQUIRED',
+                    'performer': 'reviewer', 'exempt': False, 'session': 'review-independent',
+                    'tool': 'claude', 'model': 'rev-m', 'effort': 'medium', 'session_kb': None})
+        transact(self.base, 'fixture', 'test', history)
+        self.assertIn(review['id'], api.runnable(self.st()))
+        self.review(True)
+        self.assertEqual(cycles.spent(self.st(), 'D1'), {'primary': 1})
+        self.assertEqual(self.st().orders[review['id']]['state'], 'done')
 
     def test_cli_accepts_cycle_grant(self):
         import subprocess, sys

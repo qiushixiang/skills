@@ -9,7 +9,7 @@ STAFFED = ('implement', 'repair', 'review', 'decide', 'triage')
 
 def rounds(plan, target, key, default=0):
     if cycles.enabled(plan, target) and key == 'review' and target in plan['review_groups']:
-        return cycles.review_limit(plan, target)
+        return None  # Reviews follow deliveries; no separate capacity or counter.
     if cycles.enabled(plan, target) and target in plan['deliverables'] and key in cycles.STAGES:
         return cycles.config(plan, target)[key]
     override = plan['policy']['overrides'].get(target or '', {})
@@ -29,6 +29,8 @@ def ladder(plan, order, strict=True):
         if t == 'repair' and strict and order['input'].get('plan_level'):
             chain = [('lead', r('lead'))]  # plan-level finding goes straight to the lead
     elif t == 'review':
+        if cycles.enabled(plan, tg):
+            return []
         stage = plan['review_groups'].get(tg, {}).get('reviewer', 'reviewer')
         chain = [(stage, r('review'))]
     elif t in ('decide', 'triage'):
@@ -65,7 +67,7 @@ def committed(state, order):
 def used(order):
     """Charged runs per performer stage (exempt runs are free)."""
     out = {}
-    if order['type'] in ('decide', 'triage'):
+    if order['type'] in ('decide', 'triage') or (order['type'] == 'review' and order.get('execution_model') == cycles.MODEL):
         return out
     for run in order['runs']:
         if run['ended'] and charge(order, run) == 1:
@@ -84,6 +86,8 @@ def budget_key(order):
 
 
 def spent(state, order):
+    if order['type'] == 'review' and cycles.enabled(state.plan, order['target']):
+        return {}
     if cycles.enabled(state.plan, order['target']) and order['type'] in ('implement', 'repair'):
         return cycles.spent(state, order['target'])
     out = {}
@@ -96,6 +100,9 @@ def spent(state, order):
 
 def stage(plan, order, state=None):
     """Next stage with budget left, or None when the chain is exhausted."""
+    if order['type'] == 'review' and cycles.enabled(plan, order['target']):
+        reviewer = plan['review_groups'][order['target']].get('reviewer', 'reviewer')
+        return reviewer if reviewer in plan['roles'] else None
     if cycles.enabled(plan, order['target']) and order['type'] in ('implement', 'repair'):
         need(state is not None, 'cycle assignment requires the task journal')
         return cycles.stage(state, order)
@@ -153,7 +160,7 @@ def add_rounds(plan, target, increments):
     need(increments and all(k in allowed and type(v) is int and v > 0 for k, v in increments.items()),
          'invalid execution round increment')
     need(target not in plan['review_groups'] or (not is_cycle and set(increments) == {'review'}),
-         'cycle review allowance is derived from author rounds')
+         'cycles-v1 reviews have no separate allowance')
     spec = plan['deliverables'].get(target, {})
     destination = (spec['execution'].setdefault('rounds', {}) if is_cycle and 'execution' in spec else
                    plan['policy']['overrides'].setdefault(target, {}))

@@ -161,11 +161,6 @@ def reopen(state, order):
     order['performer'] = select(state, order)
 
 
-def review_limit(plan, group):
-    members = set(plan['review_groups'][group]['deliverables'])
-    return 1 + sum(2 * sum(n for _, n in limits(plan, d)) - 1 for d in members)
-
-
 def require_same_model(old, new, orders):
     if enabled(old) != enabled(new):
         need(not orders, 'execution model change requires a fresh task; historical runs cannot be reinterpreted')

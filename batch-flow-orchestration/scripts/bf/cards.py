@@ -247,6 +247,12 @@ def _schema(state, target=None):
 
 def _execution_options(state, subject):
     """Plan facts for lead selection, never a backend health or capability verdict."""
+    from . import cycles
+    if subject['type'] == 'review' and cycles.enabled(state.plan, subject['target']):
+        reviewer = state.plan['review_groups'][subject['target']].get('reviewer', 'reviewer')
+        return {'subject': subject['id'], 'reviewer': reviewer,
+                'configuration': dict(state.plan['roles'].get(reviewer, {})),
+                'notice': '审阅随交付和返修派发，不设独立容量或额度；CLI 异常与非法协议仍有界恢复。'}
     limits = dict(policy.ladder(state.plan, subject))
     used = policy.spent(state, subject)
     pending = policy.unsettled(state, subject)
