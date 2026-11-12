@@ -77,6 +77,7 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow init --plan plan.
 - `no_review`：交付目标不属于任何审阅组时必须写明原因，否则计划不通过。
 - `design_ref`：设计章节引用。保存章节哈希，变化作为事实送达角色，不自动暂停实施；负责人判断影响与需要重做的目标。
 - 可选 `deliverables.*.non_goals`（字符串列表，卡片目标节列出“不要做”）与 `review_groups.*.focus`（字符串，审阅卡列出审阅重点）。计划编制方法见 [技术负责人](technical-lead.md)。
+- 可选 `front.readonly_commands`：按完整 argv 和 SHA256 预授绑定任务内的 Python `-I` 只读观察脚本；每个子命令单独登记。只读语义由负责人核实，脚本或参数变化重新登记，不放开任意 Python。格式及 agy 原生 schedule 边界见 [运行与恢复](operations.md)。
 - `instruction`、`acceptance` 不得为空。完整路径审阅额度不足时登记失败，不再仅写 `plan.warnings`。修订/增额不得新增或扩大缺口；新建、重做或改变成员的审阅路径必须全额覆盖。历史不变缺口保留原批准与用量，派发前仍受硬门禁约束，不自动追加额度。
 
 ## 协调与额度

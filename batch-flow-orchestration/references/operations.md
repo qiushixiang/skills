@@ -31,6 +31,24 @@ agy 前端支持简称替换，显式映射维护在 [model-aliases.json](model-
 
 四种前端共用同一命令白名单：只操作绑定任务、读文件、在 answers/ 新建原话文件，不改源码或手写工单状态。Codex 的 apply_patch 仅允许新建 answers/ 文件；agy/OpenCode 的原生工具事件转换后执行同一检查。配置只写入本任务的 front/，不改用户或项目既有的宿主配置。
 
+agy 文件工具兼容 `read_file(Path)` / `write_file(Path)` 和 `view_file` / `write_to_file(TargetFile)` 两组名称；写入均经同一 answers/ 新文件检查，已有文件、目录外路径及符号链接逃逸仍拒绝。未知工具仍默认拒绝。
+
+agy 原生 `schedule` 事件按自身参数检查，不映射成 Claude 的 Cron 工具：`DurationSeconds`
+（正数，一次唤醒）与 `CronExpression`（五字段，周期唤醒）二选一，`Prompt` 必填；
+`IsDaemon` 只能省略或 false，可选 `ExactTiming` 布尔值，一次唤醒可带 `TimerCondition`。
+未知字段、命令载荷或跨会话目标拒绝。唤醒消息不会绕过后续工具门禁，也不构成用户批准。
+只有实际 schedule 创建成功才可报告监测已建立；工具未提供、创建失败或会话退出时如实说明。
+
+正式计划可配置 `front.readonly_commands: [{"argv": ["/绝对/python", "-I", "/绑定任务/observer.py", "status"],
+"sha256": "脚本SHA256"}]`。仅允许本机 Python 的完整 argv、绑定任务内非符号链接脚本及
+匹配哈希；每个只读子命令分别登记，未知参数拒绝。配置须经用户授权及 bf init/revise 登记，
+脚本更新后重新核对并登记哈希。负责人保证观察命令的只读语义，门禁检查身份和参数；
+不得将修改状态、预算或硬件操作的子命令列入其中。前端仍不能写源码或手改状态。
+
+运行中的 agy hook 每次工具调用加载 Python 门禁源码，新规则无需重启驱动；启动提示文字
+更新则需重新读取当前任务前端 AGENTS.md，或重启前端会话。维护门禁不创建 schedule、
+不自动恢复暂停或启动任务驱动。
+
 OpenCode 使用 V2 的交互式 mini 界面，不是 print/run 单轮调用；`--standalone` 保证临时配置由本次私有服务加载，不连接已有后台服务。显式模型须为 `provider/model`；不支持单独的 `--effort`，省略时沿用模型配置。专用 agent 和插件在环境中叠加，不将继承的 provider 凭据写入文件或 dry-run 输出。终端命令继承环境前会移除本前端的 agent/插件，避免限制扩散到 bf 驱动器与执行角色。现有同名 `batch_flow_front` agent 冲突时报错，不覆盖。
 
 Codex 首次启动或 hook 变更后需在 `/hooks` 中审阅并信任；启动器不绕过 hook 信任，也不绕过 CLI 权限或沙箱。agy 需要信任该前端工作区。Codex/agy/OpenCode 若 120 秒内没有收到真实工具门禁回执，启动器结束前端，不宣称门禁已生效；重新启动会清除旧就绪标记。同一任务、同一后端的前端有排他锁。
@@ -90,7 +108,8 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow answer WO-0012 --
 用户随时可以调整，每条都带 `--approval <base>/answers/<n>.txt`（用户原话，一次调整 = 一次修订 + 一条事件）。命令均为 `bf/cli.py --base <任务>/.batch-flow ...`：
 
 - `models <后端>`：只读，查询模型目录；`set-role <角色> --backend B --name '<说法>' [--effort E]`：换角色模型，见 [CLI 适配器](cli-adapter.md)。
-- cycles-v1 增额用 `grant <交付目标> --primary|--backup|--lead N --approval F`，审阅自动配套、不单独增额；旧目标不原地切换模型；新批次可在原计划追加目标级 execution 配置。见[执行轮次](execution-cycles.md)。
+- cycles-v1 增额用 `grant <交付目标> --primary|--backup|--lead N --approval F`，审阅随交付派发，不设独立容量或增额；旧目标不原地切换模型；新批次可在原计划追加目标级 execution 配置。见[执行轮次](execution-cycles.md)。
+- cycles-v1 工单耗尽轮次后执行者为空时，增额后用 `retry WO-n --note T` 记录恢复说明并按现有剩余轮次重新选人；历史调用、已用返修权益和独立审阅保留。已清除暂停标记但执行者仍为空的旧工单也可用此入口恢复；未决裁决及其他派发约束继续生效。
 - legacy-v1 历史任务：`envelope --add|--remove <批次>...`：自动推进范围；`grant <交付目标> --implement|--backup|--lead|--repair|--review N` 或 `grant <审阅组> --review N`：只增不减。
 - `hold <交付目标或批次>...` / `unhold ...`：只暂停这一部分；`supersede WO-n --reason R`：作废开立中的工单。
 - 新增或改写交付目标属于计划修订，由技术负责人起草（`revise`），聊天前端不运行 `init`/`revise`。

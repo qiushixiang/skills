@@ -130,12 +130,16 @@ def hook(event, base, backend, runtime, account_switch=()):
         args = args if isinstance(args, dict) else {}
         cwd = args.get('Cwd') or str(runtime)
         mapping = {'run_command': ('Bash', {'command': args.get('CommandLine', '')}),
-                   'view_file': ('Read', {}), 'list_dir': ('Glob', {}), 'grep_search': ('Grep', {}),
+                   'view_file': ('Read', {}), 'read_file': ('Read', {}),
+                   'list_dir': ('Glob', {}), 'grep_search': ('Grep', {}),
                    'find_by_name': ('Glob', {}),
+                   'write_file': ('Write', {'file_path': args.get('Path', '')}),
                    'write_to_file': ('Write', {'file_path': args.get('TargetFile', '')})}
         tool, inp = mapping.get(name, ('unknown', {}))
         ev = {'tool_name': tool, 'tool_input': inp, 'cwd': cwd}
         allowed = front.hook_decision(ev, base, account_switch)['decision'] == 'allow'
+        if name == 'schedule':
+            allowed = front.agy_schedule_allowed(args)
         if name == 'run_command' and (args.get('RequestedTerminalID') or args.get('RunPersistent')):
             allowed = False
         if name in ('command_status', 'wait', 'ask_question', 'finish'):

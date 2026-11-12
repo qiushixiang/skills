@@ -43,8 +43,8 @@ if BACKEND=='codex':
     answer = invoke('apply_patch',{'command':'*** Begin Patch\n*** Add File: '+target+'\n+test answer\n*** End Patch'})
     source = invoke('apply_patch',{'command':'*** Begin Patch\n*** Add File: '+str(Path(SOURCE)/'bad.py')+'\n+bad\n*** End Patch'})
 else:
-    answer = invoke('write_to_file',{'TargetFile':target,'CodeContent':'test answer'})
-    source = invoke('write_to_file',{'TargetFile':str(Path(SOURCE)/'bad.py'),'CodeContent':'bad'})
+    answer = invoke('write_file',{'Path':target,'Content':'test answer'})
+    source = invoke('write_file',{'Path':str(Path(SOURCE)/'bad.py'),'Content':'bad'})
 if answer=='allow':
     Path(target).write_text('test answer')
 foreign = shell(COMMAND.replace(BASE, str(Path(BASE).parent/'another-task'/'.batch-flow')))
@@ -55,6 +55,34 @@ sys.exit(23)
 
 
 class Hosts(Base):
+    def test_agy_file_tool_aliases_share_answer_policy(self):
+        runtime = self.root/'agy-files'
+        runtime.mkdir()
+        answers = self.base/'answers'
+        answers.mkdir()
+        existing = answers/'existing.txt'
+        existing.write_text('original')
+        (answers/'escape').symlink_to(self.workspace, target_is_directory=True)
+        for tool, key in (('write_file', 'Path'), ('write_to_file', 'TargetFile')):
+            cases = [(str(answers/'new.txt'), 'allow'),
+                     (str(existing), 'deny'),
+                     (str(self.workspace/'bad.py'), 'deny'),
+                     (str(answers/'..'/'plan.json'), 'deny'),
+                     (str(answers/'escape'/'bad.py'), 'deny'),
+                     ('', 'deny')]
+            for path, expected in cases:
+                for serialized in (False, True):
+                    with self.subTest(tool=tool, path=path, serialized=serialized):
+                        args = {key: path}
+                        event = {'toolCall': {'name': tool, 'args': json.dumps(args) if serialized else args}}
+                        self.assertEqual(front_hosts.hook(event, self.base, 'agy', runtime)['decision'], expected)
+        for tool in ('read_file', 'view_file'):
+            event = {'toolCall': {'name': tool, 'args': {'Path': str(existing)}}}
+            self.assertEqual(front_hosts.hook(event, self.base, 'agy', runtime)['decision'], 'allow')
+        event = {'toolCall': {'name': 'unknown_file_tool', 'args': {'Path': str(answers/'new.txt')}}}
+        self.assertEqual(front_hosts.hook(event, self.base, 'agy', runtime)['decision'], 'deny')
+        self.assertEqual(existing.read_text(), 'original')
+
     def test_argon_short_name_is_replaced_in_the_actual_launch_command(self):
         for name in ('argon', 'Gemini 4 Argon', 'gemini-4-argon'):
             call = subprocess.run([str(HERE/'start-batch-flow.sh'),str(self.base.parent),'--backend','agy',
@@ -140,6 +168,9 @@ class Hosts(Base):
             self.assertIn('不会自动唤醒', text)
             self.assertIn('run --background', text)
             self.assertNotIn('用 Monitor 工具', text)
+            if backend == 'agy':
+                for field in ('schedule', 'DurationSeconds', 'CronExpression', 'IsDaemon', '创建成功'):
+                    self.assertIn(field, text)
 
     def test_dry_run_previews_both_fronts_without_executing_binary(self):
         for backend in ('codex','agy'):
