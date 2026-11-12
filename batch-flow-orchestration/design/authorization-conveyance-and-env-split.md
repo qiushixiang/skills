@@ -234,6 +234,19 @@
 4. 测试：离线覆盖解析、拒绝、回执、漂移和迁移；真实验收分别跑一次 codex 模型冒烟和一次 opencode 无模型冒烟。
 5. `0-ethercat_reliability`：先在副本上用 `migrate-env` 转换，补写 selfcheck，执行 `env-resolve --smoke`，再经 `revise` 登记。切换技能需要你批准。
 
+## A1/A2 实施记录（2026-11-12）
+
+与上文提案的差异，以代码和 `scripts/test_bf_disposition.py` 为准：
+
+- **`awaiting_disposition` 没有删除**：删除它要改动结算、续作、门禁等多处语义，风险高于收益。改为用不变式约束：这个标记只在有待处理裁决或用户问题时才合法，否则事务被拒。检查只针对本次事务改动的工单，避免历史遗留状态阻塞其他操作。历史遗留的无出口工单在 report 中显示为 `no_disposition`，用 escalate 修复。
+- **前端动词**：没有新增 `reopen`。对归负责人的受阻项（包括等待处置的工单），retry 和 escalate 都会带着事实重开裁决（trigger 为 `operational_recovery`），前端不能直接清除负责人的阻塞；机械故障仍用 retry 清除。原先“负责人 blocked 后，用户增额再由前端 retry”的流程，改为在 blocked 中写 `waits_on: [{"grant": 目标}]`，增额时由脚本重开裁决；用尽轮次且没有受阻记录的执行人空缺仍可直接 retry。
+- **不变式的检查范围**：只拒绝本次事务把工单变成无出口的情况。原本就无出口的历史工单即使被改动，也不阻塞提交。
+- **environment_drift**：等待计划修订；revise 后脚本直接清除受阻记录，由派发前检查重新核对，不再为此开裁决。
+- **同一裁决内的矛盾**：如果裁决里已经追加额度或修订计划，又在 waits_on 中等待同一变化，该裁决会被拒绝。
+- **reconcile**：带批准的历史登记修复会同时清除等待处置标记。
+- **A2 的 hold 没有新增 ID**：hold 以目标或批次本身作为标识，原因写进 `hold_notes`；waits_on 直接引用目标或批次，unhold 批次时也命中该批内的目标。
+- **卡片“当前生效状态”节**：所有角色卡片都有这一节，并纳入导出保真检查。
+
 ## 影响面与顺序
 
 1. A3（能力表、解析器、env_resolved、冒烟；改动集中在 agent_cli、adapter.argv、model、register(init/revise/set-role)、cards 环境节、导入，以及 plan.md / design-book 的编制规范）。

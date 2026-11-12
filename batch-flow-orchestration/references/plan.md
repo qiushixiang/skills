@@ -66,6 +66,7 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow init --plan plan.
 - **资源**：会互相干扰的交付目标（如共用一块板）写相同的 `resources`，并发运行时不会同时派发。
 - **授权包络**：`envelope.batches` 是用户批准可自主推进的批次；可选 `envelope.protected: {"目标": ["精确仓库相对路径"]}` 预授限定路径权限。预授权只覆盖指定目标和路径，仍遵守设计中的修改内容、验收和审阅要求。包络外的工作由脚本转交用户。
 - **派发需求**：已知实施需要改保护路径时，在交付目标的 `required_protected` 列出精确路径，驱动器在派发前检查。它声明需求，不授予权限；不要把已知需求只藏在指令文字里。
+- **正文不写会变化的状态**：设计书、instruction、constraints、env.guide 只写稳定的规则与条件（如“占板时不得操作设备”），不写“当前暂缓/当前仅离线窗口/资源已释放”。这类状态用 hold（带 `--reason`）、envelope、grant 表达，卡片在派发时导出“当前生效状态”。
 - **执行环境（必填）**：CLI 调用 = 技能固定部分 + 本任务环境需求。`env` 只写 `requirements`、`blocked_output`、`guide`；不写后端名或 `approval_policy`、沙箱等调用参数（脚本拒绝）。没有需求写 `"requirements": []`。
   - 需求类型：`host_parent`（CLI 父进程须在宿主）、`extra_dirs`（额外可写目录）、`host_entry`（受控入口在沙箱外执行，须给 `smoke`）、`sandbox_escalation`（`mode: auto_review`）。每项写 `reason` 和 `applies`（目标列表或 `"*"`，读/写），按实际需要收窄。
   - `smoke` 是入口的自检 argv：无副作用、不取共享锁、不碰设备，只证明调用环境成立。入口没有这种目标时先在设计中补上，否则无法登记。

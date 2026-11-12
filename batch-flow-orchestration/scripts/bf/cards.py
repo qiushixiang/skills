@@ -40,7 +40,7 @@ SCHEMA = (
     '- {"plan_revision": "<草案路径>", "within_authorization": true, "revalidate": ["<需重做的交付目标>"]}  负责人判断调整是否在授权内，说明依据和影响；脚本仅核对显式策略边界。revalidate 明确选择重做目标，不自动传播；新增承诺转用户\n'
     '- {"ask_user": "<问题>", "user_request": {"category": "commitment|authority|budget|risk|information|checkpoint", '
     '"decision": "<需要用户决定什么>", "recommendation": "<推荐方案>", "impact": "<代价及不决定的影响>"}, "options": [...]}  只问六类新增用户决定，不能只问继续吗\n'
-    '- {"blocked": "WO-n", "reason": "<技术阻塞原因>", "missing": "<最小缺项>"}  保留阻塞并报告，不生成用户待办\n'
+    '- {"blocked": "WO-n", "reason": "<技术阻塞原因>", "missing": "<最小缺项>", "waits_on": [{"hold": "批次或目标"}, {"grant": "目标"}, {"revision": true}]}  保留阻塞并报告，不生成用户待办；waits_on 可选，只列可机械判定的条件，条件变化时脚本自动重开裁决\n'
     '- {"refresh_design": true}  设计文档措辞调整、方案不变时重新固定章节哈希（design_drift 触发用）\n'
     'open 默认成为被裁决工单的前置处置，完成后原工单才恢复；不得反向依赖原工单。新单不增加额度。\n'
     '其余动作在授权包络内由脚本直接执行。')
@@ -130,6 +130,32 @@ def _environment(state, o, assignment, run_dir):
     guide = environment.text(state.plan, 'guide')
     if guide:
         out.append('说明：%s' % guide)
+    return _lines(out)
+
+
+def current_state(state, o):
+    """Structured state as of dispatch (A2). Prose in the plan, design or earlier decisions may describe a past
+    state; this section is exported from holds/adjustments/envelope and wins on conflict."""
+    plan = state.plan
+    dels = model.deliverables_of(plan, o['target'])
+    scope = {o['target'], model.batch_of(plan, o['target'])} | set(dels) | {model.batch_of(plan, d) for d in dels}
+    scope.discard(None)
+    out = ['计划第 %s 版。以下由结构化状态在派发时导出；计划正文、设计书或历史裁决中关于“当前暂缓/窗口/资源占用”的描述'
+           '若与本节冲突，以本节为准，不得据旧描述停下。' % plan.get('revision')]
+    held = [h for h in plan.get('holds', []) if h in scope]
+    notes = plan.get('hold_notes', {})
+    out.append('暂缓（hold）：' + ('；'.join('%s%s' % (h, '（%s）' % notes[h]['reason'] if notes.get(h, {}).get('reason') else '')
+                                       for h in held) if held else '无，本单所属目标与批次未暂缓'))
+    batch = model.batch_of(plan, o['target'])
+    if batch:
+        out.append('自动推进包络：批次 %s %s' % (batch, '在内' if batch in plan['envelope']['batches'] else '不在内（转用户）'))
+    out.append('全局停止：%s' % ('已停止' if state.stopped else '否'))
+    recent = [a for a in plan.get('adjustments', []) if not a.get('targets') or scope & set(a['targets'])][-5:]
+    if recent:
+        out.append('相关用户调整（最近 %d 条）：' % len(recent) + '；'.join(
+            '第 %s 版 %s %s（批准 %s，%s）' % (a['revision'], a['op'], '、'.join(a.get('targets', [])) or (
+                '（历史记录未含对象）' if a['op'] in ('hold', 'unhold', 'grant', 'envelope', 'supersede') else '全局'),
+                                          a['approval']['path'], a['approval'].get('at', '')) for a in recent))
     return _lines(out)
 
 
@@ -356,6 +382,7 @@ def prepare(state, order_id):
                         'in_envelope': model.batch_of(state.plan, o['target']) in state.plan['envelope']['batches'],
                         'dependencies': {n: state.orders[n]['state'] for n in o['needs'] if n in state.orders}},
             'design_changes': [] if accounting else model.drifted(state.plan),
+            'current_state': current_state(state, o),
             'plan_revision': state.plan.get('revision')}
 
 
@@ -406,7 +433,7 @@ def _facts_text(data):
 
 
 def validate_export(data, text):
-    for key in ('goal', 'acceptance', 'contracts', 'non_goals', 'review_scope', 'constraints'):
+    for key in ('goal', 'acceptance', 'contracts', 'non_goals', 'review_scope', 'constraints', 'current_state'):
         need(data.get(key, '') in text, 'card export omitted or changed ' + key)
     need(_input_text(data) in text, 'card export omitted or changed the resolved order input')
     if data['required_read']:
@@ -422,11 +449,13 @@ def render(state, order_id, assignment, run_dir=None, prepared=None):
     if o['type'] == 'review':
         parts = [('审阅目标', data['goal']), ('验收依据', data['acceptance']),
                  ('审阅边界', data['review_scope']), ('范围与约束', bounds),
+                 ('当前生效状态（以此为准）', data['current_state']),
                  ('本次审阅要求', _input_text(data)), ('被审交付与证据', _body(state, o, run_dir)),
                  ('实施约定（供核对，不是审阅者待办）', data['contracts'])]
     else:
         parts = [('目标', data['goal']), ('验收条件', data['acceptance']),
-                 ('范围与约束', bounds), ('本次工作', _input_text(data)),
+                 ('范围与约束', bounds), ('当前生效状态（以此为准）', data['current_state']),
+                 ('本次工作', _input_text(data)),
                  ('本单', _body(state, o, run_dir)), ('目标实施约定', data['contracts'])]
     if data['required_read']:
         parts.append(('输入材料', '只读指定范围；历史材料用于所列用途，不自动成为当前命令：\n' + _reading_text(data)))

@@ -63,6 +63,7 @@ def main(argv=None):
         gr.add_argument('--' + k, type=int)
     for name in ('hold', 'unhold'):
         sub.add_parser(name).add_argument('targets', nargs='+')
+    sub.choices['hold'].add_argument('--reason', help='why it is held; shown on every affected card')
     sp = sub.add_parser('supersede')
     sp.add_argument('order')
     sp.add_argument('--reason', required=True)
@@ -152,7 +153,8 @@ def main(argv=None):
                 out = {'overrides': adjust.grant(base, args.target, args.approval, **dict(
                     (k, getattr(args, k)) for k in ('primary', 'implement', 'backup', 'lead', 'repair', 'review')))}
             elif args.cmd in ('hold', 'unhold'):
-                out = {'holds': getattr(adjust, args.cmd)(base, args.targets, args.approval)}
+                out = {'holds': (adjust.hold(base, args.targets, args.approval, reason=args.reason) if args.cmd == 'hold'
+                                 else adjust.unhold(base, args.targets, args.approval))}
             else:
                 out = {'superseded': adjust.supersede(base, args.order, args.approval, args.reason)}
         elif args.cmd == 'env-resolve':

@@ -99,7 +99,8 @@ def preflight(base):
             drift = _environment_drift(st, oid)
             if drift:
                 routing.pause(st, o, drift, 'environment_drift',
-                              missing='负责人重跑 bf env-resolve --smoke 并经 revise 更新执行环境登记；不消耗执行轮次')
+                              missing='负责人重跑 bf env-resolve --smoke 并经 revise 更新执行环境登记；不消耗执行轮次',
+                              waits_on=[{'revision': True}])
                 continue
             paths = permissions.missing(st.plan, o)
             if paths:
@@ -425,13 +426,15 @@ def retry(base, order_id, note, expected_revision=None, request_id=None, actor='
         stranded = (cycle_work and o.get('performer') is None
                     and cycles.retry_performer(st, o) is not None)
         need(o.get('ops') or stranded, 'order %s has no pending operational problem' % order_id)
+        lead_owned = bool(o.get('ops')) and routing.ops_owner(o) == 'lead'
         ops = o.pop('ops', {'problem': 'execution performer unset after exhausted rounds'})
         o.setdefault('ops_log', []).append({'op': 'retry', 'note': note, 'problem': ops['problem'], 'at': now()})
         o['invalid_floor'] = len(o['runs'])
         if o['type'] in ('decide', 'triage'):
             o['coordination_floor'] = len(o['runs'])
-        elif ops.get('kind') in ('no_progress', 'coordination_limit'):
-            routing.open_decide(st, o, 'operational_recovery', {'note': note}, force=True)
+        elif lead_owned or ops.get('kind') in ('no_progress', 'coordination_limit') or o.get('awaiting_disposition'):
+            # The lead still owns this order's disposition: hand the operational fact back, never just clear it.
+            routing.open_decide(st, o, 'operational_recovery', {'note': note, 'problem': ops['problem']}, force=True)
         if stranded:
             o['performer'] = cycles.retry_performer(st, o)
         return order_id
@@ -442,16 +445,18 @@ def escalate(base, order_id, note, expected_revision=None, request_id=None, acto
     """The fault looks technical: hand it to the technical lead as a decide (trigger tool_failure)."""
     def fn(st):
         o = routing.get(st, order_id)
-        need(o.get('ops'), 'order %s has no pending operational problem' % order_id)
+        stuck = routing.disposition(st, o) is None   # historical state without any exit
+        need(o.get('ops') or stuck, 'order %s has no pending operational problem' % order_id)
         need(isinstance(note, str) and note.strip(), 'recovery requires a concrete operational note')
-        problem = o.pop('ops')['problem']
+        trigger = 'tool_failure' if o.get('ops') and routing.ops_owner(o) == 'front' else 'operational_recovery'
+        problem = o.pop('ops')['problem'] if o.get('ops') else '等待负责人处置但无裁决单（历史状态）'
         o.setdefault('ops_log', []).append({'op': 'escalate', 'note': note, 'problem': problem, 'at': now()})
         o['invalid_floor'] = len(o['runs'])
         if o['type'] in ('decide', 'triage'):
             o['coordination_floor'] = len(o['runs'])
             o['fresh_next'] = True
         else:
-            routing.open_decide(st, o, 'tool_failure', {'problem': problem, 'note': note}, force=True)
+            routing.open_decide(st, o, trigger, {'problem': problem, 'note': note}, force=True)
         return order_id
     return transact(base, 'escalate', actor, fn, expected_revision, request_id)
 
@@ -543,9 +548,17 @@ def report(base, recent=10):
         else:
             state = 'pending'
         batches.append({'id': b['id'], 'title': b.get('title', ''), 'state': state, 'done': done_n, 'total': len(members)})
-    ops = [{'order': o['id'], 'label': label(plan, o['target']), 'problem': o['ops']['problem'],
-            'kind': o['ops'].get('kind', 'tool_failure'), 'missing': o['ops'].get('missing', '')}
-           for o in routing.sorted_orders(st) if o.get('ops')]
+    ops = []
+    for o in routing.sorted_orders(st):
+        where = routing.disposition(st, o)
+        if where == 'ops':
+            ops.append({'order': o['id'], 'label': label(plan, o['target']), 'problem': o['ops']['problem'],
+                        'kind': o['ops'].get('kind', 'tool_failure'), 'missing': o['ops'].get('missing', ''),
+                        'owner': routing.ops_owner(o)})
+        elif where is None:   # committed before invariant I-D existed; only escalate can repair it
+            ops.append({'order': o['id'], 'label': label(plan, o['target']), 'kind': 'no_disposition', 'owner': 'lead',
+                        'problem': '工单等待负责人处置，但没有待处理裁决或受阻记录（历史状态）',
+                        'missing': '前端 escalate 带事实重开负责人裁决'})
     for item in ask:
         item['label'] = label(plan, item['target'])
     ended.sort(key=lambda x: x['ended'])

@@ -532,3 +532,11 @@ cycles-v1 不再把历史最高执行阶段作为永久下界。负责人用 ret
 ## 35. 执行环境拆分与登记时冒烟（2026-11-12 用户批准）
 
 CLI 调用由技能固定部分与任务执行环境组成。计划 `env` 只写与后端无关的需求（host_parent、extra_dirs、host_entry、sandbox_escalation），不写后端参数；能力表负责映射；init、revise 和各项调整在登记前要求冒烟回执；驱动器派发时只比对哈希，不一致的工单单独暂停。详见 [authorization-conveyance-and-env-split.md](authorization-conveyance-and-env-split.md) 的 A3；行为规格见 scripts/test_bf_environment.py。
+
+## 36. 工单处置完整性与授权传达（2026-11-12 用户批准）
+
+- **A1 处置完整性**：每次事务提交前，本次改动的每张未完成工单都必须有可推进的出口（`routing.disposition`），否则整笔事务拒绝，状态不落盘。`awaiting_disposition` 仍保留为标记，但只在存在待处理裁决或用户问题时才合法。
+- **ops 归属**：ops 带 owner。机械故障（tool_failure、coordination_exhausted）归前端；其余归负责人。前端对负责人所属的等待处置工单用 retry 时，脚本会带上事实重开裁决，不会直接清除。report 由处置状态推导：已终结的工单不再显示受阻，不变式之前遗留的无出口工单显示为 no_disposition，可用 escalate 修复。
+- **A2 授权传达**：卡片新增“当前生效状态”一节，由 holds（含原因）、包络、停止状态和相关调整（带批准来源）导出，与正文冲突时以这一节为准。hold 可以写原因，调整记录作用对象。负责人的 blocked 可写 waits_on（hold、grant、revision），unhold、grant、revise 命中时由脚本自动重开裁决。
+
+行为规格见 scripts/test_bf_disposition.py。

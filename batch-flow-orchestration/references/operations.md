@@ -98,6 +98,8 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow answer WO-0012 --
 ## 停止、恢复、重启
 
 - `stop`：不再派发新工单，已在运行的调用结束后照常回收。`resume` 恢复。
+- 受阻项（report 的 `ops`）带 `owner`：`front` 为机械故障（CLI 不可用、协调格式耗尽），前端 retry/escalate；`lead` 为需要判断的阻塞，前端只用 escalate（或 retry，效果相同）带运维事实交回负责人，不能直接清除。每张未完成工单在提交时必须有可推进的出口，否则事务被拒；`no_disposition` 为不变式之前遗留的历史状态，用 escalate 修复。
+- 卡片“当前生效状态”节由 holds、hold 原因、包络、停止状态和相关用户调整导出，正文旧描述与之冲突时以它为准；暂缓时用 `hold <目标> --reason R` 写明原因。负责人的 blocked 可写 `waits_on`，unhold、grant、revise 命中时自动重开裁决。
 - 驱动器没有可派发或在途工作时退出，包括等待用户时。前端在 `answer / resume / retry / escalate / unhold / grant / envelope / set-role / supersede` 成功后统一运行 `ensure-run`：复用上次 `run` 保存的配置，在需要时后台启动；不会解除用户 stop，单实例锁防止重复派发。首次运行仍用 `run`。直接使用 CLI 的用户也应在这些操作后运行 `ensure-run`。
 - 驱动器随时可以重启：状态全部在文件里；上次未回收的调用会被接管或登记为无效；新版技术调用若不能证明整次未启动，转负责人裁决与结算。
 - CLI 工具失败登记为无效。新版整次未启动有机械证明才免扣并有界重试；其他技术调用立即移交负责人，不按无回复推断免扣。

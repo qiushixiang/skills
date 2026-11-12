@@ -82,6 +82,7 @@ def apply(base, manifest, approval, dry_run=False):
             need(type(spec['fresh_session']) is bool, 'fresh_session must be boolean')
             obj['fresh_next'] = spec['fresh_session']
         obj.pop('ops', None)
+        obj.pop('awaiting_disposition', None)   # the approved repair is the disposition
         return {'order': obj['id'], 'paths': paths, 'credits': list(credits),
                 'stage': policy.stage(st.plan, obj, st), 'runnable': obj['id'] in routing.runnable(st, 1000),
                 'approval': approval_ref, 'manifest': manifest_ref, 'dry_run': dry_run,

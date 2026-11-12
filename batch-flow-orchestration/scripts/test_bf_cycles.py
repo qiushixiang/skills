@@ -123,15 +123,22 @@ class ExecutionCycles(Base):
         rid = api.start(self.base, decision['id'], conversation_id='lead-recovery')
         out = api.deliver(self.base, decision['id'], rid, '结果：VERIFIED', decision={
             'diagnosis': '原轮返修已耗尽，等待可用实施轮次',
-            'actions': [{'blocked': rep, 'reason': '执行轮次用尽', 'missing': '需可用实施轮次'}]})
+            'actions': [{'blocked': rep, 'reason': '执行轮次用尽', 'missing': '需可用实施轮次',
+                         'waits_on': [{'grant': 'D1'}]}]})
         self.assertTrue(out['legal'], out)
         self.assertIsNone(self.st().orders[rep]['performer'])
-        api.retry(self.base, rep, '核对当前仍无额度')
         self.assertNotIn(rep, api.runnable(self.st()))
         with self.assertRaises(BfError):
-            api.retry(self.base, rep, '仍无可用轮次')
+            api.retry(self.base, rep + 'x', '未知工单')
+        # A lead block is never cleared by the front; the approved grant reopens the lead's disposition.
         adjust.grant(self.base, 'D1', self.approval, primary=1, lead=1)
-        api.retry(self.base, rep, '已批准增额，恢复原工单')
+        reopened = [o for o in self.st().orders.values() if o['type'] == 'decide' and o['state'] == 'open'
+                    and o['input'].get('subject') == rep]
+        self.assertEqual([o['input']['trigger'] for o in reopened], ['condition_changed'])
+        rid = api.start(self.base, reopened[0]['id'], conversation_id='lead-recovery-2')
+        out = api.deliver(self.base, reopened[0]['id'], rid, '结果：VERIFIED', decision={
+            'diagnosis': '已批准增额，恢复原工单', 'actions': [{'retry': rep, 'reason': '按新增轮次继续'}]})
+        self.assertTrue(out['legal'], out)
         self.assertIn(rep, api.runnable(self.st()))
         self.assertEqual(api.assign(self.st(), rep)['stage'], 'primary')
         self.assertEqual(cycles.spent(self.st(), 'D1'), {'primary': 1})

@@ -20,7 +20,7 @@ ACTION_FIELDS = {
     'open': {'open', 'target', 'input', 'needs', 'allow_protected', 'fresh_session'},
     'authorize': {'authorize', 'paths'}, 'retry': {'retry', 'reason', 'fresh_session', 'performer'},
     'supersede': {'supersede', 'reason'}, 'grant': {'grant'}, 'ask_user': {'ask_user', 'options', 'user_request'},
-    'blocked': {'blocked', 'reason', 'missing'},
+    'blocked': {'blocked', 'reason', 'missing', 'waits_on'},
     'plan_revision': {'plan_revision', 'within_authorization', 'revalidate'}, 'refresh_design': {'refresh_design'},
 }
 
@@ -194,6 +194,16 @@ def validate_decision(state, decision, order=None):
                 return 'blocked 只能暂停未完成且未运行的工单'
             if not all(isinstance(a.get(x), str) and a[x].strip() for x in ('reason', 'missing')):
                 return 'blocked 须记录原因和最小缺项'
+            problem = routing.waits_on_problem(state, a.get('waits_on'))
+            if problem:
+                return problem
+            granted = {t for b in decision['actions'] if isinstance(b, dict) and isinstance(b.get('grant'), dict)
+                       for t in b['grant']}
+            granted |= {state.orders[t]['target'] for t in granted if t in state.orders}
+            revised = any(isinstance(b, dict) and 'plan_revision' in b for b in decision['actions'])
+            for w in a.get('waits_on') or []:
+                if ('grant' in w and w['grant'] in granted) or ('revision' in w and revised):
+                    return 'waits_on 等待的条件已在本裁决中改变（%s）；先按新条件处置，不要等待已发生的变化' % w
         if k == 'authorize':
             if not isinstance(a['authorize'], str):
                 return 'authorize 须指定工单号'

@@ -148,7 +148,7 @@ def _execute(state, source, a, waiter):
     elif 'authorize' in a:
         permissions.install(state, routing.get(state, a['authorize']), a['paths'], source['id'])
     elif 'blocked' in a:
-        routing.pause(state, routing.get(state, a['blocked']), a['reason'], missing=a['missing'])
+        routing.pause(state, routing.get(state, a['blocked']), a['reason'], missing=a['missing'], waits_on=a.get('waits_on'))
     elif 'open' in a:
         inp = dict(a.get('input') or {})
         if a.get('allow_protected'):
@@ -200,6 +200,8 @@ def _execute(state, source, a, waiter):
             environment.register(state.base, plan)  # new lead rounds may put the lead on implementation
         plan['revision'] += 1
         state.plan_dirty = True
+        targets = {state.orders[k]['target'] if k in state.orders else k for k in a['grant']}
+        routing.condition_changed(state, 'grant', targets, '负责人追加额度：%s' % '、'.join(sorted(targets)))
     elif 'plan_revision' in a:
         from . import changes
         candidate = model.load_plan_file(a['plan_revision'])
@@ -291,6 +293,7 @@ def revise(state, new_plan, approval, source='user', revalidate=()):
                     obj.setdefault('contract_history', []).append({'revision': plan['revision'], 'prior': obj['contract']})
                     obj['contract'] = current
     state.plan = plan
+    routing.condition_changed(state, 'revision', (), '计划已修订为第 %d 版' % plan['revision'])
     for o in state.orders.values():
         if o['type'] in policy.STAFFED:
             over = policy.over_budget(plan, o, state)

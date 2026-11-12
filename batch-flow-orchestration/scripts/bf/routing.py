@@ -237,7 +237,92 @@ def check_exhausted(state, order):
         open_decide(state, order, 'exhausted')
 
 
-def pause(state, order, why, kind='technical_block', missing=''):
+def disposition(state, o):
+    """The single place that says how an unfinished order moves on (design A1, invariant I-D).
+    None means no actor can move it: such a state must never be committed."""
+    if o['state'] in SATISFIED or o['state'] == 'failed':
+        return 'terminal'
+    if o['state'] == 'running':
+        return 'running'
+    if o.get('ops'):
+        return 'ops'
+    pending = [state.orders[n] for n in o['needs'] if n in state.orders and state.orders[n]['state'] not in SATISFIED]
+    if o.get('awaiting_disposition'):
+        # The lead's disposition is still coming (a decide), or waits for the user's approval of its bundle.
+        return 'lead' if any(p['type'] in ('decide', 'ask_user') for p in pending) else None
+    if o['type'] == 'ask_user':
+        return 'user'
+    return 'waiting' if pending else 'ready'
+
+
+FRONT_KINDS = ('tool_failure', 'coordination_exhausted')
+
+
+def ops_owner(o):
+    """Who resolves a pause: the front for mechanical faults, the lead for everything that needs judgement."""
+    if o.get('awaiting_disposition'):
+        return 'lead'
+    return 'front' if (o.get('ops') or {}).get('kind', 'tool_failure') in FRONT_KINDS else 'lead'
+
+
+def disposition_problems(state, ids):
+    return ['%s（%s %s）等待负责人处置，但既没有待处理裁决也没有受阻记录' % (i, state.orders[i]['type'], state.orders[i]['target'])
+            for i in ids if i in state.orders and disposition(state, state.orders[i]) is None]
+
+
+WAIT_KINDS = ('hold', 'grant', 'revision')
+
+
+def waits_on_problem(state, waits):
+    """waits_on lists only mechanically observable conditions; reasons stay in text for the lead."""
+    if waits is None:
+        return ''
+    known = set(state.plan['deliverables']) | set(state.plan['review_groups']) | {b['id'] for b in state.plan['batches']}
+    if not isinstance(waits, list) or not waits:
+        return 'waits_on 须为非空列表，例如 [{"hold": "R3"}, {"grant": "R3.D"}, {"revision": true}]'
+    for w in waits:
+        if not isinstance(w, dict) or len(w) != 1 or next(iter(w)) not in WAIT_KINDS:
+            return 'waits_on 每项只能是 {"hold": 目标或批次} / {"grant": 交付目标} / {"revision": true}'
+        kind, value = next(iter(w.items()))
+        if kind == 'revision' and value is not True:
+            return 'waits_on revision 只能写 true'
+        if kind in ('hold', 'grant') and value not in known:
+            return 'waits_on %s 指向未知目标 %s' % (kind, value)
+    return ''
+
+
+def condition_changed(state, kind, values, note):
+    """A structured fact a block waited on has changed: reopen the lead's disposition (A2) instead of
+    leaving the block in place until someone happens to notice."""
+    reopened = []
+    for o in sorted_orders(state):
+        ops = o.get('ops') or {}
+        waits = ops.get('waits_on') or []
+        def hit(w):
+            if kind not in w:
+                return False
+            return kind == 'revision' or w[kind] in values or model.batch_of(state.plan, w[kind]) in values
+        if not any(hit(w) for w in waits):
+            continue
+        o.pop('ops')
+        o.setdefault('ops_log', []).append({'op': 'condition_changed', 'note': note, 'problem': ops.get('problem'), 'at': _now()})
+        if ops.get('kind') == 'environment_drift':
+            pass   # mechanical: the next dispatch preflight re-checks the pinned environment
+        elif o['type'] in ('decide', 'triage'):
+            o['coordination_floor'] = len(o['runs'])
+        else:
+            open_decide(state, o, 'condition_changed', {'changed': note, 'prior_problem': ops.get('problem'),
+                                                         'prior_missing': ops.get('missing')}, force=True)
+        reopened.append(o['id'])
+    return reopened
+
+
+def _now():
+    from .store import now
+    return now()
+
+
+def pause(state, order, why, kind='technical_block', missing='', waits_on=None):
     """Bound a stalled path without fabricating a user decision or satisfying dependencies."""
     from .store import now
     if not missing:
@@ -247,6 +332,8 @@ def pause(state, order, why, kind='technical_block', missing=''):
                    'coordination_limit': '负责人或运维核查协调调用次数及恢复条件'}.get(kind, '负责人核实具体恢复条件')
     order['state'] = 'open'
     order['ops'] = {'problem': why, 'kind': kind, 'missing': missing, 'at': now()}
+    if waits_on:
+        order['ops']['waits_on'] = list(waits_on)
     return order
 
 

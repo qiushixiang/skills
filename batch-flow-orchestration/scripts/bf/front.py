@@ -19,7 +19,7 @@ ADJUST = {
     'envelope': {'pos': None, 'flags': {'--add': -1, '--remove': -1, '--approval': 1}, 'need': ('--approval',), 'any': ('--add', '--remove')},
     'grant': {'pos': 'one', 'flags': dict([('--' + k, 1) for k in ('implement', 'backup', 'lead', 'repair', 'review')] + [('--approval', 1)]),
               'need': ('--approval',), 'any': ('--implement', '--backup', '--lead', '--repair', '--review')},
-    'hold': {'pos': 'many', 'flags': {'--approval': 1}, 'need': ('--approval',)},
+    'hold': {'pos': 'many', 'flags': {'--approval': 1, '--reason': 1}, 'need': ('--approval',)},
     'unhold': {'pos': 'many', 'flags': {'--approval': 1}, 'need': ('--approval',)},
     'supersede': {'pos': 'one', 'flags': {'--reason': 1, '--approval': 1}, 'need': ('--reason', '--approval')},
 }

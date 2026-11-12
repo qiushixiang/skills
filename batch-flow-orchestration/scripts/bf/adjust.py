@@ -21,7 +21,7 @@ def _catalog_module():
     return model_catalog
 
 
-def _edit(base, op, approval, fn):
+def _edit(base, op, approval, fn, targets=None, reason=None):
     ref = model.approval_ref(approval)
 
     def run(st):
@@ -34,8 +34,16 @@ def _edit(base, op, approval, fn):
         if op in ('set_role', 'grant') and not environment.is_legacy(st.plan.get('env')):
             environment.register(st.base, st.plan)  # only these change who executes what; hold/stop never block
         st.plan['revision'] += 1
-        st.plan.setdefault('adjustments', []).append({'revision': st.plan['revision'], 'op': op, 'approval': ref})
+        entry = {'revision': st.plan['revision'], 'op': op, 'approval': ref}
+        if targets:
+            entry['targets'] = list(targets)
+        if reason:
+            entry['reason'] = reason
+        st.plan.setdefault('adjustments', []).append(entry)
         st.plan_dirty = True
+        changed = {'unhold': 'hold', 'grant': 'grant'}.get(op)
+        if changed and targets:
+            routing.condition_changed(st, changed, set(targets), '用户调整 %s：%s（批准 %s）' % (op, '、'.join(targets), ref['path']))
         return result
     return transact(base, op, 'user', run)
 
@@ -85,7 +93,7 @@ def envelope(base, approval, add=(), remove=()):
         current = (set(st.plan['envelope']['batches']) | set(add)) - set(remove)
         st.plan['envelope']['batches'] = [b for b in ids if b in current]
         return st.plan['envelope']['batches']
-    return _edit(base, 'envelope', approval, fn)
+    return _edit(base, 'envelope', approval, fn, targets=list(add) + list(remove))
 
 
 def grant(base, target, approval, **rounds):
@@ -94,10 +102,10 @@ def grant(base, target, approval, **rounds):
     def fn(st):
         need(target in st.plan['deliverables'] or target in st.plan['review_groups'], 'unknown target %s' % target)
         return policy.add_rounds(st.plan, target, asked)
-    return _edit(base, 'grant', approval, fn)
+    return _edit(base, 'grant', approval, fn, targets=[target])
 
 
-def _holds(base, targets, approval, op, hold):
+def _holds(base, targets, approval, op, hold, reason=None):
     def fn(st):
         p = st.plan
         p.setdefault('holds', [])  # plans written before holds existed
@@ -106,12 +114,18 @@ def _holds(base, targets, approval, op, hold):
         if not hold:
             need(all(t in p['holds'] for t in targets), 'not held')
         p['holds'] = [h for h in p['holds'] if h not in targets] + (list(targets) if hold else [])
+        notes = p.setdefault('hold_notes', {})
+        for t in targets:
+            if hold:
+                notes[t] = {'reason': reason or '', 'at': now()}
+            else:
+                notes.pop(t, None)
         return p['holds']
-    return _edit(base, op, approval, fn)
+    return _edit(base, op, approval, fn, targets=targets, reason=reason)
 
 
-def hold(base, targets, approval):
-    return _holds(base, list(targets), approval, 'hold', True)
+def hold(base, targets, approval, reason=None):
+    return _holds(base, list(targets), approval, 'hold', True, reason)
 
 
 def unhold(base, targets, approval):
@@ -125,4 +139,4 @@ def supersede(base, order_id, approval, reason):
         o['state'] = 'superseded'
         o['output'] = {'superseded_by': 'user', 'reason': reason, 'at': now()}
         return order_id
-    return _edit(base, 'supersede', approval, fn)
+    return _edit(base, 'supersede', approval, fn, targets=[order_id], reason=reason)

@@ -148,7 +148,16 @@ def transact(base, op, actor, fn, expected_revision=None, request_id=None, init=
         if expected_revision is not None:
             need(expected_revision == state.revision, 'revision conflict: expected %s, current %s'
                  % (expected_revision, state.revision))
+        from . import routing
+        before = {k: json.dumps(v, sort_keys=True) for k, v in state.orders.items()}
+        # Orders already without an exit (written before invariant I-D) never block unrelated commits.
+        stranded = {k for k, v in state.orders.items() if routing.disposition(state, v) is None}
         result = fn(state)
+        changed = [k for k, v in state.orders.items()
+                   if before.get(k) != json.dumps(v, sort_keys=True) and k not in stranded]
+        if changed:
+            problems = routing.disposition_problems(state, changed)
+            need(not problems, '状态不一致，未提交（每张未完成工单必须有可推进的出口）：' + '；'.join(problems))
         state.revision += 1
         if state.plan_dirty:
             _atomic_write(base / 'plan.json', _dump(state.plan))
