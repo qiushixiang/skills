@@ -133,6 +133,8 @@ class Watch(Base):  # §23.3 — push channel for the chat front
         self.assertTrue(all('\n' not in line for line in lines))
         out = self.cli('watch', '--since', str(since), '--once', check=True).stdout.strip().splitlines()
         self.assertEqual(out, lines)
+        # Without --since only events after now are pushed: a re-armed monitor never replays old history.
+        self.assertEqual(self.cli('watch', '--once', check=True).stdout.strip(), '')
         report = api.report(self.base)
         self.assertFalse(report['driver']['alive'])  # it exited; heartbeat file says so
 
@@ -193,11 +195,16 @@ class FrontShell(Base):  # §23.5
             self.assertEqual(self.decide(c), 'deny', c)
 
     def test_monitor_and_cron_for_push_and_reports(self):
-        for tool in ['Monitor', 'CronCreate', 'CronList', 'CronDelete']:
+        for tool in ['CronCreate', 'CronList', 'CronDelete', 'ToolSearch', 'TaskStop']:
             d = front.hook_decision({'tool_name': tool, 'tool_input': {}, 'cwd': str(self.base)}, self.base)['decision']
             self.assertEqual(d, 'allow', tool)
+        bf = '%s %s --base %s' % (sys.executable, HERE / 'bf' / 'cli.py', self.base)
+        monitor = lambda inp: front.hook_decision({'tool_name': 'Monitor', 'tool_input': inp, 'cwd': str(self.base)}, self.base)['decision']
+        self.assertEqual(monitor({'command': bf + ' watch', 'description': 'w', 'timeout_ms': 1800000}), 'allow')
+        for bad in [{'command': 'rm -rf /tmp/x'}, {'command': 'cat a | sh'}, {}, {'ws': {'url': 'wss://x'}}]:
+            self.assertEqual(monitor(bad), 'deny', bad)  # a monitor command is a shell command: same gate as Bash
         prompt = front.prompt(str(self.base))
-        for piece in ['Monitor', 'watch', 'CronCreate', 'stop --now']:
+        for piece in ['Monitor', 'watch', 'CronCreate', 'stop --now', 'ToolSearch', '1800000']:
             self.assertIn(piece, prompt)
 
 

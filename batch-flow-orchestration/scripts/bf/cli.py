@@ -22,7 +22,7 @@ def main(argv=None):
     snap.add_argument('--repo', required=True)
     snap.add_argument('--paths', nargs='+', required=True)
     wt = sub.add_parser('watch')
-    wt.add_argument('--since', type=int, default=0)
+    wt.add_argument('--since', type=int, help='replay events after this revision; default: only new events')
     wt.add_argument('--once', action='store_true')
     sub.add_parser('report').add_argument('--text', action='store_true')
     rc = sub.add_parser('reconcile')
@@ -122,7 +122,7 @@ def main(argv=None):
             from bf import evidence
             out = evidence.doctor(base)
         elif args.cmd == 'watch':
-            since = args.since
+            since = api.load(base).revision if args.since is None else args.since
             while True:
                 lines, since = api.watch(base, since)
                 for line in lines:

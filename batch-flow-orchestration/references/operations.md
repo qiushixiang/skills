@@ -159,7 +159,7 @@ bf/cli.py --base <任务>/.batch-flow reconcile --file <base>/answers/repair.jso
 
 ## 通知、体检与立即停止
 
-- `watch [--since N] [--once]`：把值得关注的事件（驱动器启停、待你决定、运维暂停、交付结果、批次放行、停止）逐条输出为一行中文；前端用 Monitor 挂着它。`report` 的 `driver.alive` 表示驱动器是否在运行。
+- `watch [--since N] [--once]`：把值得关注的事件（驱动器启停、待你决定、运维暂停、交付结果、批次放行、停止）逐条输出为一行中文；不带 `--since` 只推送之后的新事件，`--since 0` 回放全部历史。Claude 前端先用 ToolSearch 加载 Monitor/CronCreate（门禁允许），Monitor 命令按 Bash 同一门禁检查；Monitor 最长 30 分钟，到期先 `report --text` 补看再重挂。`report` 的 `driver.alive` 表示驱动器是否在运行。
 - `doctor`：列出任务目录里引用了、但技能中已不存在的脚本（`{"missing": [{file, line, ref}]}`）；切换或升级技能前运行。
 - `stop` 同时阻止续跑（不合法交付暂存，`resume` 后继续）；`stop --now` 先向启动回执中核验仍属于本次进程组的实际 CLI 发送 SIGINT（对应 Ctrl+C），等待其正常取消与工具清理，保留监督进程回收结果。各后端共用该流程；超时或没有有效启动回执时再按进程组 TERM/KILL 兜底。正常中断能力须按后端验证；强制兜底不保证清除已脱离进程组的后台任务，怀疑残留时需检查宿主进程，不能仅凭 running=0 判断全部停止。在途调用登记为无效，驱动器退出；新版已启动技术调用待负责人结算。
 

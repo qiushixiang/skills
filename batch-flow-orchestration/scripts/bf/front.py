@@ -138,7 +138,9 @@ def allowed(command, account_switch=(), bound_base=None):
 
 # ---- launcher: PreToolUse guard, settings and prompt for the chat-front Claude Code session ---------
 
-PASS_TOOLS = ('Monitor', 'ScheduleWakeup', 'CronCreate', 'CronDelete', 'CronList')
+# Scheduling and tool-schema loading only. Monitor runs a shell command, so it is gated like Bash below.
+# ToolSearch is needed because Claude Code defers Monitor/CronCreate schemas until they are loaded.
+PASS_TOOLS = ('ScheduleWakeup', 'CronCreate', 'CronDelete', 'CronList', 'ToolSearch', 'TaskStop')
 
 
 def configured_readonly_command(words, base):
@@ -260,6 +262,9 @@ def hook_decision(event, base, account_switch=()):
     if tool == 'Bash':
         command = inp.get('command') or ''
         ok = shell_ok(command, account_switch, base)
+    elif tool == 'Monitor':
+        # Same gate as Bash: a monitor command is a shell command. No raw WebSocket sources.
+        ok = not inp.get('ws') and shell_ok(inp.get('command') or '', account_switch, base)
     elif tool == 'Write':
         target = path if os.path.isabs(path) else os.path.join(cwd or '', path)
         ok = bool(path) and _inside(target, os.path.join(base, 'answers')) and not os.path.exists(target)
@@ -277,7 +282,7 @@ def settings(base, account_switch=()):
 
 def prompt(base, account_switch=(), backend='claude', runtime=None):
     cli = shlex.join([sys.executable, str(Path(__file__).resolve().with_name('cli.py')), '--base', str(base)])
-    watch = ('2. 启动驱动器后立刻用 Monitor 工具挂上 CLI watch（事件推送，每行一条：待你决定、运维故障、交付结果、批次放行、驱动器启停），被唤醒后告诉用户并按需处理；另用 CronCreate 建一个每 10 分钟重复的定时任务（不要用一次性的 ScheduleWakeup），以及用户询问时，运行 CLI report --text，把结果转述给用户。'
+    watch = ('2. 未加载时先 ToolSearch select:Monitor,CronCreate。启动驱动器后用 Monitor 挂 CLI watch（只推新事件），timeout_ms=1800000，到期先 report --text 补看再重挂；CronCreate 建每 10 分钟重复汇报（7 天过期需重建）。被唤醒及用户询问时运行 CLI report --text 转述。'
              if backend == 'claude' else
              '2. 启动器将事件与每 10 分钟报告写入 %s/notifications.log，不向当前 TUI 插入文字，也不会自动唤醒闲置模型。不要调用 Claude 专有的 Monitor/CronCreate。每次用户交互先读最新报告，处理运维故障、转达待决问题；用户询问时运行 CLI report --text。' % runtime)
     if backend == 'opencode':
