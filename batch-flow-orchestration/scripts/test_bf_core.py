@@ -28,8 +28,8 @@ def make_plan(**over):
         'roles': {
             'executor': {'tool': 'codex', 'model': 'exec-m', 'effort': 'medium'},
             'backup_executor': {'tool': 'opencode', 'model': 'backup-m', 'effort': 'default'},
-            'lead': {'tool': 'claude', 'model': 'lead-m', 'effort': 'medium'},
-            'reviewer': {'tool': 'claude', 'model': 'rev-m', 'effort': 'medium'},
+            'lead': {'tool': 'codex', 'model': 'lead-m', 'effort': 'medium'},
+            'reviewer': {'tool': 'codex', 'model': 'rev-m', 'effort': 'medium'},
         },
         'policy': {
             'rounds': {'implement': 3, 'backup': 1, 'lead': 1, 'repair': 2, 'review': 32, 'decide_per_source': 2},
@@ -44,10 +44,29 @@ def make_plan(**over):
         },
         'review_groups': {'R12': {'deliverables': ['D1', 'D2']}, 'R3': {'deliverables': ['D3']}},
         'envelope': {'batches': ['B1', 'B2']},
-        'env': {'codex': {'entry': [ENTRY], 'blocked_output': 'Sandbox detected|Missing sudo rule'}},
+        'env': {'requirements': [
+            {'id': 'board-entry', 'kind': 'host_entry', 'entries': [ENTRY], 'smoke': [ENTRY, 'selfcheck'],
+             'reason': '板测入口须在宿主执行', 'applies': {'deliverables': '*', 'access': ['write']}},
+            {'id': 'escalate', 'kind': 'sandbox_escalation', 'mode': 'auto_review',
+             'reason': 'codex 写入时自动审阅提权', 'applies': {'deliverables': '*', 'access': ['write']}}],
+                'blocked_output': 'Sandbox detected|Missing sudo rule'},
     }
     p.update(over)
     return p
+
+
+from bf import environment  # noqa: E402
+environment.ASSUME_SMOKE_FOR_TESTS = True  # registration smoke itself is specified in test_bf_environment.py
+
+
+def write_smoke_receipts(base):
+    """Real receipt files for the task's current plan (fake host/model runners), for CLI subprocess tests."""
+    def model_ok(base_, plan_, spec, token):
+        return ([{'type': 'command_execution', 'command': ' '.join(argv), 'exit_code': 0}
+                 for argv in environment.model_commands(spec, token)], [], None)
+    from unittest.mock import patch
+    with patch.object(environment, '_check_host_parent', return_value=(True, 'test')):
+        return environment.smoke(base, api.load(base).plan, run_host=lambda argv: (0, 'ok'), run_model=model_ok)
 
 
 def record_json(n=0, exit_code=0):

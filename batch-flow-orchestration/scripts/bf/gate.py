@@ -109,7 +109,7 @@ def controlled_wrapper(command, entries):
         return False
 
 
-def scan(run, events, env):
+def scan(run, events, entries):
     """Fold one segment's CLI events into the run (edited / failed / latest controlled-entry call).
     Returns True when this segment edited files."""
     edited = False
@@ -121,10 +121,10 @@ def scan(run, events, env):
             run['commands_seen'] = run.get('commands_seen', 0) + 1
             if item['exit_code'] != 0:
                 run['failed'] = True
-            if env and direct_entry(item.get('command') or '', env.get('entry') or []):
+            if entries and direct_entry(item.get('command') or '', entries):
                 run['entry'] = {'exit_code': item['exit_code'], 'output': (item.get('aggregated_output') or '')[-4000:]}
                 run.pop('controlled_wrapper', None)
-            elif env and controlled_wrapper(item.get('command') or '', env.get('entry') or []):
+            elif entries and controlled_wrapper(item.get('command') or '', entries):
                 run['controlled_wrapper'] = True
                 run['entry'] = None
     run['edited'] = run.get('edited', False) or edited

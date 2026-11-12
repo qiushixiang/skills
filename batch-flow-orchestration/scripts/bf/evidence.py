@@ -41,7 +41,8 @@ def record(base, argv, cwd=None):
         from . import gate
         import shlex
         plan = json.loads(plan_file.read_text(encoding='utf-8'))
-        entries = [entry for env in plan.get('env', {}).values() for entry in env.get('entry', [])]
+        from . import environment
+        entries = environment.entries(plan)
         command = shlex.join(argv)
         need(not gate.direct_entry(command, entries) and not gate.controlled_wrapper(command, entries),
              '受控入口自行留证，必须直接调用；禁止在入口外套 bf record。')

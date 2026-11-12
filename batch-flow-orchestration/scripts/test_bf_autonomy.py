@@ -34,7 +34,7 @@ class Autonomy(Base):
     def test_scan_records_commands_without_guessing_work_nature(self):
         for text in ['cat README.md', 'python3 diagnostic.py', 'git diff --output=x']:
             run = {'edited': False}
-            gate.scan(run, [cmd(text, 0)], {})
+            gate.scan(run, [cmd(text, 0)], [])
             self.assertEqual(run['commands_seen'], 1)
             self.assertNotIn('non_readonly_command', run)
 

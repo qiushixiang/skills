@@ -12,8 +12,10 @@ from .store import BfError, now
 
 def check_driver_environment(state):
     """Reject an unsuitable driver parent before profiles, runs or children exist."""
-    backends = {role['tool'] for role in state.plan['roles'].values()}
-    if not any(state.plan.get('env', {}).get(backend, {}).get('require_host') for backend in backends):
+    from . import environment
+    if environment.is_legacy(state.plan.get('env')):
+        raise BfError('DRIVER_ENVIRONMENT_BLOCKED: ' + environment.LEGACY_HINT + '。未派发工单。')
+    if not environment.requires_host(state.plan):
         return
     from agent_cli import check_execution
     try:
@@ -232,7 +234,8 @@ class Runner(object):
                 api.release(self.base, oid)
                 progress = True
                 continue
-            a = dict(api.assign(st, oid), access='read' if o['type'] == 'review' and not st.plan.get('repos') else 'write')
+            from . import environment
+            a = dict(api.assign(st, oid), access=environment.access_for(st.plan, o['type']))
             resume = a['session']['conversation_id'] if a['session']['mode'] == 'resume' else None
             # Export/validate before starting a billable role run.
             next_id = '%s-r%d' % (oid, len(o['runs']) + 1)

@@ -11,7 +11,8 @@ class DriverEnvironment(Base):
     legacy_protocol = False
 
     def require_host(self):
-        self.reinit(env={'codex': {'require_host': True}})
+        self.reinit(env={'requirements': [{'id': 'host', 'kind': 'host_parent', 'reason': '受控入口需宿主权限',
+                                           'applies': {'deliverables': '*', 'access': ['write', 'read']}}]})
 
     def test_foreground_refused_without_mutating_orders_or_creating_run(self):
         self.require_host()

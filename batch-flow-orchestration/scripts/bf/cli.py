@@ -73,6 +73,15 @@ def main(argv=None):
         p.add_argument('--plan', required=True)
         p.add_argument('--approval', required=True)
     sub.choices['revise'].add_argument('--revalidate', nargs='*', default=[])
+    er = sub.add_parser('env-resolve', help='resolve plan.env.requirements per role backend; --smoke writes receipts')
+    er.add_argument('--plan', help='plan draft; default: the registered plan')
+    er.add_argument('--role', action='append', default=[], metavar='ROLE=TOOL:MODEL[:EFFORT]',
+                    help='smoke a candidate role configuration before set-role')
+    er.add_argument('--smoke', action='store_true')
+    er.add_argument('--agent-cli')
+    me = sub.add_parser('migrate-env', help='convert a legacy per-backend env into requirements (writes --out only)')
+    me.add_argument('--plan', required=True)
+    me.add_argument('--out', required=True)
     argv = list(sys.argv[1:] if argv is None else argv)
     child = []
     if '--' in argv:  # record's child command is never parsed by argparse
@@ -146,6 +155,47 @@ def main(argv=None):
                 out = {'holds': getattr(adjust, args.cmd)(base, args.targets, args.approval)}
             else:
                 out = {'superseded': adjust.supersede(base, args.order, args.approval, args.reason)}
+        elif args.cmd == 'env-resolve':
+            from bf import environment, adapter, model
+            raw = (json.loads(Path(args.plan).read_text(encoding='utf-8')) if args.plan
+                   else json.loads((base / 'plan.json').read_text(encoding='utf-8')))
+            for item in args.role:
+                role, _, spec = item.partition('=')
+                parts = spec.split(':')
+                if not role or len(parts) not in (2, 3):
+                    raise api.BfError('--role expects ROLE=TOOL:MODEL[:EFFORT]')
+                raw['roles'][role] = {'tool': parts[0], 'model': parts[1], 'effort': parts[2] if len(parts) == 3 else 'default'}
+            plan = model.normalize(raw, enforce_review_budget=False)
+            base.mkdir(parents=True, exist_ok=True)
+            backends = sorted({model.backend(r['tool']) for r in plan['roles'].values()})
+            profiles = {b: adapter.ensure_profile(base, b, args.agent_cli) for b in backends} if plan['env']['requirements'] else {}
+            resolution = environment.resolve(plan, base)
+            out = {'hash': resolution['hash'], 'failures': resolution['failures'], 'notes': resolution['notes'],
+                   'profiles': profiles,
+                   'combos': {k: {'backend': c['backend'], 'access': c['access'], 'roles': c['roles'],
+                                  'requirements': [r['id'] for r in c['requirements']], 'launch': c['launch'],
+                                  'receipt': 'ok' if (environment.read_receipt(base, k) or {}).get('ok') else 'missing'}
+                              for k, c in resolution['combos'].items()}}
+            if args.smoke:
+                out['smoke'] = environment.smoke(base, plan)['smoke']
+                bad = [k for k, v in out['smoke'].items() if not v['ok']]
+                if bad or resolution['failures']:
+                    print(json.dumps(out, ensure_ascii=False, indent=1))
+                    return 2
+            elif resolution['failures']:
+                print(json.dumps(out, ensure_ascii=False, indent=1))
+                return 2
+        elif args.cmd == 'migrate-env':
+            from bf import environment
+            plan = json.loads(Path(args.plan).read_text(encoding='utf-8'))
+            env, report = environment.migrate(plan)
+            plan['env'] = env
+            plan.pop('env_resolved', None)
+            target = Path(args.out)
+            if target.exists():
+                raise api.BfError('refusing to overwrite %s' % target)
+            target.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+            out = {'written': str(target), 'report': report}
         elif args.cmd in ('init', 'revise'):
             plan = json.loads(Path(args.plan).read_text(encoding='utf-8'))
             out = {args.cmd: (api.init(base, plan, args.approval) if args.cmd == 'init' else

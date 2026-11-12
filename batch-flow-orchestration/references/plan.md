@@ -43,9 +43,15 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow init --plan plan.
     "P3B.T": {"deliverables": ["…"], "batch": "S16", "reviewer": "third_party"}
   },
   "envelope": {"batches": ["S15", "S16"]},
-  "env": {"codex": {"require_host": true, "add_dirs": [], "approval_policy": "on-request",
-                    "entry": ["/…/run_board_test.sh"], "preflight": "/…/run_board_test.sh preflight",
-                    "blocked_output": "Sandbox detected|Missing sudo rule", "guide": "…"}},
+  "env": {"requirements": [
+            {"id": "host", "kind": "host_parent", "reason": "受控入口需 sudo 端点",
+             "applies": {"deliverables": "*", "access": ["read", "write"]}},
+            {"id": "board", "kind": "host_entry", "entries": ["/…/run_board_test.sh"],
+             "preflight": "/…/run_board_test.sh preflight", "smoke": ["/…/run_board_test.sh", "selfcheck"],
+             "reason": "板测须在沙箱外执行", "applies": {"deliverables": ["S15.E"], "access": ["write"]}},
+            {"id": "escalate", "kind": "sandbox_escalation", "mode": "auto_review",
+             "reason": "Codex 写入时自动审阅提权", "applies": {"deliverables": "*", "access": ["write"]}}],
+          "blocked_output": "Sandbox detected|Missing sudo rule", "guide": "与后端无关的环境说明"},
   "design": {"path": "/…/设计书.md", "sha256": "…"}
 }
 ```
@@ -60,7 +66,14 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow init --plan plan.
 - **资源**：会互相干扰的交付目标（如共用一块板）写相同的 `resources`，并发运行时不会同时派发。
 - **授权包络**：`envelope.batches` 是用户批准可自主推进的批次；可选 `envelope.protected: {"目标": ["精确仓库相对路径"]}` 预授限定路径权限。预授权只覆盖指定目标和路径，仍遵守设计中的修改内容、验收和审阅要求。包络外的工作由脚本转交用户。
 - **派发需求**：已知实施需要改保护路径时，在交付目标的 `required_protected` 列出精确路径，驱动器在派发前检查。它声明需求，不授予权限；不要把已知需求只藏在指令文字里。
-- **环境**：需要宿主权限的验证只经 `env.entry` 受控入口；`blocked_output` 写入口自身的环境失败输出，作为环境诊断事实，由角色判断是否阻塞。
+- **执行环境（必填）**：CLI 调用 = 技能固定部分 + 本任务环境需求。`env` 只写 `requirements`、`blocked_output`、`guide`；不写后端名或 `approval_policy`、沙箱等调用参数（脚本拒绝）。没有需求写 `"requirements": []`。
+  - 需求类型：`host_parent`（CLI 父进程须在宿主）、`extra_dirs`（额外可写目录）、`host_entry`（受控入口在沙箱外执行，须给 `smoke`）、`sandbox_escalation`（`mode: auto_review`）。每项写 `reason` 和 `applies`（目标列表或 `"*"`，读/写），按实际需要收窄。
+  - `smoke` 是入口的自检 argv：无副作用、不取共享锁、不碰设备，只证明调用环境成立。入口没有这种目标时先在设计中补上，否则无法登记。
+  - 各后端怎样实现由技能能力表决定（见[CLI 适配器](cli-adapter.md#执行环境能力表)）；会执行某需求的角色后端不支持时登记被拒，改分工或请用户批准新映射。
+  - 起草后运行 `bf --base <任务>/.batch-flow env-resolve --plan <草案> --smoke`：列出每个角色实际得到的环境并冒烟，回执存 `records/env-smoke/`。init、revise、set-role 及其他调整要求每个组合都有通过的回执，否则拒绝；冒烟不计任何目标轮次。批准材料附上每个角色实际得到的环境与冒烟结果。
+  - 登记后 CLI profile、宿主 rules 或需求变化时，驱动器派发前只比对哈希，受影响组合暂停为 `environment_drift`，负责人重跑冒烟并经 revise 更新；其他组合照常推进。
+  - 旧的按后端分节 env 用 `bf migrate-env --plan 旧 --out 新` 转换（只写新文件并报告缺项和差异），补齐后按上面登记；旧格式计划不能启动驱动器。
+  - `blocked_output` 写入口自身的环境失败输出，作为环境诊断事实，由角色判断是否阻塞。
 - 配置各目标 primary/backup/lead 执行轮次；每轮一次交付及至多一次原作者返修，全部独立审阅组随交付派发，不设独立审阅容量或计数。不得额外填写 repair/review，也不设置审阅组作者轮次 override。
 
 ## 修订、额度与版本

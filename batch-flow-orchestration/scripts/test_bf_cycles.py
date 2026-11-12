@@ -396,6 +396,8 @@ class ExecutionCycles(Base):
     def test_cli_accepts_cycle_grant(self):
         import subprocess, sys
         from pathlib import Path
+        from test_bf_core import write_smoke_receipts
+        write_smoke_receipts(self.base)
         cli=Path(__file__).parent/'bf/cli.py'
         out=subprocess.run([sys.executable,str(cli),'--base',str(self.base),'grant','D1',
                             '--primary','1','--approval',str(self.approval)],capture_output=True,text=True)

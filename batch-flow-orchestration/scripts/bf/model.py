@@ -140,7 +140,8 @@ def normalize(plan, enforce_review_budget=True):
     need(isinstance(permits, dict) and all(d in dels and isinstance(paths, list) and
          all(valid_exact_path(x) for x in paths) for d, paths in permits.items()),
          'envelope.protected: deliverable -> exact repository-relative paths required')
-    p.setdefault('env', {})
+    from . import environment
+    environment.normalize(p)
     pin_design(p, strict=True)
     from . import review_budget
     if enforce_review_budget:
@@ -199,12 +200,8 @@ def deliverables_of(plan, target):
 
 
 def backend(tool):
-    """Backend a role tool maps to; plan.env is keyed by backend."""
+    """Backend a role tool maps to."""
     return CLI_TOOLS.get(tool, tool)
-
-
-def env_for(plan, tool):
-    return plan['env'].get(backend(tool), {})
 
 
 # ---- design pinning (design 24.3, 24.4) ----------------------------------------------------------

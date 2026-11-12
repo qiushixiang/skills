@@ -195,6 +195,9 @@ def _execute(state, source, a, waiter):
             target = state.orders[key]['target'] if key in state.orders else key
             need(target in plan['deliverables'] or target in plan['review_groups'], 'grant: unknown target %s' % key)
             policy.add_rounds(plan, target, spec)
+        from . import environment
+        if not environment.is_legacy(plan.get('env')):
+            environment.register(state.base, plan)  # new lead rounds may put the lead on implementation
         plan['revision'] += 1
         state.plan_dirty = True
     elif 'plan_revision' in a:
@@ -256,6 +259,8 @@ def revise(state, new_plan, approval, source='user', revalidate=()):
         if o['target'] in old['review_groups']:
             o.setdefault('contract', model.review_contract(old, o['target']))
     plan = model.normalize(new_plan, enforce_review_budget=False)
+    from . import environment
+    environment.register(state.base, plan)
     cycles.require_same_model(old, plan, state.orders)
     review_budget.validate_revision(old, plan, revalidate)
     plan['revision'] = old['revision'] + 1

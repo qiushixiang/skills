@@ -105,21 +105,31 @@ def _review_scope(state, o):
     return _lines(out)
 
 
-def _environment(state, assignment, run_dir):
-    env = model.env_for(state.plan, assignment['tool'])
+def _environment(state, o, assignment, run_dir):
+    from . import environment
+    access = assignment.get('access') or environment.access_for(state.plan, o['type'])
+    backend = model.backend(assignment['tool'])
+    entries = [e for r in environment.applicable(state.plan, access, o['target']) if r['kind'] == 'host_entry' for e in r['entries']]
+    preflights = [r['preflight'] for r in environment.applicable(state.plan, access, o['target'])
+                  if r['kind'] == 'host_entry' and r.get('preflight')]
     out = ['工作目录：%s；证据目录：%s' % (state.plan.get('workspace') or '<工作目录>', state.base.resolve() / 'records')]
     if run_dir:
         out.append('本次运行目录：%s' % run_dir)
     cli = '%s %s --base %s' % (sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cli.py'), state.base.resolve())
     ws = state.plan.get('workspace') or '<工作目录>'
     out.append('BF命令前缀：%s\n  留证：<BF> record --cwd %s -- <命令>；快照：<BF> snapshot --repo <仓库绝对路径> --paths <文件>...' % (cli, ws))
-    if env.get('entry'):
-        out.append('受控入口（直接调用，不组合命令、不另套 shell）：%s' % '、'.join(env['entry']))
+    if entries:
+        out.append('受控入口（直接调用，不组合命令、不另套 shell）：%s' % '、'.join(entries))
         out.append('受控入口例外：入口自身负责 bf record 留证。调用时 cmd 直接写入口绝对路径和固定参数，禁止外套 bf record、Python 或 timeout；上述通用留证模板只用于其他命令。')
-        out.append('require_host 只检查 CLI 父进程，不代表工具已出沙箱；以受控入口的实际前检为准。包装调用失败先纠正调用，不能据此认定宿主权限失效。')
-    for key, label in (('preflight', '前检'), ('guide', '说明')):
-        if env.get(key):
-            out.append('%s：%s' % (label, env[key]))
+        out.append('宿主父进程检查不代表工具已出沙箱；以受控入口的实际前检为准。包装调用失败先纠正调用，不能据此认定宿主权限失效。')
+    if preflights:
+        out.append('前检：%s' % '；'.join(preflights))
+    granted = environment.describe(state.plan, backend, access, o['target'], o['type'])
+    if granted:
+        out.append('本次调用的执行环境（登记前已冒烟验证）：' + '；'.join(granted))
+    guide = environment.text(state.plan, 'guide')
+    if guide:
+        out.append('说明：%s' % guide)
     return _lines(out)
 
 
@@ -264,11 +274,16 @@ def _execution_options(state, subject):
             continue
         held = [r['run_id'] for o, r in pending if r['performer'] == performer]
         limit = limits.get(performer, 0)
-        env = model.env_for(state.plan, cfg['tool'])
+        from . import environment
+        env = {'entry': [e for r in environment.applicable(state.plan, 'write', subject['target'])
+                         if r['kind'] == 'host_entry' for e in r['entries']],
+               'environment': environment.describe(state.plan, model.backend(cfg['tool']), 'write', subject['target']),
+               'guide': environment.text(state.plan, 'guide')}
+        env = {k: v for k, v in env.items() if v}
         rows.append({'performer': performer, 'role': role, 'configuration': dict(cfg),
                      'budget_limit': limit, 'budget_spent': used.get(performer, 0),
                      'pending_runs': held, 'budget_remaining': max(0, limit - used.get(performer, 0) - len(held)),
-                     'environment': {k: env[k] for k in ('require_host', 'entry', 'preflight', 'guide') if k in env}})
+                     'environment': env})
     from . import cycles
     if cycles.enabled(state.plan, subject['target']):
         facts = cycles.options(state, subject)
@@ -417,7 +432,7 @@ def render(state, order_id, assignment, run_dir=None, prepared=None):
         parts.append(('输入材料', '只读指定范围；历史材料用于所列用途，不自动成为当前命令：\n' + _reading_text(data)))
     if data['versions_and_evidence']:
         parts.append(('历史证据索引（按需核对）', _facts_text(data)))
-    parts += [('环境与留证', _environment(state, assignment, run_dir)), ('交付', _delivery(o))]
+    parts += [('环境与留证', _environment(state, o, assignment, run_dir)), ('交付', _delivery(o))]
     if _norms(o):
         parts.append(('规范', '按下列文件的对应章节工作；通用规范不增加本组验收或审阅范围：\n' + _norms(o)))
     head = '# 工单 %s（%s，%s）' % (o['id'], o['type'], o['target'] or '-')

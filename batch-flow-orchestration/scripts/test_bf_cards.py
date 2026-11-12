@@ -81,7 +81,7 @@ class Cards(unittest.TestCase):
         self.assertEqual(candidates['primary']['budget_spent'], 1)
         self.assertEqual(candidates['primary']['budget_remaining'], 2)
         self.assertEqual(candidates['backup']['budget_remaining'], 1)
-        self.assertEqual(candidates['primary']['environment']['entry'], st.plan['env']['codex']['entry'])
+        self.assertEqual(candidates['primary']['environment']['entry'], st.plan['env']['requirements'][0]['entries'])
         text = cards.render(st, decision['id'], api.assign(st, decision['id']), prepared=data)
         self.assertIn('backup-m', text)
         self.assertIn('缺少预先成功调用证明不等于备用未授权或不可用', text)

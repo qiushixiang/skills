@@ -3,7 +3,7 @@ import re
 import time
 from pathlib import Path
 
-from . import evidence as evidence_mod, gate, model, policy, register, routing, context, snap, permissions, review_budget, cycles
+from . import evidence as evidence_mod, environment, gate, model, policy, register, routing, context, snap, permissions, review_budget, cycles
 from .store import BfError, State, load, need, now, transact
 
 __all__ = ['driver_event', 'watch', 'watch_lines', 'driver_status', 'retry', 'escalate', 'report_text', 'abandon', 'cli_failed', 'report', 'BfError', 'init', 'load', 'orders', 'runnable', 'assign', 'start', 'deliver', 'release', 'answer',
@@ -15,6 +15,7 @@ def init(base, plan, approval, expected_revision=None, request_id=None, actor='u
 
     def fn(st):
         st.plan = model.normalize(plan)
+        environment.register(st.base, st.plan)
         st.plan['revision'] = 1
         st.plan['approval'] = ref
         st.plan_dirty = True
@@ -88,12 +89,18 @@ def start(base, order_id, conversation_id=None, expected_revision=None, request_
 def preflight(base):
     """Resolve known dispatch deficiencies without spending a role run."""
     state = load(base)
-    candidates = [oid for oid in runnable(state, 1000) if permissions.missing(state.plan, state.orders[oid]) or review_budget.dispatch_shortfalls(state, state.orders[oid])]
+    candidates = [oid for oid in runnable(state, 1000) if permissions.missing(state.plan, state.orders[oid])
+                  or review_budget.dispatch_shortfalls(state, state.orders[oid]) or _environment_drift(state, oid)]
     if not candidates:
         return False
     def fn(st):
         for oid in candidates:
             o = st.orders[oid]
+            drift = _environment_drift(st, oid)
+            if drift:
+                routing.pause(st, o, drift, 'environment_drift',
+                              missing='负责人重跑 bf env-resolve --smoke 并经 revise 更新执行环境登记；不消耗执行轮次')
+                continue
             paths = permissions.missing(st.plan, o)
             if paths:
                 routing.open_decide(st, o, 'authorization_required', {'paths': paths})
@@ -105,6 +112,19 @@ def preflight(base):
     return transact(base, 'preflight', 'driver', fn)
 
 
+def _environment_drift(state, order_id):
+    """Pinned environment no longer matches this call (profile, host rules or needs changed)."""
+    o = state.orders[order_id]
+    if o['type'] not in policy.STAFFED:
+        return None
+    try:
+        assignment = policy.assign(state, order_id)
+    except BfError:
+        return None
+    access = environment.access_for(state.plan, o['type'])
+    return environment.call(state.plan, state.base, assignment['tool'], access, o['target'], o['type'])[1]
+
+
 def deliver(base, order_id, run_id, text, events=(), decision=None, conversation_id=None, session_kb=None,
             version=None, card=None, expected_revision=None, request_id=None, actor='driver', segment=None):
     def register_segment(st):
@@ -113,7 +133,7 @@ def deliver(base, order_id, run_id, text, events=(), decision=None, conversation
         run = next((r for r in o['runs'] if r['run_id'] == run_id), None)
         need(run is not None and run['ended'] is None, 'no open run %s on %s' % (run_id, order_id))
         p = gate.parse(text, st.base)
-        gate.scan(run, events, model.env_for(st.plan, run['tool']))
+        gate.scan(run, events, environment.entries(st.plan))
         legal, reason = gate.judge(st, o, run, p, decision, text)
         _capture(st, run)
         # Changes are observations for reviewers, never an engineering verdict.

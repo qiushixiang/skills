@@ -2,7 +2,7 @@
 
 ## 启动
 
-计划已配置角色的后端声明 `env.<backend>.require_host=true` 时，驱动器在前台入口、后台创建和 ensure-run 恢复入口检查自身 NoNewPrivs。受限父进程（非 0）或无法读取状态时直接返回 `DRIVER_ENVIRONMENT_BLOCKED`，不 probe profile、不创建后台驱动器、不派发角色、不登记无效角色轮次。通过平台批准机制在既有授权宿主重新启动；不自动提权，不修改子 CLI 沙箱或计划中的宿主要求。未声明 require_host 的任务不增加该限制。现有角色启动前检仍保留。
+登记的执行环境要求宿主父进程（`host_parent`）时，驱动器在前台入口、后台创建和 ensure-run 恢复入口检查自身 NoNewPrivs。受限父进程（非 0）或无法读取状态时直接返回 `DRIVER_ENVIRONMENT_BLOCKED`，不 probe profile、不创建后台驱动器、不派发角色、不登记无效角色轮次。通过平台批准机制在既有授权宿主重新启动；不自动提权，不修改子 CLI 沙箱或计划中的宿主要求。未声明该需求的任务不增加该限制。现有角色启动前检仍保留。旧的按后端分节 env 不能启动驱动器（提示 migrate-env）；派发前执行环境哈希不一致的工单暂停为 `environment_drift`，由负责人重跑冒烟并 revise，不消耗轮次，其他工作照常。
 
 聊天前端支持 **Claude Code、Codex CLI、agy、OpenCode V2**。用 `--backend` 选择，默认 Claude；前端选择不改变计划中执行者、审阅者等角色的工具和模型。
 
@@ -107,6 +107,7 @@ python3 <技能>/scripts/bf/cli.py --base <任务>/.batch-flow answer WO-0012 --
 
 用户随时可以调整，每条都带 `--approval <base>/answers/<n>.txt`（用户原话，一次调整 = 一次修订 + 一条事件）。命令均为 `bf/cli.py --base <任务>/.batch-flow ...`：
 
+- `env-resolve --role <角色>=<后端>:<模型ID>[:<effort>] --smoke`：换后端前对已登记计划冒烟候选角色（不计轮次）；set-role、grant 会重新登记执行环境。
 - `models <后端>`：只读，查询模型目录；`set-role <角色> --backend B --name '<说法>' [--effort E]`：换角色模型，见 [CLI 适配器](cli-adapter.md)。
 - cycles-v1 增额用 `grant <交付目标> --primary|--backup|--lead N --approval F`，审阅随交付派发，不设独立容量或增额；旧目标不原地切换模型；新批次可在原计划追加目标级 execution 配置。见[执行轮次](execution-cycles.md)。
 - cycles-v1 工单耗尽轮次后执行者为空时，增额后用 `retry WO-n --note T` 记录恢复说明并按现有剩余轮次重新选人；历史调用、已用返修权益和独立审阅保留。已清除暂停标记但执行者仍为空的旧工单也可用此入口恢复；未决裁决及其他派发约束继续生效。

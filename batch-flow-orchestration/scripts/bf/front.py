@@ -25,6 +25,8 @@ ADJUST = {
 }
 ADJUST['retry'] = ADJUST['escalate'] = {'pos': 'one', 'flags': {'--note': 1}, 'need': ('--note',), 'order': True}
 ADJUST['snapshot'] = {'pos': None, 'flags': {'--repo': 1, '--paths': -1}, 'need': ('--repo', '--paths')}
+# Only the stored plan with a candidate role: the front never smokes plan drafts (that is the lead's revise path).
+ADJUST['env-resolve'] = {'pos': None, 'flags': {'--role': 1, '--smoke': 0}, 'need': ('--role',)}
 ADJUST['reconcile'] = {'pos': None, 'flags': {'--file': 1, '--approval': 1, '--dry-run': 0}, 'need': ('--file', '--approval')}
 FLAGS = {'doctor': {}, 'watch': {'--since': 1, '--once': 0}, 'stop': {'--now': 0}, 'report': {'--text': 0}, 'run': {'--background': 0, '--parallel': 1, '--profile': 1}, 'answer': {'--file': 1, '--approve': 0, '--reject': 0}}
 SHELL_META = r'[;&|<>`$()\n\\]'
@@ -295,7 +297,7 @@ def prompt(base, account_switch=(), backend='claude', runtime=None):
         '下文 CLI 指：%s' % cli,
         'CLI 不是 shell 别名 flow：执行时写上述完整 Python/cli.py/--base 命令；帮助用 CLI reconcile --help。读取 JSON 用 Read/Grep/cat，不运行 Python -c 或 heredoc；orders.json 的工单位于顶层 orders 字段。',
         '职责：',
-        '1. 启动、停止、查看驱动器：CLI run --background 后台启动并立即返回；按 plan.env.require_host 要求使用宿主执行并保留原有权限审批。CLI stop / CLI resume（stop 阻止新派发与续跑，在途调用自行结束；用户说“立刻停”“全部停掉”时用 CLI stop --now，终止在途调用，登记为免扣无效）；CLI status。',
+        '1. 启动、停止、查看驱动器：CLI run --background 后台启动并立即返回；按登记的执行环境使用宿主执行并保留原有权限审批；旧格式 env 被拒时报告负责人。CLI stop / CLI resume（stop 阻止新派发与续跑，在途调用自行结束；用户说“立刻停”“全部停掉”时用 CLI stop --now，终止在途调用，登记为免扣无效）；CLI status。',
         '   驱动器空闲时退出。answer/resume/retry/escalate/unhold/grant/envelope/set-role/supersede 成功后统一运行 CLI ensure-run，按上次配置确保单实例继续；它不会解除 stop。首次运行仍用 run。',
         watch + '需要更多细节时读 CLI report 的 JSON、%s/attention.md 与 %s/records/runs/ 下的卡片和原始输出。' % (base, base),
         '   当前待决只以最新 CLI report 的 ask_user 为准；attention.md 是派生视图，旧通知与历史对话不代表仍需批准。计划修订或用户回答后先重新查询，不重复请求已失效事项。',
@@ -306,7 +308,7 @@ def prompt(base, account_switch=(), backend='claude', runtime=None):
         '   工单号只用于命令，不要对用户说。',
         '4. 转达用户的回答与调整，全部带用户原话文件 --approval %s/answers/<n>.txt：' % base,
         '   - 回答问题：CLI answer WO-n --file %s/answers/<n>.txt --approve|--reject；' % base,
-        '   - 换模型：CLI models <后端>；CLI set-role <角色> --backend <后端> --name \'<用户的说法>\' [--effort E] --approval F（角色：executor backup_executor lead reviewer third_party）；多个候选或未找到时把候选展示给用户，绝不自己挑；',
+        '   - 换模型：CLI models <后端>；CLI set-role <角色> --backend <后端> --name \'<用户的说法>\' [--effort E] --approval F（角色：executor backup_executor lead reviewer third_party）；多个候选或未找到时把候选展示给用户，绝不自己挑；换后端先 CLI env-resolve --role <角色>=<后端>:<模型ID> --smoke，通过再 set-role，失败如实报告；',
         '   - CLI envelope --add|--remove <批次>... --approval F；CLI grant <交付目标> --implement|--backup|--lead|--repair|--review N --approval F（审阅组只用 --review，只增不减）；CLI hold|unhold <交付目标或批次>... --approval F；CLI supersede WO-n --reason R --approval F。',
         '   - 已获批准的历史登记修复用 CLI reconcile --file answers/清单.json --approval answers/原话.txt，先加 --dry-run 核对；不改写历史运行、不启动项目编排。详情见 operations.md。',
         '   用户已明确提出或批准的调整，直接把原话保存到新文件 %s/answers/<n>.txt 后执行并复述结果，不重复请示同一授权。只有缺少不可替代的信息或真实新增授权边界才请求决定。' % base,

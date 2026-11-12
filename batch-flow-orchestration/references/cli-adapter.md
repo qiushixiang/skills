@@ -21,6 +21,7 @@ python3 <技能>/scripts/agent_cli.py models --profile <profile> --output <新�
 python3 <技能>/scripts/agent_cli.py resolve-model --profile <profile> --catalog <上述文件> --name '<用户说的名字>' --effort default
 ```
 
+换到另一后端前，先对已登记计划冒烟候选角色：`bf/cli.py --base <任务>/.batch-flow env-resolve --role <角色>=<后端>:<模型ID>[:<effort>] --smoke`；set-role 和 grant 都会重新登记执行环境，缺回执或后端不支持已批准需求时拒绝（hold、unhold、supersede、envelope 不受影响）。
 运行中换角色模型用 `bf/cli.py --base <任务>/.batch-flow set-role <角色> --backend <后端> --name '<用户说法>' --approval <用户原话文件>`：自动完成查目录与解析，只有唯一结果才写入计划，候选多个或未找到时不改动并返回候选；目录存 `<base>/catalogs/`。换工具或模型后的下一次派发开新会话。
 
 多个候选时向用户确认变体。`effort=default` 表示不覆盖 CLI 自身配置。已核验：OpenCode v2.2.5 的 `deepseek/deepseek-flash` 即 DeepSeek V4.1 Flash 1017（2026-11-06，新建与续接两次真实调用通过）。
@@ -39,7 +40,20 @@ python3 <技能>/scripts/agent_cli.py resolve-model --profile <profile> --catalo
 
 - 续接必须提供上一轮成功调用的 run 目录（`--resume-from`）：核对 usable、后端、会话 ID 与 cwd 一致才启动。不用“最近会话”，不跨后端续接。
 - `collect` 只读：检查退出码、JSON、非空最终回复、实际会话 ID、权限拒绝与 CLI 错误。不可用的调用由驱动器登记为无效；预算只依启动证明或负责人结算，不按不可用状态自动免扣。退出码 0 不等于技术成功。
-- 计划 `env.<backend>` 的 `require_host`、`add_dirs`、`approval_policy`（Codex：on-request/untrusted）自动转成启动参数。
+- 启动参数 = 固定部分（本文件各节）+ 计划执行环境经能力表解析的结果（登记时冒烟并写入 `plan.env_resolved`；派发前只比对哈希）。计划里不写后端参数。
+
+### 执行环境能力表
+
+`scripts/bf/environment.py` 的 `TABLE`。每格为 mapped（给出参数/规则）、native（后端无 OS 隔离，天然满足，卡片注明）或 unsupported（会执行该需求的角色使用此后端时拒绝登记）。修改或新增映射须真实接入验收证据。
+
+| 需求 | codex | claude | opencode | agy |
+|---|---|---|---|---|
+| host_parent | `--require-host`（父进程 NoNewPrivs=0） | 同左 | 同左 | 同左 |
+| extra_dirs | `--add-dir` | `--add-dir` | native | `--add-dir` |
+| host_entry | 宿主 rules 的 allow 规则（`execpolicy check`）或同组合有 sandbox_escalation；模型冒烟证明 | unsupported（无提示权限模式未验证） | native | unsupported（未验证） |
+| sandbox_escalation=auto_review | `approval_policy=on-request`（write 加 `--approve-for-me`） | unsupported | native | unsupported |
+
+冒烟：host_parent 检查父进程；extra_dirs 检查目录可写；无 OS 沙箱的后端在宿主直接运行 host_entry 的 smoke；Codex 组合用解析后的真实参数发一次最小调用，只执行 smoke 与目录写入，再从 CLI 事件流核对命令确实执行且退出码为 0。通过的回执按组合键（需求、参数、profile 版本、宿主 rules 摘要）复用。冒烟必须在宿主运行（有 host_parent 时父进程检查失败即不发模型调用）。
 - Codex 的 write + on-request 使用经 profile.help 核验的 `--approve-for-me`，保留 workspace-write，不使用全权限。只有 `-c approval_policy=...` 不足以证明 exec/resume 已启用审批。read 角色不使用该快捷开关，避免它扩大到 workspace-write；若 CLI 不能兑现其声明策略，按不可用暂停，不能静默降为 never 或扩大读写权限。
 - 本机 0.167.0 拒绝同时使用 `--sandbox` 与 `--approve-for-me`；自动审批分支用显式 `-c sandbox_mode="workspace-write"` 固定同一边界，并核对本次原生回执实际仍为 workspace-write。其他分支继续使用 `-s read-only/workspace-write`，不改用户配置文件。
 - 声明了审批策略的 Codex 调用会监测原生会话中本次启动后的 turn_context，核对实际 approval_policy、sandbox_policy 和自动 reviewer。实际值写 execution-actual.json；错误策略、旧续接回执、缺失回执均使 collect 不可用。适配器在检测到不符时终止该调用树；调用仍保留在驱动器管理的进程组中，stop --now 照常覆盖。该检查不是隔离边界，不能用它代替原生沙箱或命令规则。

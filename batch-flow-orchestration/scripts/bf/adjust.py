@@ -30,6 +30,9 @@ def _edit(base, op, approval, fn):
         prior = copy.deepcopy(st.plan)
         result = fn(st)
         review_budget.validate_revision(prior, st.plan)
+        from . import environment
+        if op in ('set_role', 'grant') and not environment.is_legacy(st.plan.get('env')):
+            environment.register(st.base, st.plan)  # only these change who executes what; hold/stop never block
         st.plan['revision'] += 1
         st.plan.setdefault('adjustments', []).append({'revision': st.plan['revision'], 'op': op, 'approval': ref})
         st.plan_dirty = True

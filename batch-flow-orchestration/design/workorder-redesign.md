@@ -528,3 +528,7 @@ cycles-v1 不再把历史最高执行阶段作为永久下界。负责人用 ret
 ## 34. 取消 cycles-v1 独立审阅容量（2026-11-10 用户批准）
 
 用户决定“取消吧,没有必要不是吗?”。取消新轮次模型的审阅容量公式、共享额度计数和派发容量门禁；审阅随交付及返修派发。执行轮次、每轮最多一次原作者返修、全部独立审阅组、依赖、作者独立性及单次调用异常恢复上限保留。历史调用保留供审计，不改写状态或迁移 legacy-v1 的历史预算；新增目标按目标级模型解析。行为规格见 test_bf_cycles.py、test_bf_scoped_cycles.py 及原 legacy 审阅预算回归。
+
+## 35. 执行环境拆分与登记时冒烟（2026-11-12 用户批准）
+
+CLI 调用由技能固定部分与任务执行环境组成。计划 `env` 只写与后端无关的需求（host_parent、extra_dirs、host_entry、sandbox_escalation），不写后端参数；能力表负责映射；init、revise 和各项调整在登记前要求冒烟回执；驱动器派发时只比对哈希，不一致的工单单独暂停。详见 [authorization-conveyance-and-env-split.md](authorization-conveyance-and-env-split.md) 的 A3；行为规格见 scripts/test_bf_environment.py。

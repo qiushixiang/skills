@@ -82,10 +82,10 @@ class AdapterSpec(unittest.TestCase):
                             "open(%r, 'a').write(a[a.index('--backend') + 1] + '\\n')\n"
                             "Path(a[a.index('--profile') + 1]).write_text('{}')\n" % str(log))
             first = adapter.ensure_profiles(base, fake)
-            self.assertEqual(sorted(first), ['claude', 'codex', 'opencode'])
-            self.assertEqual(sorted(log.read_text().split()), ['claude', 'codex', 'opencode'])
+            self.assertEqual(sorted(first), ['codex', 'opencode'])
+            self.assertEqual(sorted(log.read_text().split()), ['codex', 'opencode'])
             self.assertEqual(adapter.ensure_profiles(base, fake), first)
-            self.assertEqual(len(log.read_text().split()), 3)  # reused, no second probe
+            self.assertEqual(len(log.read_text().split()), 2)  # reused, no second probe
             override = adapter.ensure_profiles(base, fake, {'codex': '/x/c.json'})
             self.assertEqual(override['codex'], '/x/c.json')
 

@@ -76,16 +76,20 @@ class AgentCliAdapter(object):
         plan = api.load(self.base).plan
         if not plan.get('workspace'):
             raise api.BfError('plan.workspace is not set (source working directory)')
+        from . import environment
+        access = assignment.get('access') or environment.access_for(plan, order['type'])
         argv = [sys.executable, self.agent_cli, 'run', '--profile', profile, '--task', order['id'], '--cwd', plan['workspace'],
                 '--model', assignment['model'], '--effort', assignment['effort'], '--prompt-file', str(card_path),
-                '--run-dir', str(cli_dir), '--access', assignment.get('access') or ('read' if order['type'] == 'review' else 'write')]
-        env = model.env_for(plan, assignment['tool'])
-        for d in env.get('add_dirs') or []:
+                '--run-dir', str(cli_dir), '--access', access]
+        launch, drift = environment.call(plan, self.base, assignment['tool'], access, order['target'], order['type'])
+        if drift:
+            raise api.BfError(drift)
+        for d in launch['add_dirs']:
             argv += ['--add-dir', d]
-        if env.get('require_host'):
+        if launch['require_host']:
             argv.append('--require-host')
-        if env.get('approval_policy'):
-            argv += ['--approval-policy', env['approval_policy']]
+        if launch['approval_policy']:
+            argv += ['--approval-policy', launch['approval_policy']]
         if resume:
             previous = self._sessions().get(resume)
             if not previous:

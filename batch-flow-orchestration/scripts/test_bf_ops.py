@@ -76,7 +76,7 @@ class AdapterArguments(Base):  # §19.3
         self.assertEqual(argv[argv.index('--profile') + 1], '/p/codex.json')
         review = self.argv('review', 'R12')
         self.assertEqual(review[review.index('--access') + 1], 'read')
-        self.assertEqual(review[review.index('--profile') + 1], '/p/claude.json')
+        self.assertEqual(review[review.index('--profile') + 1], '/p/codex.json')
 
     def test_missing_workspace_is_an_error(self):
         other = self.root / 'other' / '.batch-flow'
